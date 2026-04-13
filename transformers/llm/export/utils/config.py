@@ -48,6 +48,8 @@ class LlmConfig(PretrainedConfig):
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
         config_path = os.path.join(pretrained_model_name_or_path, 'config.json')
+        model_type = None
+        raw_config = {}
         if os.path.exists(config_path):
             with open(config_path, 'r') as f:
                 raw_config = json.load(f)

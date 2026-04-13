@@ -1,0 +1,69 @@
+{
+    "//": "SmolVLM2-2.2B — Example benchmark config with all options documented",
+
+    "build": {
+        "ndk_path": "/Users/artemkatolikov/Library/Android/sdk/ndk/27.0.12077973",
+        "cmake_path": "cmake",
+        "build_type": "Release",
+        "jobs": 8,
+        "cmake_flags": [
+            "-DANDROID_ABI=arm64-v8a",
+            "-DANDROID_STL=c++_static",
+            "-DANDROID_NATIVE_API_LEVEL=android-28",
+            "-DMNN_ARM82=ON",
+            "-DMNN_OPENCL=ON",
+            "-DMNN_OPENMP=ON",
+            "-DMNN_CPU_WEIGHT_DEQUANT_GEMM=ON",
+            "-DMNN_BUILD_FOR_ANDROID_COMMAND=true",
+            "-DNATIVE_LIBRARY_OUTPUT=."
+        ]
+    },
+
+    "model": {
+        "converted_mnn_dir": "/tmp/SmolVLM2-MNN",
+        "model_type": "smolvlm"
+    },
+
+    "inputs": {
+        "images": ["/Users/artemkatolikov/Desktop/image.png"],
+        "vlm_prompt_template": "Describe the photo: <img>img0</img>"
+    },
+
+    "device": {
+        "adb_device_id": "R5CY71BJJ9D",
+        "target_dir": "/data/local/tmp/mnn_bench"
+    },
+
+    "reports": {
+        "markdown": true,
+        "excel": true
+    },
+
+    "stages": [
+        {
+            "name": "cpu",
+            "backend": "cpu",
+            "threads": 4,
+            "precision": "normal",
+            "warmup_rounds": 1,
+            "measure_rounds": 3,
+            "max_gen_tokens": 200,
+            "use_vlm_input": true,
+            "mllm_backend": "cpu",
+            "mllm_threads": 4
+        },
+        {
+            "name": "opencl",
+            "backend": "opencl",
+            "gpu_mode": ["MNN_GPU_MEMORY_BUFFER", "MNN_GPU_TUNING_WIDE"],
+            "precision": "low",
+            "power": "high",
+            "warmup_rounds": 1,
+            "measure_rounds": 3,
+            "max_gen_tokens": 200,
+            "use_vlm_input": true,
+            "mllm_backend": "cpu",
+            "mllm_threads": 4
+        }
+    ]
+}

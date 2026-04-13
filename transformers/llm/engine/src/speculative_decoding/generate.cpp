@@ -73,6 +73,11 @@ void ArGeneration::generate(GenerationParams& param) {
         // Compute Next Logits
         auto outputs = mLlm->forwardVec({mContext->current_token});
         if(outputs.empty()) {
+            if (mContext->status == LlmStatus::RUNNING) {
+                mContext->status = LlmStatus::INTERNAL_ERROR;
+            }
+            MNN_ERROR("[ArGeneration] forwardVec returned empty at token %d (gen_seq_len=%d)\n",
+                      mContext->current_token, mContext->gen_seq_len);
             break;
         }
         // Update input seq

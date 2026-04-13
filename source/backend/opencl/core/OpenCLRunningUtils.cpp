@@ -569,17 +569,20 @@ void run3DKernelDefault(const ::std::shared_ptr<KernelWrap> &kernelw, const std:
     MNN_CHECK_CL_SUCCESS(res, "run3d");
 
     unsigned int num_flush = runtime->getQueueNum();
-    if(runtime->getGpuType() != GpuType::ADRENO) {
+    // Flush interval: Adreno and RADEON (Samsung Xclipse / AMD) use a relaxed
+    // interval to reduce clFlush() dispatch overhead during LLM decode, where
+    // 1000+ small kernels are dispatched per token.  Other GPUs (Mali, Intel,
+    // etc.) keep the conservative interval to avoid driver command-buffer issues.
+    if(runtime->getGpuType() == GpuType::ADRENO || runtime->getGpuType() == GpuType::RADEON) {
+        if(num_flush % 10 == 0) {
+            runtime->commandQueue().flush();
+        }
+    } else {
         if(num_flush % 2 == 0) {
             runtime->commandQueue().flush();
         }
     }
-    else {
-        if(num_flush % 10 == 0) {
-            runtime->commandQueue().flush();
-        }
-    }
-    
+
 #ifdef LOG_VERBOSE
     MNN_PRINT("end run3DKernelDefault !\n");
 #endif
@@ -603,13 +606,12 @@ void runKernel2D(const ::std::shared_ptr<KernelWrap> &kernelw, const std::vector
     MNN_CHECK_CL_SUCCESS(res, "run2d");
 
     unsigned int num_flush = runtime->getQueueNum();
-    if(runtime->getGpuType() != GpuType::ADRENO) {
-        if(num_flush % 2 == 0) {
+    if(runtime->getGpuType() == GpuType::ADRENO || runtime->getGpuType() == GpuType::RADEON) {
+        if(num_flush % 10 == 0) {
             runtime->commandQueue().flush();
         }
-    }
-    else {
-        if(num_flush % 10 == 0) {
+    } else {
+        if(num_flush % 2 == 0) {
             runtime->commandQueue().flush();
         }
     }

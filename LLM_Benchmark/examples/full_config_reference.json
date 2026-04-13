@@ -1,0 +1,225 @@
+{
+    "//": "LLM_Benchmark — Full Configuration Reference",
+    "//": "All parameters with their descriptions and default values",
+
+    "build": {
+        "//": "Cross-compilation settings for Android NDK",
+        "ndk_path": "/path/to/android-ndk",
+        "cmake_path": "cmake",
+        "build_type": "Release",
+        "jobs": 8,
+        "generator": "",
+
+        "cmake_flags": [
+            "-DANDROID_ABI=arm64-v8a",
+            "-DANDROID_STL=c++_static",
+            "-DANDROID_NATIVE_API_LEVEL=android-28",
+            "-DMNN_ARM82=ON",
+            "-DMNN_OPENCL=ON",
+            "-DMNN_VULKAN=OFF",
+            "-DMNN_OPENMP=ON",
+            "-DMNN_CPU_WEIGHT_DEQUANT_GEMM=ON",
+            "-DMNN_BUILD_FOR_ANDROID_COMMAND=true",
+            "-DNATIVE_LIBRARY_OUTPUT=.",
+            "-DMNN_IMGCODECS=ON",
+            "-DMNN_GPU_TIME_PROFILE=ON"
+        ]
+    },
+
+    "model": {
+        "//source_path": "HuggingFace model ID or local path (triggers download+convert)",
+        "source_path": "",
+
+        "//model_type": "Model type: smolvlm, qwen2, llama, etc.",
+        "model_type": "smolvlm",
+
+        "//converted_mnn_dir": "Path to pre-converted MNN model directory",
+        "converted_mnn_dir": "/path/to/Model-MNN",
+
+        "//gguf_path": "Path to GGUF model (alternative to source_path)",
+        "gguf_path": "",
+
+        "conversion": {
+            "//": "Auto-conversion settings (only used with source_path)",
+            "enabled": false,
+            "export_script": "transformers/llm/export/llmexport.py",
+            "quant_bit": 4,
+            "quant_block": 64,
+            "embed_bit": 16,
+            "sym": false,
+            "export_format": "mnn",
+            "visual_quant_bit": 8,
+            "extra_args": []
+        }
+    },
+
+    "inputs": {
+        "//prompts": "Text prompts for text-only LLM benchmarks",
+        "prompts": ["What is the capital of France?"],
+
+        "//images": "Image paths for VLM benchmarks",
+        "images": ["/path/to/image.png"],
+
+        "//vlm_prompt_template": "VLM prompt with <img>img0</img> placeholder",
+        "vlm_prompt_template": "Describe this image: <img>img0</img>"
+    },
+
+    "outputs": {
+        "host_output_dir": "./benchmark_results",
+        "logcat_filename": "logcat_capture.txt"
+    },
+
+    "device": {
+        "//adb_device_id": "ADB device serial (empty = first available)",
+        "adb_device_id": "",
+
+        "target_dir": "/data/local/tmp/mnn_bench",
+
+        "//thermal_sensor": "sysfs path for GPU temperature sensor",
+        "thermal_sensor": "/sys/kernel/gpu/gpu_tmu",
+        "//thermal_target": "Target temperature (°C) before starting each stage",
+        "thermal_target": 25,
+        "//thermal_timeout": "Max seconds to wait for cooldown",
+        "thermal_timeout": 300,
+        "//thermal_poll": "Seconds between temperature checks",
+        "thermal_poll": 5,
+
+        "//clock_settings": "CPU governor settings for consistent benchmarks",
+        "clock_settings": {
+            "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor": "performance"
+        },
+        "clock_restore": {
+            "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor": "schedutil"
+        }
+    },
+
+    "reports": {
+        "//": "Auto-generate reports after benchmark",
+        "markdown": true,
+        "excel": true
+    },
+
+    "stages": [
+        {
+            "//": "--- CPU Best Configuration ---",
+            "name": "cpu_best",
+            "enabled": true,
+
+            "//backend": "Backend: cpu, opencl, vulkan",
+            "backend": "cpu",
+
+            "//threads": "CPU thread count (ignored for GPU backends)",
+            "threads": 4,
+
+            "//precision": "Computation precision: normal, low, high",
+            "precision": "normal",
+
+            "//memory": "Memory mode: normal, low, high",
+            "memory": "low",
+
+            "//power": "Power mode: normal, low, high",
+            "power": "normal",
+
+            "//gpu_mode": "GPU mode flags (OpenCL/Vulkan only)",
+            "//gpu_mode_options": [
+                "MNN_GPU_MEMORY_BUFFER", "MNN_GPU_MEMORY_IMAGE",
+                "MNN_GPU_TUNING_NONE", "MNN_GPU_TUNING_FAST",
+                "MNN_GPU_TUNING_NORMAL", "MNN_GPU_TUNING_HEAVY", "MNN_GPU_TUNING_WIDE",
+                "MNN_GPU_RECORD_OP", "MNN_GPU_RECORD_BATCH"
+            ],
+
+            "//attention_mode": "Attention mode: 0=default, check MNN docs for others",
+            "attention_mode": 0,
+
+            "//no_tuning": "Skip GPU kernel tuning (faster startup, use cached)",
+            "no_tuning": true,
+
+            "//warmup_rounds": "Warmup rounds (not measured)",
+            "warmup_rounds": 3,
+            "//measure_rounds": "Measurement rounds (averaged for results)",
+            "measure_rounds": 5,
+
+            "//prompt_tokens": "Synthetic prompt token count (0 = use real prompt/image)",
+            "prompt_tokens": 0,
+            "//max_gen_tokens": "Maximum tokens to generate per round",
+            "max_gen_tokens": 200,
+
+            "//enable_op_profile": "Enable per-operator profiling (requires Session_Debug)",
+            "enable_op_profile": false,
+
+            "//session_mode": "Session mode: Session_Debug (for profiling), Session_Release",
+            "session_mode": [],
+
+            "//use_vlm_input": "Use VLM image input instead of text prompt",
+            "use_vlm_input": true,
+            "vlm_image_index": 0,
+
+            "//mllm_backend": "Vision encoder backend: cpu, opencl",
+            "mllm_backend": "cpu",
+            "mllm_precision": "normal",
+            "mllm_threads": 4,
+
+            "//cache_file": "Path to pre-built OpenCL cache file on device",
+            "cache_file": "",
+
+            "//hints": "Backend-specific hint overrides",
+            "hints": {
+                "//DYNAMIC_QUANT_OPTIONS": "1=enable dynamic quantization",
+                "//CPU_LITTLECORE_DECREASE_RATE": "100=disable little core penalty",
+                "//KVCACHE_SIZE_LIMIT": "-1=unlimited KV cache",
+                "//QKV_QUANT_OPTIONS": "KV cache quantization bits",
+                "//OP_ENCODER_NUMBER_FOR_COMMIT": "Batch N kernels before GPU commit"
+            },
+
+            "//repetition_penalty": "Token repetition penalty (1.0=none)",
+            "repetition_penalty": 1.0,
+            "//temperature": "Sampling temperature (0=greedy, 1=default)",
+            "temperature": 1.0,
+
+            "//prefer_decode": "Optimize session for decode (single-token) performance",
+            "prefer_decode": false,
+            "//use_mmap": "Use memory-mapped file I/O for weights",
+            "use_mmap": false
+        },
+        {
+            "//": "--- OpenCL Best Configuration ---",
+            "name": "opencl_best",
+            "enabled": true,
+            "backend": "opencl",
+            "gpu_mode": ["MNN_GPU_MEMORY_BUFFER", "MNN_GPU_TUNING_WIDE"],
+            "precision": "low",
+            "memory": "low",
+            "power": "high",
+            "no_tuning": false,
+            "warmup_rounds": 3,
+            "measure_rounds": 5,
+            "max_gen_tokens": 200,
+            "use_vlm_input": true,
+            "vlm_image_index": 0,
+            "mllm_backend": "cpu",
+            "mllm_precision": "normal",
+            "mllm_threads": 4
+        },
+        {
+            "//": "--- OpenCL Kernel Profiling (separate build with MNN_GPU_TIME_PROFILE=ON) ---",
+            "name": "opencl_kernel_ops",
+            "enabled": false,
+            "backend": "opencl",
+            "gpu_mode": ["MNN_GPU_MEMORY_BUFFER", "MNN_GPU_TUNING_WIDE"],
+            "precision": "low",
+            "memory": "low",
+            "power": "high",
+            "no_tuning": false,
+            "warmup_rounds": 1,
+            "measure_rounds": 1,
+            "max_gen_tokens": 200,
+            "enable_op_profile": true,
+            "session_mode": ["Session_Debug"],
+            "use_vlm_input": true,
+            "vlm_image_index": 0,
+            "mllm_backend": "cpu",
+            "mllm_precision": "normal",
+            "mllm_threads": 4
+        }
+    ]
+}

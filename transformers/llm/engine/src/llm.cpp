@@ -740,6 +740,26 @@ int Llm::sample(VARP logits, int offset, int size) {
         MNN_ASSERT(logits->getInfo()->size >= offset + size);
         logits = _Const(logits->readMap<float>() + offset, {size}, NHWC, halide_type_of<float>());
     }
+    // Suppress EOS tokens during early generation (min_new_tokens protection)
+    // This prevents quantized VLM models from prematurely stopping on certain images
+    int min_new_tokens = mConfig->config_.value("min_new_tokens", 0);
+    if (min_new_tokens > 0 && mContext->gen_seq_len < min_new_tokens) {
+        // Mask out all stop tokens by setting their logits to -inf
+        auto logitsPtr = logits->readMap<float>();
+        int total = logits->getInfo()->size;
+        std::vector<float> maskedLogits(logitsPtr, logitsPtr + total);
+        bool masked = false;
+        for (int i = 0; i < total; i++) {
+            // Check if this token is a stop token
+            if (mTokenizer->is_stop(i)) {
+                maskedLogits[i] = -1e9f;
+                masked = true;
+            }
+        }
+        if (masked) {
+            logits = _Const(maskedLogits.data(), {total}, NHWC, halide_type_of<float>());
+        }
+    }
     auto token_id = mSampler->sample(logits);
     return token_id;
 }
