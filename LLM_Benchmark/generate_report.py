@@ -213,15 +213,47 @@ def parse_stage_stdout(stdout):
 
 stages = {}
 for d in input_dirs:
-    stage_dirs = sorted([sd for sd in d.iterdir()
-                         if sd.is_dir() and sd.name not in ("device_tmp", "_combined")])
-    for sd in stage_dirs:
-        stdout_files = list(sd.glob("*/output_stdout.txt"))
-        if not stdout_files:
-            continue
-        stdout = stdout_files[0].read_text()
-        name = sd.name
-        stages[name] = parse_stage_stdout(stdout)
+    # Find all output_stdout.txt files recursively
+    stdout_files = sorted(d.rglob("output_stdout.txt"))
+    for sf in stdout_files:
+        # Determine stage name from directory structure.
+        # Possible layouts:
+        #   _combined/<ts>/stage_name/model/output_stdout.txt
+        #   stage_name/<ts>/model/output_stdout.txt
+        #   stage_name/model/output_stdout.txt
+        # Strategy: walk from the input dir, skip timestamps and the model dir
+        # (the dir containing output_stdout.txt), take the first meaningful name.
+        rel_parts = sf.relative_to(d).parts[:-1]  # drop "output_stdout.txt"
+
+        # The model dir is always the immediate parent of output_stdout.txt.
+        # Walk ancestor dirs (excluding model dir) looking for a non-timestamp,
+        # non-special directory name to use as stage name.
+        # Also check the input dir's own ancestry for stage names.
+        candidate_parts = rel_parts[:-1] if len(rel_parts) > 1 else []
+
+        stage_name = None
+        for p in candidate_parts:
+            if p in ("device_tmp", "_combined"):
+                continue
+            if re.match(r'^\d{8}_\d{6}$', p):
+                continue
+            stage_name = p
+            break
+
+        if not stage_name:
+            # Walk up from input dir: cpu_best/20260414_... → cpu_best
+            for ancestor in [d] + list(d.parents):
+                name = ancestor.name
+                if not name or name in ("benchmark_results", ".", "_combined", "device_tmp"):
+                    continue
+                if re.match(r'^\d{8}_\d{6}$', name):
+                    continue
+                stage_name = name
+                break
+
+        if stage_name and stage_name not in stages:
+            stdout = sf.read_text()
+            stages[stage_name] = parse_stage_stdout(stdout)
 
 print(f"Parsed {len(stages)} stages: {list(stages.keys())}")
 
