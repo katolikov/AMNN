@@ -42,7 +42,9 @@ class DeviceManager:
     def shell(self, cmd_str: str, root=False, **kw) -> subprocess.CompletedProcess:
         inner = cmd_str
         if root:
-            inner = f"su -c {shlex.quote(cmd_str)}"
+            # Android su syntax: su 0 sh -c 'command'
+            # (NOT Linux-style 'su -c command' which Android su misparses)
+            inner = f"su 0 sh -c {shlex.quote(cmd_str)}"
         return self.adb("shell", inner, **kw)
 
     def push(self, src: str, dst: str, silent=False) -> None:
@@ -103,17 +105,19 @@ class DeviceManager:
         if not settings:
             self.logger.info(f"{C.DIM}No clock settings configured{C.RESET}")
             return
+        need_root = self.config.device.get("clock_root", True)
         for path, val in settings.items():
-            self.shell(f"echo {val} > {path}", root=True, check=False, silent=True)
+            self.shell(f"echo {val} > {path}", root=need_root, check=False, silent=True)
         self._clocks_applied = True
-        self.logger.ok(f"Clock settings applied ({len(settings)} entries)")
+        self.logger.ok(f"Clock settings applied ({len(settings)} entries, root={'yes' if need_root else 'no'})")
 
     def restore_clocks(self):
         if not self._clocks_applied:
             return
+        need_root = self.config.device.get("clock_root", True)
         restore = self.config.device.get("clock_restore", {})
         for path, val in restore.items():
-            self.shell(f"echo {val} > {path}", root=True, check=False, silent=True)
+            self.shell(f"echo {val} > {path}", root=need_root, check=False, silent=True)
         self.logger.ok("Clocks restored")
 
     # ── Thermal cooldown ──
