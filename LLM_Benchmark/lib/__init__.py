@@ -8,9 +8,11 @@ from .builder import Builder
 from .converter import ModelConverter
 from .stage_runner import StageRunner
 from .pipeline import BenchmarkPipeline, print_stages_overview
+from .app_builder import AppBuilder
 
 __all__ = [
     "ROOT", "MNN_ROOT", "C", "STAGE_FLAGS",
     "Logger", "Config", "DeviceManager", "Builder",
     "StageRunner", "BenchmarkPipeline", "print_stages_overview",
+    "AppBuilder",
 ]

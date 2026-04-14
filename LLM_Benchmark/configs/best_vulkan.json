@@ -1,0 +1,56 @@
+{
+    "_doc": [
+        "Optimal mobile GPU config via Vulkan (Adreno / Mali / PowerVR).",
+        "",
+        "WHY these flags:",
+        "  backend_type: vulkan — Uses the Vulkan compute pipeline. Preferred over OpenCL",
+        "                         on devices where the Vulkan driver is more mature (most",
+        "                         Samsung Exynos/Mali and recent MediaTek Dimensity SoCs).",
+        "  gpu_mode flags become MNN's thread_num directly (no separate threads field for GPU).",
+        "",
+        "  gpu_mode flags (bitwise-ORed):",
+        "    MNN_GPU_TUNING_WIDE (1<<2 = 4)",
+        "      — Benchmarks local-workgroup-size candidates on first run and caches results.",
+        "        Per MNNForwardType.h:63, only TUNING_NONE/HEAVY/WIDE are valid for Vulkan.",
+        "    MNN_GPU_RECORD_BATCH (1<<9 = 512)",
+        "      — Per MNNForwardType.h:76-78, for Vulkan this makes all ops share a single",
+        "        VkCommandBuffer. Eliminates per-op vkQueueSubmit overhead and enables the",
+        "        driver to reorder/fuse dispatches across the entire decoder layer.",
+        "",
+        "  NOTE: MNN_GPU_MEMORY_BUFFER / MNN_GPU_MEMORY_IMAGE are OpenCL-only flags and",
+        "  must NOT be set for Vulkan — they are meaningless and may cause undefined behavior.",
+        "",
+        "  precision: low       — FP16 compute via VK_KHR_shader_float16_int8. All Vulkan",
+        "                         1.1+ mobile GPUs support this; doubles ALU throughput.",
+        "  memory: low          — Compact Vulkan memory allocation; reuses VkDeviceMemory",
+        "                         blocks across non-overlapping op lifetimes.",
+        "  power: high          — Hints maximum GPU frequency to the driver.",
+        "",
+        "  quant_qkv: 11        — KV cache: K=INT8 + V=FP8 + flash attention (3|8).",
+        "  use_mmap: true       — Memory-maps weights before staging to GPU.",
+        "",
+        "  QKV_QUANT_OPTIONS: 11 — Applied via RuntimeManager::setHint to configure the",
+        "                          flash-attention + KV quantisation path.",
+        "  KVCACHE_SIZE_LIMIT: -1 — No per-layer cap; keep entire KV cache in GPU memory."
+    ],
+
+    "backend_type": "vulkan",
+    "gpu_mode": ["MNN_GPU_TUNING_WIDE", "MNN_GPU_RECORD_BATCH"],
+    "precision": "low",
+    "memory": "low",
+    "power": "high",
+
+    "quant_qkv": 11,
+    "use_mmap": true,
+
+    "session_mode": ["Session_Debug"],
+    "hints": {
+        "QKV_QUANT_OPTIONS": 11,
+        "KVCACHE_SIZE_LIMIT": -1
+    },
+
+    "warmup_rounds": 2,
+    "measure_rounds": 5,
+    "prompt_tokens": 128,
+    "max_gen_tokens": 64
+}

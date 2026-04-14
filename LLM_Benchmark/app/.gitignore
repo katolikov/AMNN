@@ -1,0 +1,23 @@
+# Build outputs
+*.iml
+.gradle
+/local.properties
+/.idea
+.DS_Store
+/build
+/captures
+.externalNativeBuild
+.cxx
+*.apk
+*.ap_
+*.dex
+
+# App build artifacts
+app/build/
+app/.cxx/
+.kotlin/
+
+# Injected at build time by AppBuilder
+app/src/main/jniLibs/
+app/src/main/assets/app_config.json
+app/src/main/assets/benchmark_config.json

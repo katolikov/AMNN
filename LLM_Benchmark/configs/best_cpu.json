@@ -1,0 +1,54 @@
+{
+    "_doc": [
+        "Optimal ARM big-core CPU config for real device (Snapdragon/Dimensity/Exynos).",
+        "",
+        "WHY these flags:",
+        "  threads: 4           — Targets the 4 big (Cortex-A7x/X-series) cores. Using all 8",
+        "                         cores adds little-core overhead that hurts latency.",
+        "  precision: low       — Enables FP16 NEON FMLA throughout MatMul and attention.",
+        "                         Halves memory bandwidth for weights/activations on ARMv8.2+.",
+        "  memory: low          — Uses MNN's compact allocator; shares buffers aggressively",
+        "                         across ops to minimise DRAM pressure and TLB misses.",
+        "  power: high          — Requests performance governor hint from MNN runtime;",
+        "                         scheduler prefers big cores over LITTLE efficiency cores.",
+        "  quant_qkv: 11        — Bitmask: 3 (K=INT8 + V=FP8) | 8 (flash attention).",
+        "                         Compresses KV cache ~4× and enables fused softmax kernel.",
+        "  prefer_decode: true  — Sets DYNAMIC_QUANT_OPTIONS bit 3; selects decode-optimised",
+        "                         INT8 GEMM kernels tuned for single-token throughput.",
+        "  use_mmap: true       — Memory-maps .mnn weight files instead of malloc+read;",
+        "                         the OS pages in weights on demand, saving ~50% peak RSS.",
+        "",
+        "  DYNAMIC_QUANT_OPTIONS: 1  — Enables per-tensor dynamic INT8 quantization for",
+        "                              general conv/matmul; combined with prefer_decode",
+        "                              the runtime applies value (1%8)+8 = 9 for decode kernels.",
+        "  CPU_LITTLECORE_DECREASE_RATE: 100  — Tells MNN that LITTLE cores have 0% capacity",
+        "                                       relative to big cores → all work goes to big cores.",
+        "  CPU_SME2_INSTRUCTIONS: 1  — Enables ARM SME2 codepath on cores that support it",
+        "                              (Cortex-X4/X925). No-op on older SoCs.",
+        "  KVCACHE_SIZE_LIMIT: -1    — Unlimited in-memory KV cache (no disk spill)."
+    ],
+
+    "backend_type": "cpu",
+    "threads": 4,
+    "precision": "low",
+    "memory": "low",
+    "power": "high",
+
+    "quant_qkv": 11,
+    "use_mmap": true,
+    "prefer_decode": true,
+
+    "session_mode": ["Session_Debug"],
+    "hints": {
+        "DYNAMIC_QUANT_OPTIONS": 1,
+        "CPU_LITTLECORE_DECREASE_RATE": 100,
+        "CPU_SME2_INSTRUCTIONS": 1,
+        "KVCACHE_SIZE_LIMIT": -1,
+        "INIT_THREAD_NUMBER": 4
+    },
+
+    "warmup_rounds": 2,
+    "measure_rounds": 5,
+    "prompt_tokens": 128,
+    "max_gen_tokens": 64
+}

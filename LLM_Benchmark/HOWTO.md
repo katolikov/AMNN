@@ -262,6 +262,138 @@ benchmark_results/
 - **`MNN_GPU_RECORD_BATCH`**: Not beneficial on Samsung Xclipse 950 — actually slower. Test on your device
 - **Kernel profiling overhead**: `MNN_GPU_TIME_PROFILE=ON` adds ~20% overhead. Don't use for absolute timing
 
+## Android App (com.mnn.benchmarkapp)
+
+The benchmark suite includes a Jetpack Compose Android application for interactive LLM/VLM inference testing.
+
+### App Architecture
+
+- **Jetpack Compose** UI with three screens: VLM, LLM, Settings
+- **Navigation** via `NavHost` with animated transitions (slide, fade, scale)
+- **JNI bridge** to MNN C++ inference engine (`libmnnbench.so`)
+- **Multi-source model downloader** (HuggingFace, ModelScope, Modelers)
+
+### Screen Overview
+
+| Screen | Purpose |
+|--------|---------|
+| **VLM** | Camera-based vision+language inference. Capture or pick images, analyze with configurable prompt |
+| **LLM** | Text chat interface with streaming responses, inline metrics, system prompt |
+| **Settings** | Backend configuration (CPU/OpenCL), precision, threads, sampler parameters |
+
+### Prompt Configuration
+
+Both VLM and LLM screens use an **icon button + popup dialog** pattern for prompt editing:
+
+- **VLM**: Tap the pencil icon (top-right corner) to open the "VLM Prompt" dialog. The current prompt is shown as a preview chip at the bottom. Default: "Describe this image."
+- **LLM**: Tap the pencil icon in the header (next to temperature) to open the "System Prompt" dialog. Default: "You are a helpful assistant."
+
+### Animations
+
+The app uses animated transitions throughout:
+
+- **Screen transitions**: VLM ↔ LLM slide horizontally; Settings slides up with scale
+- **Mode toggle**: Animated background color and scale on the VLM/LLM toggle
+- **Content elements**: Output overlays, metrics cards, and chat bubbles animate in with fade + slide
+- **Prompt button**: Scale animation on press
+- **AI Run button**: Gradient glow pulse when model is ready, spinner during loading/generation
+
+### Building the App
+
+The recommended way to build the app is via `run_benchmark.py --build-app`, which handles library provisioning, config injection, and APK deployment automatically:
+
+```bash
+cd LLM_Benchmark/
+
+# Build and deploy the app using a config JSON
+python3 run_benchmark.py configs/app_config.json --build-app
+
+# Build with custom icon
+python3 run_benchmark.py configs/app_config.json --build-app --icon /path/to/icon.png
+
+# Build with verbose logging
+python3 run_benchmark.py configs/app_config.json --build-app --debug-log
+```
+
+The `--build-app` pipeline performs 4 steps automatically:
+1. **Configure** — injects `app_config.json` into app assets, generates `GeneratedConfig.kt` with compile-time defaults
+2. **Provision libraries** — finds prebuilt MNN `.so` files (or builds from source if needed)
+3. **Build APK** — runs Gradle `assembleDebug`
+4. **Deploy** — installs APK via `adb install -r` and optionally pushes model files
+
+#### App Config JSON
+
+The app config uses a different structure from benchmark configs (see `configs/app_config.json`):
+
+```json
+{
+  "engine": {
+    "backend": "cpu",
+    "threads": 4,
+    "precision": "low",
+    "memory": "low",
+    "power": "high",
+    "use_mmap": true,
+    "attention_mode": 8
+  },
+  "sampler": {
+    "temperature": 1.0
+  },
+  "generation": {
+    "max_gen_tokens": 512
+  },
+  "model": {
+    "device_path": "/data/local/tmp/mnn_bench/model",
+    "host_path": ""
+  },
+  "vlm_prompt": "Describe this image.",
+  "build": {
+    "ndk_path": "/path/to/android-ndk",
+    "adb_device_id": "DEVICE_SERIAL"
+  }
+}
+```
+
+#### Direct Gradle (alternative)
+
+For development without the Python orchestrator:
+
+```bash
+cd LLM_Benchmark/app/
+./gradlew assembleDebug
+./gradlew installDebug
+```
+
+### Running E2E Tests
+
+```bash
+cd LLM_Benchmark/e2e_tests/
+
+# Install Python dependencies
+pip install -r requirements.txt
+
+# Run all tests (auto-detects connected device)
+pytest -v
+
+# Target a specific device
+DEVICE_SERIAL=R5CY71BJJ9D pytest -v
+
+# Run a specific test suite
+pytest test_06_prompt_dialog_and_animations.py -v
+```
+
+### Test Suites
+
+| Suite | File | Coverage |
+|-------|------|----------|
+| UI & Layout | `test_01_ui_layout.py` | Temperature display, button integrity, screen elements |
+| Inference Config | `test_02_inference_config.py` | OpenCL/CPU settings, OPs profiling, backend switching |
+| Model Management | `test_03_model_management.py` | Download flow, ADB push, model loading states |
+| Features | `test_04_features.py` | LLM chat, vision, execution modes |
+| Advanced | `test_05_advanced.py` | Settings persistence, stress tests, temperature placement |
+| Prompt & Animations | `test_06_prompt_dialog_and_animations.py` | Prompt button/dialog, screen transitions, mode toggle |
+| Output & Gallery | `test_07_output_and_gallery.py` | VLM history reset, gallery attachment, LLM output, streaming |
+
 ## Standalone Report Generation
 
 Reports can be generated independently from existing results:

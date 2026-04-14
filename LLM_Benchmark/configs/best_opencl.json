@@ -1,0 +1,61 @@
+{
+    "_doc": [
+        "Optimal mobile GPU config via OpenCL (Adreno / Mali / PowerVR).",
+        "",
+        "WHY these flags:",
+        "  backend_type: opencl — Runs all MatMul, attention, and MLP ops on the GPU.",
+        "  gpu_mode flags become MNN's thread_num directly (no separate threads field for GPU).",
+        "",
+        "  gpu_mode flags (bitwise-ORed by the C++ binary):",
+        "    MNN_GPU_MEMORY_BUFFER (1<<6 = 64)",
+        "      — Uses OpenCL buffer objects instead of image2d. Buffers support arbitrary",
+        "        shapes without texture size limits and allow zero-copy between ops when",
+        "        the driver supports SVM or fine-grained shared virtual memory.",
+        "    MNN_GPU_TUNING_WIDE (1<<2 = 4)",
+        "      — On first run, benchmarks a wide set of local-workgroup-size candidates",
+        "        per kernel and caches the winners to mnn_cachefile.bin. Subsequent runs",
+        "        skip tuning and replay the optimal dispatch parameters.",
+        "    MNN_GPU_RECORD_BATCH (1<<9 = 512)",
+        "      — Records 10 consecutive kernels into a single OpenCL command-buffer",
+        "        recording (clEnqueueNDRangeKernel batching). On Qualcomm Adreno this",
+        "        reduces per-dispatch CPU overhead by ~5-8× via the CL recording extension.",
+        "",
+        "  precision: low       — FP16 compute on GPU. Modern mobile GPUs have 2× FP16",
+        "                         throughput vs FP32 (Adreno 730+: 2 TFLOPS FP16).",
+        "  memory: low          — Compact GPU buffer allocation; frees intermediate",
+        "                         buffers as soon as possible to stay within GPU VRAM.",
+        "  power: high          — Hints the GPU driver to use maximum clock frequency.",
+        "",
+        "  quant_qkv: 11        — KV cache: K=INT8 + V=FP8 + flash attention (3|8).",
+        "                         The quantised KV cache lives in GPU memory, saving VRAM.",
+        "  use_mmap: true       — Memory-maps weights on the CPU side before upload to GPU;",
+        "                         avoids double-buffering during model load.",
+        "",
+        "  OP_ENCODER_NUMBER_FOR_COMMIT: 10",
+        "      — Batches 10 ops into a single GPU command-buffer submission (encoder commit).",
+        "        Reduces clFlush / vkQueueSubmit overhead. The optimal value is 6-15;",
+        "        10 balances latency and throughput for typical LLM decoder layers.",
+        "  QKV_QUANT_OPTIONS: 11  — Mirrors quant_qkv; applied via RuntimeManager hint."
+    ],
+
+    "backend_type": "opencl",
+    "gpu_mode": ["MNN_GPU_MEMORY_BUFFER", "MNN_GPU_TUNING_WIDE", "MNN_GPU_RECORD_BATCH"],
+    "precision": "low",
+    "memory": "low",
+    "power": "high",
+
+    "quant_qkv": 11,
+    "use_mmap": true,
+
+    "session_mode": ["Session_Debug"],
+    "hints": {
+        "QKV_QUANT_OPTIONS": 11,
+        "OP_ENCODER_NUMBER_FOR_COMMIT": 10,
+        "KVCACHE_SIZE_LIMIT": -1
+    },
+
+    "warmup_rounds": 2,
+    "measure_rounds": 5,
+    "prompt_tokens": 128,
+    "max_gen_tokens": 64
+}

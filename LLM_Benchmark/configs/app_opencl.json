@@ -1,0 +1,47 @@
+{
+  "engine": {
+    "backend": "opencl",
+    "threads": 4,
+    "precision": "low",
+    "memory": "low",
+    "power": "high",
+    "use_mmap": true,
+    "attention_mode": 0,
+    "dynamic_quant": 0,
+    "kvcache_limit": 0,
+    "max_all_tokens": 4096,
+    "gpu_mode": [
+      "MNN_GPU_MEMORY_BUFFER",
+      "MNN_GPU_TUNING_WIDE"
+    ],
+    "no_tuning": false,
+    "session_mode": [
+      "Session_Release"
+    ],
+    "hints": {
+      "MAX_TUNING_NUMBER": 50,
+      "MEM_ALLOCATOR_TYPE": 0,
+      "DYNAMIC_QUANT_OPTIONS": 0
+    }
+  },
+  "sampler": {
+    "temperature": 1.0,
+    "repetition_penalty": 1.0,
+    "presence_penalty": 0.0,
+    "frequency_penalty": 0.0,
+    "penalty_window": 0
+  },
+  "generation": {
+    "max_gen_tokens": 512,
+    "prompt_tokens": 128
+  },
+  "model": {
+    "device_path": "/data/local/tmp/mnn_bench/model",
+    "host_path": ""
+  },
+  "vlm_prompt": "Describe this image.",
+  "build": {
+    "ndk_path": "/path/to/android-ndk",
+    "adb_device_id": "DEVICE_SERIAL"
+  }
+}

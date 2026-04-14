@@ -1,0 +1,74 @@
+{
+    "//": "SmolVLM2 kernel profiling: OpenCL with MNN_GPU_TIME_PROFILE (separate build)",
+    "build": {
+        "ndk_path": "/Users/artemkatolikov/Library/Android/sdk/ndk/27.0.12077973",
+        "cmake_path": "cmake",
+        "build_type": "Release",
+        "jobs": 8,
+        "generator": "",
+        "cmake_flags": [
+            "-DANDROID_ABI=arm64-v8a",
+            "-DANDROID_STL=c++_static",
+            "-DANDROID_NATIVE_API_LEVEL=android-28",
+            "-DMNN_ARM82=ON",
+            "-DMNN_OPENCL=ON",
+            "-DMNN_VULKAN=OFF",
+            "-DMNN_OPENMP=ON",
+            "-DMNN_CPU_WEIGHT_DEQUANT_GEMM=ON",
+            "-DMNN_BUILD_FOR_ANDROID_COMMAND=true",
+            "-DNATIVE_LIBRARY_OUTPUT=.",
+            "-DMNN_IMGCODECS=ON",
+            "-DMNN_GPU_TIME_PROFILE=ON"
+        ]
+    },
+    "model": {
+        "converted_mnn_dir": "/tmp/SmolVLM2-MNN",
+        "model_type": "smolvlm"
+    },
+    "inputs": {
+        "images": [
+            "/Users/artemkatolikov/Desktop/image.png"
+        ],
+        "vlm_prompt_template": "What are the labels GT and PRED? Describe the photo: <img>img0</img>"
+    },
+    "outputs": {
+        "host_output_dir": "./benchmark_results",
+        "logcat_filename": "logcat_capture.txt"
+    },
+    "device": {
+        "adb_device_id": "R5CY71BJJ9D",
+        "target_dir": "/data/local/tmp/mnn_bench",
+        "thermal_sensor": "/sys/kernel/gpu/gpu_tmu",
+        "thermal_target": 25,
+        "thermal_timeout": 300,
+        "thermal_poll": 5
+    },
+    "stages": [
+        {
+            "name": "OPENCL(Kernel ops)",
+            "enabled": true,
+            "backend": "opencl",
+            "gpu_mode": [
+                "MNN_GPU_MEMORY_BUFFER",
+                "MNN_GPU_TUNING_WIDE"
+            ],
+            "precision": "low",
+            "memory": "low",
+            "power": "high",
+            "no_tuning": false,
+            "warmup_rounds": 1,
+            "measure_rounds": 1,
+            "prompt_tokens": 0,
+            "max_gen_tokens": 200,
+            "enable_op_profile": true,
+            "session_mode": [
+                "Session_Debug"
+            ],
+            "use_vlm_input": true,
+            "vlm_image_index": 0,
+            "mllm_backend": "cpu",
+            "mllm_precision": "normal",
+            "mllm_threads": 4
+        }
+    ]
+}

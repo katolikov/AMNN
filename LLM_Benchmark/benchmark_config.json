@@ -1,0 +1,234 @@
+{
+    "//": "MNN LLM/VLM Benchmark Suite — Master Configuration",
+
+    "build": {
+        "ndk_path": "/Users/artemkatolikov/Library/Android/sdk/ndk/27.0.12077973",
+        "cmake_path": "cmake",
+        "build_type": "Release",
+        "jobs": 8,
+        "generator": "Ninja",
+        "use_vulkan_image": false,
+
+        "cmake_flags": [
+            "-DANDROID_ABI=arm64-v8a",
+            "-DANDROID_STL=c++_static",
+            "-DANDROID_NATIVE_API_LEVEL=android-27",
+            "-DMNN_BUILD_SIRC_BENCHMARK=ON",
+            "-DMNN_BUILD_CONVERTER=ON",
+            "-DMNN_SEP_BUILD=OFF",
+            "-DMNN_OPENCL=ON",
+            "-DMNN_VULKAN=ON",
+            "-DMNN_OPENMP=ON",
+            "-DMNN_BUILD_FOR_ANDROID_COMMAND=true",
+            "-DNATIVE_LIBRARY_OUTPUT=."
+        ],
+
+        "debug_cmake_flags": [
+            "-DMNN_DEBUG=ON",
+            "-DMNN_GPU_TRACE=ON",
+            "-DMNN_GPU_TIME_PROFILE=ON",
+            "-DOPENCL_FALLBACK_LOG=ON",
+            "-DOPENCL_LOG_VERBOSE=ON",
+            "-DMNN_VULKAN_DEBUG=ON",
+            "-DMNN_OP_SUPPORT_LOG=ON",
+            "-DMNN_VULKAN_DUMP_MEMORY_USAGE=ON",
+            "-DMNN_VULKAN_DEBUG_COPY=ON",
+            "-DMNN_DEBUG_TENSOR_SIZE=ON",
+            "-DMNN_DEBUG_MEMORY=OFF",
+            "-DMNN_PIPELINE_DEBUG=ON",
+            "-DLOG_VERBOSE_SIRC=ON"
+        ]
+    },
+
+    "model": {
+        "source_path": "HuggingFaceTB/SmolVLM2-2.2B-Instruct",
+        "model_type": "smolvlm",
+        "converted_mnn_dir": "",
+        "gguf_path": "",
+
+        "conversion": {
+            "enabled": true,
+            "export_script": "transformers/llm/export/llmexport.py",
+            "quant_bit": 4,
+            "quant_block": 64,
+            "embed_bit": 16,
+            "sym": false,
+            "export_format": "mnn",
+            "visual_quant_bit": 8,
+            "extra_args": []
+        }
+    },
+
+    "inputs": {
+        "prompts": [
+            "What is the capital of France?",
+            "Explain the theory of relativity in simple terms.",
+            "Write a short poem about the ocean."
+        ],
+        "image_dir": "",
+        "images": [
+            "/home/user/data/test_image_01.jpg"
+        ],
+        "vlm_prompt_template": "Describe this image in detail: <img>img0</img>"
+    },
+
+    "outputs": {
+        "host_output_dir": "./benchmark_results",
+        "host_model_export_dir": "./exported_models",
+        "logcat_filename": "logcat_capture.txt",
+        "metrics_filename": "metrics.json"
+    },
+
+    "device": {
+        "adb_device_id": "",
+        "target_dir": "/data/local/tmp/mnn_bench",
+        "clock_settings": {
+            "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor": "performance",
+            "/sys/devices/system/cpu/cpu4/cpufreq/scaling_governor": "performance",
+            "/sys/devices/system/cpu/cpu7/cpufreq/scaling_governor": "performance"
+        },
+        "clock_restore": {
+            "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor": "schedutil",
+            "/sys/devices/system/cpu/cpu4/cpufreq/scaling_governor": "schedutil",
+            "/sys/devices/system/cpu/cpu7/cpufreq/scaling_governor": "schedutil"
+        }
+    },
+
+    "stages": [
+        {
+            "name": "cpu_best",
+            "enabled": true,
+            "backend": "cpu",
+            "threads": 4,
+            "precision": "low",
+            "memory": "low",
+            "power": "high",
+            "quant_qkv": 11,
+            "prefer_decode": true,
+            "use_mmap": true,
+            "session_mode": ["Session_Debug"],
+            "hints": {
+                "DYNAMIC_QUANT_OPTIONS": 1,
+                "CPU_LITTLECORE_DECREASE_RATE": 100,
+                "CPU_SME2_INSTRUCTIONS": 1,
+                "KVCACHE_SIZE_LIMIT": -1,
+                "INIT_THREAD_NUMBER": 4
+            },
+            "warmup_rounds": 2,
+            "measure_rounds": 5,
+            "prompt_tokens": 128,
+            "max_gen_tokens": 64,
+            "enable_op_profile": false
+        },
+        {
+            "name": "cpu_opprofile",
+            "enabled": true,
+            "backend": "cpu",
+            "threads": 4,
+            "precision": "low",
+            "memory": "low",
+            "power": "high",
+            "quant_qkv": 11,
+            "use_mmap": true,
+            "session_mode": ["Session_Debug"],
+            "hints": {
+                "DYNAMIC_QUANT_OPTIONS": 1,
+                "CPU_LITTLECORE_DECREASE_RATE": 100,
+                "CPU_SME2_INSTRUCTIONS": 1
+            },
+            "warmup_rounds": 1,
+            "measure_rounds": 1,
+            "prompt_tokens": 64,
+            "max_gen_tokens": 16,
+            "enable_op_profile": true
+        },
+        {
+            "name": "opencl_best",
+            "enabled": true,
+            "backend": "opencl",
+            "gpu_mode": ["MNN_GPU_MEMORY_BUFFER", "MNN_GPU_TUNING_WIDE", "MNN_GPU_RECORD_BATCH"],
+            "precision": "low",
+            "memory": "low",
+            "power": "high",
+            "quant_qkv": 11,
+            "use_mmap": true,
+            "session_mode": ["Session_Debug"],
+            "hints": {
+                "QKV_QUANT_OPTIONS": 11,
+                "OP_ENCODER_NUMBER_FOR_COMMIT": 10,
+                "KVCACHE_SIZE_LIMIT": -1
+            },
+            "warmup_rounds": 2,
+            "measure_rounds": 5,
+            "prompt_tokens": 128,
+            "max_gen_tokens": 64,
+            "enable_op_profile": false
+        },
+        {
+            "name": "vulkan_best",
+            "enabled": true,
+            "backend": "vulkan",
+            "gpu_mode": ["MNN_GPU_TUNING_WIDE", "MNN_GPU_RECORD_BATCH"],
+            "precision": "low",
+            "memory": "low",
+            "power": "high",
+            "quant_qkv": 11,
+            "use_mmap": true,
+            "session_mode": ["Session_Debug"],
+            "hints": {
+                "QKV_QUANT_OPTIONS": 11,
+                "KVCACHE_SIZE_LIMIT": -1
+            },
+            "warmup_rounds": 2,
+            "measure_rounds": 5,
+            "prompt_tokens": 128,
+            "max_gen_tokens": 64,
+            "enable_op_profile": false
+        },
+        {
+            "name": "vlm_cpu_single",
+            "enabled": false,
+            "backend": "cpu",
+            "threads": 4,
+            "precision": "low",
+            "memory": "low",
+            "power": "high",
+            "quant_qkv": 11,
+            "use_mmap": true,
+            "session_mode": [],
+            "hints": {
+                "CPU_LITTLECORE_DECREASE_RATE": 100,
+                "CPU_SME2_INSTRUCTIONS": 1
+            },
+            "warmup_rounds": 1,
+            "measure_rounds": 3,
+            "prompt_tokens": 0,
+            "max_gen_tokens": 64,
+            "enable_op_profile": false,
+            "use_vlm_input": true,
+            "vlm_image_index": 0
+        },
+        {
+            "name": "vlm_cpu_all_images",
+            "enabled": false,
+            "backend": "cpu",
+            "threads": 4,
+            "precision": "low",
+            "memory": "low",
+            "power": "high",
+            "quant_qkv": 11,
+            "use_mmap": true,
+            "session_mode": [],
+            "hints": {
+                "CPU_LITTLECORE_DECREASE_RATE": 100,
+                "CPU_SME2_INSTRUCTIONS": 1
+            },
+            "warmup_rounds": 1,
+            "measure_rounds": 3,
+            "prompt_tokens": 0,
+            "max_gen_tokens": 64,
+            "enable_op_profile": false,
+            "use_vlm_input": true
+        }
+    ]
+}

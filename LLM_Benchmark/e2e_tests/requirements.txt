@@ -1,0 +1,14 @@
+# E2E Test Dependencies for MNN Benchmark App
+# Install: pip install -r requirements.txt
+
+# Test framework
+pytest>=7.4.0
+
+# Android UI automation
+uiautomator2>=3.2.0
+
+# HTTP client (used by uiautomator2 internally)
+requests>=2.31.0
+
+# ADB interface (optional, uiautomator2 handles most ADB calls)
+adbutils>=2.0.0
