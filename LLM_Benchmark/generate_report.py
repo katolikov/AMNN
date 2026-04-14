@@ -144,6 +144,15 @@ vlm_prompt = inputs_cfg.get("vlm_prompt_template", "")
 images     = inputs_cfg.get("images", [])
 image_desc = Path(images[0]).name if images else ""
 
+# Load device info (collected from ADB at runtime)
+device_info = {}
+for d in input_dirs:
+    di_path = d / "device_info.json"
+    if di_path.exists():
+        device_info = json.loads(di_path.read_text())
+        print(f"Loaded device info: {device_info.get('brand', '?')} {device_info.get('model', '?')}")
+        break
+
 # Merge stage configs from all configs
 stage_configs = {}
 for cfg in all_bench_cfgs:
@@ -488,10 +497,50 @@ def _fmt(v):
 md = []
 md.append(f"# {model_name} Benchmark Report")
 md.append("")
-md.append(f"| | |")
-md.append(f"|---|---|")
+
+# ── Device Information ──
+if device_info:
+    md.append("## Device Information")
+    md.append("")
+    md.append("| Property | Value |")
+    md.append("|----------|-------|")
+    brand = (device_info.get("brand", "") or "").title()
+    model = device_info.get("model", "")
+    product = device_info.get("product", "")
+    md.append(f"| **Device** | {brand} {model} ({product}) |")
+    chipset = device_info.get("chipset", "")
+    platform = device_info.get("platform", "")
+    if chipset or platform:
+        md.append(f"| **Chipset** | {chipset} ({platform}) |")
+    gpu_model = device_info.get("gpu_model", "")
+    if gpu_model:
+        md.append(f"| **GPU** | {gpu_model} |")
+    gpu_clock = device_info.get("gpu_clock_range", "")
+    if gpu_clock:
+        md.append(f"| **GPU Clock** | {gpu_clock} |")
+    gpu_temp = device_info.get("gpu_temp", "")
+    if gpu_temp:
+        md.append(f"| **GPU Temp (at start)** | {gpu_temp}°C |")
+    cores = device_info.get("cpu_cores", "")
+    if cores:
+        md.append(f"| **CPU Cores** | {cores} |")
+    notable = device_info.get("cpu_notable_features", "")
+    if notable:
+        md.append(f"| **CPU Features** | {notable} |")
+    android = device_info.get("android_version", "")
+    sdk = device_info.get("sdk_version", "")
+    if android:
+        md.append(f"| **Android** | {android} (API {sdk}) |")
+    md.append("")
+
+# ── Benchmark Info ──
+md.append("## Benchmark Info")
+md.append("")
+md.append("| | |")
+md.append("|---|---|")
 md.append(f"| **Model** | {model_name} |")
-md.append(f"| **Device** | {device_id} |")
+if not device_info:
+    md.append(f"| **Device** | {device_id} |")
 if image_desc:
     md.append(f"| **Image** | {image_desc} |")
 if vlm_prompt:
@@ -725,16 +774,43 @@ stage_names = list(stages.keys())
 ncols = max(3, len(stage_names) + 2)
 ws.merge_cells(f"A1:{get_column_letter(ncols)}1")
 
-ws.cell(2, 1, f"Device: {device_id}")
-ws.cell(2, 1).font = Font(size=11, color="555555")
-ws.merge_cells(f"A2:{get_column_letter(ncols)}2")
+row = 3
+# Device info block in Excel
+if device_info:
+    ws.cell(row, 1, "Device Information")
+    ws.cell(row, 1).font = _SEC_FNT
+    row += 1
+    dev_rows = [
+        ("Device", f"{(device_info.get('brand','') or '').title()} {device_info.get('model','')}"),
+        ("Chipset", f"{device_info.get('chipset','')} ({device_info.get('platform','')})"),
+        ("GPU", device_info.get("gpu_model", "")),
+        ("GPU Clock", device_info.get("gpu_clock_range", "")),
+        ("CPU Cores", device_info.get("cpu_cores", "")),
+        ("CPU Features", device_info.get("cpu_notable_features", "")),
+        ("Android", f"{device_info.get('android_version','')} (API {device_info.get('sdk_version','')})"),
+    ]
+    for label, val in dev_rows:
+        if val and val.strip() and val.strip() != "()":
+            ws.cell(row, 1, label).font = Font(bold=True, size=10)
+            ws.cell(row, 2, val.strip())
+            ws.merge_cells(f"B{row}:{get_column_letter(ncols)}{row}")
+            _bdr(ws, row, 2)
+            row += 1
+    row += 1
+else:
+    ws.cell(row, 1, f"Device: {device_id}")
+    ws.cell(row, 1).font = Font(size=11, color="555555")
+    ws.merge_cells(f"A{row}:{get_column_letter(ncols)}{row}")
+    row += 2
 
 if vlm_prompt:
-    ws.cell(3, 1, f"Prompt: {vlm_prompt}")
-    ws.cell(3, 1).font = Font(size=10, color="777777", italic=True)
-    ws.merge_cells(f"A3:{get_column_letter(ncols)}3")
+    ws.cell(row, 1, "Prompt")
+    ws.cell(row, 1).font = Font(bold=True, size=10)
+    ws.cell(row, 2, vlm_prompt)
+    ws.merge_cells(f"B{row}:{get_column_letter(ncols)}{row}")
+    row += 1
 
-row = 5
+row += 1
 headers = ["Metric", "Unit"] + stage_names
 for c, h in enumerate(headers, 1):
     ws.cell(row, c, h)

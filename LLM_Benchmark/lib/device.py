@@ -212,6 +212,66 @@ class DeviceManager:
         sys.stdout.flush()
         self.logger.ok(f"GPU cooled to {temp}°C in {int(elapsed)}s")
 
+    # ── Device info collection ──
+    def collect_device_info(self) -> dict:
+        """Collect device hardware info via ADB for reports."""
+        def _sh(cmd: str) -> str:
+            r = self.shell(cmd, capture=True, check=False, silent=True)
+            return r.stdout.strip() if r.returncode == 0 else ""
+
+        info = {}
+        # Basic device
+        info["model"] = _sh("getprop ro.product.model")
+        info["brand"] = _sh("getprop ro.product.brand")
+        info["product"] = _sh("getprop ro.product.name")
+        info["chipset"] = _sh("getprop ro.hardware.chipname")
+        info["platform"] = _sh("getprop ro.board.platform")
+        info["android_version"] = _sh("getprop ro.build.version.release")
+        info["sdk_version"] = _sh("getprop ro.build.version.sdk")
+
+        # GPU
+        info["gpu_model"] = _sh("cat /sys/kernel/gpu/gpu_model")
+        info["gpu_max_clock"] = _sh("cat /sys/kernel/gpu/gpu_max_clock")
+        info["gpu_min_clock"] = _sh("cat /sys/kernel/gpu/gpu_min_clock")
+
+        # GPU temp
+        sensor = self.config.device.get("thermal_sensor", "/sys/kernel/gpu/gpu_tmu")
+        temp = self.read_temperature(sensor)
+        if temp is not None:
+            info["gpu_temp"] = str(temp)
+
+        # CPU info (first core)
+        cpuinfo = _sh("cat /proc/cpuinfo")
+        if cpuinfo:
+            for line in cpuinfo.splitlines():
+                if line.startswith("Features"):
+                    info["cpu_features"] = line.split(":", 1)[1].strip()
+                    break
+            # Count cores
+            core_count = sum(1 for l in cpuinfo.splitlines() if l.startswith("processor"))
+            info["cpu_cores"] = str(core_count)
+
+        # Format GPU clock as range
+        if info.get("gpu_min_clock") and info.get("gpu_max_clock"):
+            try:
+                lo = int(info["gpu_min_clock"]) // 1000 if int(info["gpu_min_clock"]) > 1000 else int(info["gpu_min_clock"])
+                hi = int(info["gpu_max_clock"]) // 1000 if int(info["gpu_max_clock"]) > 1000 else int(info["gpu_max_clock"])
+                info["gpu_clock_range"] = f"{lo}–{hi} MHz"
+            except ValueError:
+                pass
+
+        # Extract notable CPU features
+        feats = info.get("cpu_features", "")
+        notable = []
+        for tag in ["sve2", "sve", "bf16", "i8mm", "sha512", "sha3", "dotprod", "asimddp"]:
+            if tag in feats.lower():
+                notable.append(tag.upper())
+        if notable:
+            info["cpu_notable_features"] = ", ".join(notable)
+
+        self.logger.ok(f"Device info collected: {info.get('brand', '?')} {info.get('model', '?')}, GPU: {info.get('gpu_model', '?')}")
+        return info
+
     # ── Push all files ──
     def push_all(self, binary: pathlib.Path, model_dir: pathlib.Path):
         target = self.config.target_dir

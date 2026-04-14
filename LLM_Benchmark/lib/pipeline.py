@@ -113,9 +113,10 @@ class BenchmarkPipeline:
             self.logger.info(f"Device: {C.BOLD}{self.config.device_id}{C.RESET}")
         self.device.push_all(binary, model_dir)
 
-        # 5. Clocks
-        self.logger.step(5, TOTAL_STEPS, "Clock Management")
+        # 5. Clocks & Device Info
+        self.logger.step(5, TOTAL_STEPS, "Clock Management & Device Info")
         self.device.apply_clocks()
+        self._device_info = self.device.collect_device_info()
 
         # 6. Run stages
         self.logger.step(6, TOTAL_STEPS, f"Execute Benchmarks ({len(stages)} stages)")
@@ -147,6 +148,9 @@ class BenchmarkPipeline:
         combined_dir = output_root / "_combined" / self.timestamp
         combined_dir.mkdir(parents=True, exist_ok=True)
         self.config.save_to(combined_dir)
+        # Save device info for report generator
+        if self._device_info:
+            (combined_dir / "device_info.json").write_text(json.dumps(self._device_info, indent=2))
         self.device.capture_logcat(combined_dir)
         self.device.pull_artifacts(combined_dir)
 
