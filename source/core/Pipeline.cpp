@@ -746,9 +746,18 @@ static ErrorCode _InsertCopy(Schedule::PipelineInfo& mInfo, std::map<Tensor*, st
                         }
                         {
                             auto titer = shapeFixConstCache.find(std::make_pair(des, curBackend));
-                            if (titer != shapeFixConstCache.end()) {
+                            // Reuse cached wrap tensor only if the original content is still alive.
+                            // Otherwise the cached entry is stale (the source mContent has been
+                            // freed and another Tensor may have been allocated at the same `des`
+                            // address) and reusing it leaves `newTensor` pointing at an invalid
+                            // descriptor, which later crashes inside CPU ops as a null-tensor
+                            // dereference (Tensor::size on null `this`).
+                            if (titer != shapeFixConstCache.end() && !titer->second.first.expired()) {
                                 newTensor = titer->second.second.get();
                             } else {
+                                if (titer != shapeFixConstCache.end()) {
+                                    shapeFixConstCache.erase(titer);
+                                }
                                 std::shared_ptr<MNN::Tensor> tensor(new Tensor);
                                 shapeFixConstCache.insert(std::make_pair(std::make_pair(des, curBackend), std::make_pair(std::weak_ptr<Tensor::InsideDescribe::NativeInsideDescribe>(TensorUtils::getDescribeOrigin(t)->mContent), tensor)));
                                 newTensor = tensor.get();
@@ -808,6 +817,21 @@ static ErrorCode _InsertCopy(Schedule::PipelineInfo& mInfo, std::map<Tensor*, st
                             cmd.workInputs = {iter.workInputs[i]};
                         }
                     }
+                }
+            }
+            // Defense in depth: if any null tensor leaked into workInputs/workOutputs
+            // (e.g. from a future bug in the wrap path) fail fast here instead of
+            // crashing later inside an op's onExecute via Tensor::size on null `this`.
+            for (auto* wt : iter.workInputs) {
+                if (nullptr == wt) {
+                    MNN_ERROR("Pipeline::_allocForTensor: null tensor in workInputs after wrap setup\n");
+                    return INPUT_DATA_ERROR;
+                }
+            }
+            for (auto* wt : iter.workOutputs) {
+                if (nullptr == wt) {
+                    MNN_ERROR("Pipeline::_allocForTensor: null tensor in workOutputs after wrap setup\n");
+                    return INPUT_DATA_ERROR;
                 }
             }
         }
