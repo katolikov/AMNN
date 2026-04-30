@@ -1028,6 +1028,27 @@ ErrorCode Pipeline::_allocForTensor(int index, bool allocInput) {
 #ifdef MNN_PIPELINE_DEBUG
                 resizeNumber++;
 #endif
+                // Strict pre-onResize guard: a null tensor here would otherwise be
+                // captured by the op into a member variable and surface as a
+                // null-`this` Tensor::size crash inside its onExecute worker.
+                bool _hasNull = false;
+                for (int v = 0; v < (int)iter.workInputs.size(); ++v) {
+                    if (nullptr == iter.workInputs[v]) {
+                        MNN_ERROR("Pipeline::onResize: null input[%d] for op type=%s\n",
+                                  v, EnumNameOpType(iter.op->type()));
+                        _hasNull = true;
+                    }
+                }
+                for (int v = 0; v < (int)iter.workOutputs.size(); ++v) {
+                    if (nullptr == iter.workOutputs[v]) {
+                        MNN_ERROR("Pipeline::onResize: null output[%d] for op type=%s\n",
+                                  v, EnumNameOpType(iter.op->type()));
+                        _hasNull = true;
+                    }
+                }
+                if (_hasNull) {
+                    return INPUT_DATA_ERROR;
+                }
                 auto code = iter.execution->onResize(iter.workInputs, iter.workOutputs);
                 if (NO_ERROR != code) {
 #ifdef MNN_PIPELINE_DEBUG
@@ -1188,6 +1209,27 @@ ErrorCode Pipeline::execute() {
                 MNN_PRINT("Group: %d, %s - %d, type=%s, inputs: %s, devices: %s - %s\n", cmd.group, info.op->name()->c_str(), cmdIndex, EnumNameOpType(cmd.op->type()), groupOfInput.c_str(), deviceOfInput.c_str(), deviceOfOutput.c_str());
             }
 #endif
+            // Strict pre-onExecute guard. Any null tensor reaching an Execution's
+            // worker (e.g. via a CPU fallback wrap path that skipped allocation)
+            // crashes deep inside the op as Tensor::size on a null `this`. Return
+            // a clean INPUT_DATA_ERROR with the op type printed so the offender
+            // is identifiable from logcat instead of from a tombstone.
+            for (int v = 0; v < (int)cmd.workInputs.size(); ++v) {
+                if (nullptr == cmd.workInputs[v]) {
+                    MNN_ERROR("Pipeline::execute: null input[%d] for op type=%s, skipping\n",
+                              v, EnumNameOpType(cmd.op->type()));
+                    _exitExecute();
+                    return INPUT_DATA_ERROR;
+                }
+            }
+            for (int v = 0; v < (int)cmd.workOutputs.size(); ++v) {
+                if (nullptr == cmd.workOutputs[v]) {
+                    MNN_ERROR("Pipeline::execute: null output[%d] for op type=%s, skipping\n",
+                              v, EnumNameOpType(cmd.op->type()));
+                    _exitExecute();
+                    return INPUT_DATA_ERROR;
+                }
+            }
             auto code = cmd.execution->onExecute(cmd.workInputs, cmd.workOutputs);
             if (NO_ERROR != code) {
                 _exitExecute();
