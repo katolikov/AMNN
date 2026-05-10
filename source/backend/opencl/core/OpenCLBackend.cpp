@@ -61,21 +61,7 @@ CLRuntime::CLRuntime(const Backend::Info& info){
     mTunedInfo = new TuneInfo;
     
     mImagePool.reset(new ImagePool(mOpenCLRuntime->context()));
-    // Pool buffer flags. Default keeps the original HOST_PTR-mapped path used by every
-    // backend prior to this change — preserves behaviour for Adreno / Mali / Intel / RADEON.
-    //
-    // For Samsung Xclipse (Exynos 2200+) the AMD-RDNA-derived driver maps HOST_PTR regions
-    // as GPU-uncached to keep CPU coherency without explicit map. The result: every weight
-    // / activation read goes through DRAM, and memory-bound kernels (Raster, Conv with
-    // small arithmetic intensity) lose ~10-15% throughput when CPU/NPU compete for DRAM
-    // bandwidth (PNG encoding, ENN running on NPU, etc.). Dropping HOST_PTR here puts the
-    // allocations into the default GPU-L2-cacheable region, where on-device weights stay
-    // resident in the 1 MB L2 across kernels and are immune to bandwidth contention.
-    cl_mem_flags poolFlags = CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR;
-    if (mOpenCLRuntime->getGpuType() == SAMSUNG) {
-        poolFlags = CL_MEM_READ_WRITE;
-    }
-    mBufferPool.reset(new BufferPool(mOpenCLRuntime->context(), poolFlags));
+    mBufferPool.reset(new BufferPool(mOpenCLRuntime->context(), CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR));
 }
 
 CLRuntime::~CLRuntime() {
@@ -334,14 +320,8 @@ OpenCLBackend::OpenCLBackend(BackendConfig::PrecisionMode precision, BackendConf
         }
 
         mImagePoolFirst.reset(new ImagePool(mOpenCLRuntime->context()));
-        // Samsung Xclipse: drop HOST_PTR so pool buffers stay GPU-L2-cacheable
-        // and survive DRAM bandwidth contention. See ctor for full rationale.
-        cl_mem_flags poolFlagsLocal = CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR;
-        if (mOpenCLRuntime->getGpuType() == SAMSUNG) {
-            poolFlagsLocal = CL_MEM_READ_WRITE;
-        }
-        mBufferPoolFirst.reset(new BufferPool(mOpenCLRuntime->context(), poolFlagsLocal));
-        mExecutionBufferPool.reset(new BufferExecutionPool(mOpenCLRuntime->context(), mOpenCLRuntime->commandQueue(), poolFlagsLocal));
+        mBufferPoolFirst.reset(new BufferPool(mOpenCLRuntime->context(), CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR));
+        mExecutionBufferPool.reset(new BufferExecutionPool(mOpenCLRuntime->context(), mOpenCLRuntime->commandQueue(), CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR));
         mImagePool = mImagePoolFirst.get();
         mBufferPool = mBufferPoolFirst.get();
     }
@@ -578,12 +558,7 @@ bool OpenCLBackend::onSelectDynamicAllocator(int index, int maxIndex) {
     }
     if (maxIndex > 1 && mImagePoolSecond.get() == nullptr) {
         mImagePoolSecond.reset(new ImagePool(mOpenCLRuntime->context()));
-        // Samsung Xclipse: drop HOST_PTR (see ctor for rationale).
-        cl_mem_flags poolFlagsSecond = CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR;
-        if (mOpenCLRuntime->getGpuType() == SAMSUNG) {
-            poolFlagsSecond = CL_MEM_READ_WRITE;
-        }
-        mBufferPoolSecond.reset(new BufferPool(mOpenCLRuntime->context(), poolFlagsSecond));
+        mBufferPoolSecond.reset(new BufferPool(mOpenCLRuntime->context(), CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR));
     }
     if (index == 0) {
         mImagePool = mImagePoolFirst.get();
