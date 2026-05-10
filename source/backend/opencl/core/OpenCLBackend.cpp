@@ -732,12 +732,26 @@ void OpenCLBackend::onExecuteEnd() const {
     mOpenCLRuntime->printEventTime();
 }
 
+// Tiny prewarm kernel — single work-item walks the buffer, touching one byte
+// per cache line (64 B stride), and stores an XOR digest into a sink so the
+// compiler can't dead-code-eliminate the reads. Goal is to drag the buffer's
+// first cache lines through the GPU L1/L2 and to exercise the shader IC.
+static const char* kPrewarmTouchSource = R"(
+__kernel void prewarm_touch(__global const uchar* buf, __global uint* sink, const uint nbytes) {
+    uint sum = 0;
+    for (uint i = 0; i < nbytes; i += 64) {
+        sum ^= (uint)buf[i];
+    }
+    sink[0] ^= sum;
+}
+)";
+
 void OpenCLBackend::onPrewarm(const std::vector<Tensor*>& dirtyImported, int prewarmFlags) {
     // Bit values mirror Interpreter::PrewarmFlag — kept as ints to avoid a public-header
     // dependency from Backend.hpp.
     constexpr int FLAG_MIGRATE        = 1 << 0;
     constexpr int FLAG_KEEPALIVE_FILL = 1 << 1;
-    // FLAG_TOUCH_KERNEL = 1 << 2; — wired up by a subsequent patch.
+    constexpr int FLAG_TOUCH_KERNEL   = 1 << 2;
 
     auto rawQueue = mOpenCLRuntime->commandQueue()();
     bool didEnqueue = false;
@@ -810,6 +824,78 @@ void OpenCLBackend::onPrewarm(const std::vector<Tensor*>& dirtyImported, int pre
                 MNN_PRINT("OpenCLBackend::onPrewarm fillBuffer failed: %d\n", res);
             } else {
                 didEnqueue = true;
+            }
+        }
+    }
+
+    // -------- PREWARM_TOUCH_KERNEL ------------------------------------
+    // Dispatch a tiny single-work-item compute kernel for each persistent
+    // buffer, reading one byte per cache line. Pushes weight data into the
+    // GPU L1/L2 and warms the shader instruction cache, addressing the case
+    // where the first real kernels stall on cache misses after an idle GPU.
+    if (prewarmFlags & FLAG_TOUCH_KERNEL) {
+        // Lazy build the program/kernel and the 4-byte sink.
+        if (mPrewarmTouchKernel == nullptr) {
+            mPrewarmTouchKernel = mOpenCLRuntime->buildKernelFromSource(
+                kPrewarmTouchSource, "prewarm_touch", {}, /*precisionLevel=*/1);
+        }
+        if (mPrewarmTouchSink == nullptr) {
+            cl_int err = CL_SUCCESS;
+            mPrewarmTouchSink.reset(new cl::Buffer(mOpenCLRuntime->context(),
+                                                   CL_MEM_READ_WRITE,
+                                                   sizeof(cl_uint),
+                                                   nullptr, &err));
+            if (err != CL_SUCCESS) {
+                MNN_PRINT("OpenCLBackend::onPrewarm touch-sink alloc failed: %d\n", err);
+                mPrewarmTouchSink.reset();
+            }
+        }
+        if (mPrewarmTouchKernel != nullptr && mPrewarmTouchSink != nullptr) {
+            // Re-collect mems independently of the migrate path, so this flag works
+            // standalone (e.g. user requests TOUCH_KERNEL only).
+            std::vector<cl_mem> mems;
+            mems.reserve(64);
+            if (mBufferPool != nullptr) {
+                mBufferPool->collectMemObjects(mems);
+            }
+            if (mBufferPoolFirst != nullptr && mBufferPoolFirst.get() != mBufferPool) {
+                mBufferPoolFirst->collectMemObjects(mems);
+            }
+            if (mBufferPoolSecond != nullptr && mBufferPoolSecond.get() != mBufferPool) {
+                mBufferPoolSecond->collectMemObjects(mems);
+            }
+            for (auto* t : dirtyImported) {
+                if (t == nullptr || t->deviceId() == 0) continue;
+                cl_mem m = (*(cl::Buffer*)t->deviceId())();
+                if (m != nullptr) mems.push_back(m);
+            }
+
+            cl::Kernel& k = mPrewarmTouchKernel->get();
+            const cl_mem sinkMem = (*mPrewarmTouchSink)();
+            const size_t global = 1, local = 1;
+
+            for (cl_mem m : mems) {
+                if (m == nullptr) continue;
+                size_t sz = 0;
+                if (::clGetMemObjectInfo(m, CL_MEM_SIZE, sizeof(sz), &sz, nullptr) != CL_SUCCESS) {
+                    continue;
+                }
+                if (sz == 0) continue;
+                cl_uint nbytes = static_cast<cl_uint>(sz < 16384 ? sz : 16384);
+
+                cl_kernel kraw = k();
+                cl_int r0 = ::clSetKernelArg(kraw, 0, sizeof(cl_mem), &m);
+                cl_int r1 = ::clSetKernelArg(kraw, 1, sizeof(cl_mem), &sinkMem);
+                cl_int r2 = ::clSetKernelArg(kraw, 2, sizeof(cl_uint), &nbytes);
+                if (r0 != CL_SUCCESS || r1 != CL_SUCCESS || r2 != CL_SUCCESS) {
+                    continue;
+                }
+                cl_int rEnq = ::clEnqueueNDRangeKernel(rawQueue, kraw,
+                                                      1, nullptr, &global, &local,
+                                                      0, nullptr, nullptr);
+                if (rEnq == CL_SUCCESS) {
+                    didEnqueue = true;
+                }
             }
         }
     }

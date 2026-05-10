@@ -186,7 +186,7 @@ private:
     // Scratch buffer used by onPrewarm(PREWARM_KEEPALIVE_FILL) — lazily allocated.
     mutable std::shared_ptr<cl::Buffer> mPrewarmScratch;
     // Cached touch-kernel + sink for onPrewarm(PREWARM_TOUCH_KERNEL) — lazily built.
-    mutable std::shared_ptr<cl::Kernel> mPrewarmTouchKernel;
+    mutable std::shared_ptr<KernelWrap> mPrewarmTouchKernel;
     mutable std::shared_ptr<cl::Buffer> mPrewarmTouchSink;
     BackendConfig::PrecisionMode mPrecision;
     BackendConfig::MemoryMode mMemory;
