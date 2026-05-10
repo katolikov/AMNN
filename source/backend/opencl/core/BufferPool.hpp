@@ -35,6 +35,13 @@ public:
     void clear();
     void releaseFreeList();
     size_t totalSize() { return mTotalSize; }
+    void collectMemObjects(std::vector<cl_mem>& out) const {
+        for (auto& kv : mAllBuffer) {
+            if (kv.first != nullptr) {
+                out.push_back((*kv.first)());
+            }
+        }
+    }
 
 private:
     std::map<cl::Buffer*, std::shared_ptr<OpenCLBufferNode>> mAllBuffer;
@@ -56,6 +63,13 @@ public:
     void clear();
     void releaseFreeList();
     size_t totalSize() { return mTotalSize; }
+    void collectMemObjects(std::vector<cl_mem>& out) const {
+        for (auto& node : mAllBuffer) {
+            if (node && node->buffer) {
+                out.push_back((*node->buffer)());
+            }
+        }
+    }
 private:
     std::set<std::shared_ptr<OpenCLBufferNode>> mAllBuffer;
     std::multimap<size_t, std::shared_ptr<OpenCLBufferNode>> mFreeList;

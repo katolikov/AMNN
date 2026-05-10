@@ -98,6 +98,7 @@ public:
 
     virtual void onExecuteBegin() const override;
     virtual void onExecuteEnd() const override;
+    virtual void onPrewarm(const std::vector<Tensor*>& dirtyImported) override;
 
     virtual int onSync(Tensor::MapType mtype, bool toCpu, const Tensor* dstTensor) override;
 

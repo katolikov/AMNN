@@ -609,6 +609,19 @@ ErrorCode Interpreter::updateSessionToModel(Session* session) {
     return session->updateToModel((Net*)mNet->net);
 }
 
+ErrorCode Interpreter::updateSessionToDevice(Session* session, const std::vector<Tensor*>& dirtyImported) {
+    if (session == nullptr) {
+        return INPUT_DATA_ERROR;
+    }
+    std::unique_lock<std::mutex> _l(mNet->lock);
+    auto& info = session->getPipelineInfo(0);
+    auto bn = info.first.cache.first.get();
+    if (bn != nullptr) {
+        bn->onPrewarm(dirtyImported);
+    }
+    return NO_ERROR;
+}
+
 const char* Interpreter::getModelVersion() const {
     if (mNet && mNet->net && mNet->net->extraInfo() && mNet->net->extraInfo()->version()) {
         return mNet->net->extraInfo()->version()->c_str();

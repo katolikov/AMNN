@@ -285,6 +285,7 @@ bool OpenCLSymbols::LoadLibraryFromPath(const std::string &library_path) {
     MNN_LOAD_FUNCTION_PTR(clEnqueueCopyImage);
     MNN_LOAD_FUNCTION_PTR(clEnqueueReadImage);
     MNN_LOAD_FUNCTION_PTR(clEnqueueWriteImage);
+    MNN_LOAD_FUNCTION_PTR(clEnqueueMigrateMemObjects);
     MNN_LOAD_FUNCTION_PTR(clGetExtensionFunctionAddress);
     MNN_LOAD_FUNCTION_PTR(clGetExtensionFunctionAddressForPlatform);
 
@@ -658,6 +659,16 @@ cl_int CL_API_CALL clFlush(cl_command_queue command_queue) {
     auto func = MNN::OpenCLSymbolsOperator::getOpenclSymbolsPtr()->clFlush;
     MNN_CHECK_NOTNULL(func);
     return func(command_queue);
+}
+
+cl_int CL_API_CALL clEnqueueMigrateMemObjects(cl_command_queue command_queue, cl_uint num_mem_objects, const cl_mem* mem_objects,
+                                              cl_mem_migration_flags flags, cl_uint num_events_in_wait_list,
+                                              const cl_event* event_wait_list, cl_event* event) {
+    auto func = MNN::OpenCLSymbolsOperator::getOpenclSymbolsPtr()->clEnqueueMigrateMemObjects;
+    if (func == nullptr) {
+        return CL_INVALID_OPERATION;
+    }
+    return func(command_queue, num_mem_objects, mem_objects, flags, num_events_in_wait_list, event_wait_list, event);
 }
 
 cl_int CL_API_CALL clFinish(cl_command_queue command_queue) {

@@ -732,6 +732,47 @@ void OpenCLBackend::onExecuteEnd() const {
     mOpenCLRuntime->printEventTime();
 }
 
+void OpenCLBackend::onPrewarm(const std::vector<Tensor*>& dirtyImported) {
+    std::vector<cl_mem> mems;
+    mems.reserve(64);
+
+    if (mBufferPool != nullptr) {
+        mBufferPool->collectMemObjects(mems);
+    }
+    if (mBufferPoolFirst != nullptr && mBufferPoolFirst.get() != mBufferPool) {
+        mBufferPoolFirst->collectMemObjects(mems);
+    }
+    if (mBufferPoolSecond != nullptr && mBufferPoolSecond.get() != mBufferPool) {
+        mBufferPoolSecond->collectMemObjects(mems);
+    }
+
+    for (auto* t : dirtyImported) {
+        if (t == nullptr || t->deviceId() == 0) {
+            continue;
+        }
+        cl_mem m = (*(cl::Buffer*)t->deviceId())();
+        if (m != nullptr) {
+            mems.push_back(m);
+        }
+    }
+
+    if (mems.empty()) {
+        return;
+    }
+
+    auto rawQueue = mOpenCLRuntime->commandQueue()();
+    cl_int res = ::clEnqueueMigrateMemObjects(rawQueue,
+                                              static_cast<cl_uint>(mems.size()),
+                                              mems.data(),
+                                              0,
+                                              0, nullptr, nullptr);
+    if (res != CL_SUCCESS) {
+        MNN_PRINT("OpenCLBackend::onPrewarm clEnqueueMigrateMemObjects failed: %d\n", res);
+        return;
+    }
+    ::clFlush(rawQueue);
+}
+
 
 bool OpenCLBackend::isCreateError() const {
     return mIsCreateError;

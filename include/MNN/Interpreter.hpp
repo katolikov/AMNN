@@ -401,6 +401,22 @@ public:
     ErrorCode updateSessionToModel(Session* session);
 
     /**
+     * @brief Bring the session's GPU memory back to device-resident state
+     *        and prime hardware caches before the next runSession.
+     *        Useful when another runtime (NPU/DSP) ran between two MNN
+     *        inferences and may have evicted the session's weights from GPU L2 / SLC,
+     *        or written into shared dma-buf inputs imported via setDevicePtr.
+     *        Currently implemented for the OpenCL backend; other backends are no-op.
+     * @param session         given session.
+     * @param dirtyImported   tensors imported via external dma-buf / fd that an
+     *                        external producer (e.g. ENN) has written to since the
+     *                        last runSession. Pass empty list to only prime weights.
+     * @return NO_ERROR on success.
+     */
+    ErrorCode updateSessionToDevice(Session* session,
+                                    const std::vector<Tensor*>& dirtyImported = {});
+
+    /**
      * @brief run session.
      * @param session   given session.
      * @return result of running.

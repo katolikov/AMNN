@@ -183,6 +183,19 @@ public:
      */
     virtual void onExecuteEnd() const = 0;
 
+    /**
+     * @brief Bring backend memory back to device-resident state and prime caches.
+     *        Call after another runtime (e.g. NPU) has held the SoC bus,
+     *        before the next inference, to mitigate cache eviction / MMU residency loss.
+     *        Default: no-op.
+     * @param dirtyImported tensors imported via external dma-buf / fd that may have been
+     *                      touched by an external producer (e.g. NPU); back-end may use
+     *                      this to issue cache-invalidate / migrate on those buffers.
+     */
+    virtual void onPrewarm(const std::vector<Tensor*>& dirtyImported) {
+        (void)dirtyImported;
+    }
+
     virtual const Runtime* getRuntime() {
         return nullptr;
     }

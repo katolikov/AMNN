@@ -180,6 +180,7 @@ public:
     using clGetExtensionFunctionAddressFunc = void *(CL_API_CALL *)(const char *);
     using clGetExtensionFunctionAddressForPlatformFunc = void *(CL_API_CALL *)(cl_platform_id, const char *);
     using clImportMemoryARMFunc = cl_mem (CL_API_CALL *)(cl_context, cl_mem_flags, const cl_import_properties_arm*, void*, size_t, cl_int*);
+    using clEnqueueMigrateMemObjectsFunc = cl_int (CL_API_CALL *)(cl_command_queue, cl_uint, const cl_mem*, cl_mem_migration_flags, cl_uint, const cl_event*, cl_event*);
     
 #ifdef __ANDROID__
     // use android ahardwarebuffer
@@ -236,6 +237,7 @@ public:
     MNN_CL_DEFINE_FUNC_PTR(clGetImageInfo);
     MNN_CL_DEFINE_FUNC_PTR(clEnqueueReadImage);
     MNN_CL_DEFINE_FUNC_PTR(clEnqueueWriteImage);
+    MNN_CL_DEFINE_FUNC_PTR(clEnqueueMigrateMemObjects);
     
     MNN_CL_DEFINE_FUNC_PTR(clCreateCommandQueueWithProperties);
     MNN_CL_DEFINE_FUNC_PTR(clSVMAlloc);
