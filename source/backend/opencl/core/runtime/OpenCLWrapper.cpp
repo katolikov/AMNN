@@ -671,6 +671,16 @@ cl_int CL_API_CALL clEnqueueMigrateMemObjects(cl_command_queue command_queue, cl
     return func(command_queue, num_mem_objects, mem_objects, flags, num_events_in_wait_list, event_wait_list, event);
 }
 
+cl_int CL_API_CALL clEnqueueFillBuffer(cl_command_queue command_queue, cl_mem buffer, const void* pattern, size_t pattern_size,
+                                       size_t offset, size_t size, cl_uint num_events_in_wait_list,
+                                       const cl_event* event_wait_list, cl_event* event) {
+    auto func = MNN::OpenCLSymbolsOperator::getOpenclSymbolsPtr()->clEnqueueFillBuffer;
+    if (func == nullptr) {
+        return CL_INVALID_OPERATION;
+    }
+    return func(command_queue, buffer, pattern, pattern_size, offset, size, num_events_in_wait_list, event_wait_list, event);
+}
+
 cl_int CL_API_CALL clFinish(cl_command_queue command_queue) {
     auto func = MNN::OpenCLSymbolsOperator::getOpenclSymbolsPtr()->clFinish;
     MNN_CHECK_NOTNULL(func);

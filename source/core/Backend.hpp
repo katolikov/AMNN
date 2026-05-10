@@ -191,9 +191,12 @@ public:
      * @param dirtyImported tensors imported via external dma-buf / fd that may have been
      *                      touched by an external producer (e.g. NPU); back-end may use
      *                      this to issue cache-invalidate / migrate on those buffers.
+     * @param prewarmFlags bitmask matching Interpreter::PrewarmFlag controlling what to do.
+     *                     Backends are expected to silently ignore unknown bits.
      */
-    virtual void onPrewarm(const std::vector<Tensor*>& dirtyImported) {
+    virtual void onPrewarm(const std::vector<Tensor*>& dirtyImported, int prewarmFlags) {
         (void)dirtyImported;
+        (void)prewarmFlags;
     }
 
     virtual const Runtime* getRuntime() {

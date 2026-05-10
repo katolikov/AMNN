@@ -732,45 +732,91 @@ void OpenCLBackend::onExecuteEnd() const {
     mOpenCLRuntime->printEventTime();
 }
 
-void OpenCLBackend::onPrewarm(const std::vector<Tensor*>& dirtyImported) {
-    std::vector<cl_mem> mems;
-    mems.reserve(64);
-
-    if (mBufferPool != nullptr) {
-        mBufferPool->collectMemObjects(mems);
-    }
-    if (mBufferPoolFirst != nullptr && mBufferPoolFirst.get() != mBufferPool) {
-        mBufferPoolFirst->collectMemObjects(mems);
-    }
-    if (mBufferPoolSecond != nullptr && mBufferPoolSecond.get() != mBufferPool) {
-        mBufferPoolSecond->collectMemObjects(mems);
-    }
-
-    for (auto* t : dirtyImported) {
-        if (t == nullptr || t->deviceId() == 0) {
-            continue;
-        }
-        cl_mem m = (*(cl::Buffer*)t->deviceId())();
-        if (m != nullptr) {
-            mems.push_back(m);
-        }
-    }
-
-    if (mems.empty()) {
-        return;
-    }
+void OpenCLBackend::onPrewarm(const std::vector<Tensor*>& dirtyImported, int prewarmFlags) {
+    // Bit values mirror Interpreter::PrewarmFlag — kept as ints to avoid a public-header
+    // dependency from Backend.hpp.
+    constexpr int FLAG_MIGRATE        = 1 << 0;
+    constexpr int FLAG_KEEPALIVE_FILL = 1 << 1;
+    // FLAG_TOUCH_KERNEL = 1 << 2; — wired up by a subsequent patch.
 
     auto rawQueue = mOpenCLRuntime->commandQueue()();
-    cl_int res = ::clEnqueueMigrateMemObjects(rawQueue,
-                                              static_cast<cl_uint>(mems.size()),
-                                              mems.data(),
-                                              0,
-                                              0, nullptr, nullptr);
-    if (res != CL_SUCCESS) {
-        MNN_PRINT("OpenCLBackend::onPrewarm clEnqueueMigrateMemObjects failed: %d\n", res);
-        return;
+    bool didEnqueue = false;
+
+    // -------- PREWARM_MIGRATE -----------------------------------------
+    if (prewarmFlags & FLAG_MIGRATE) {
+        std::vector<cl_mem> mems;
+        mems.reserve(64);
+
+        if (mBufferPool != nullptr) {
+            mBufferPool->collectMemObjects(mems);
+        }
+        if (mBufferPoolFirst != nullptr && mBufferPoolFirst.get() != mBufferPool) {
+            mBufferPoolFirst->collectMemObjects(mems);
+        }
+        if (mBufferPoolSecond != nullptr && mBufferPoolSecond.get() != mBufferPool) {
+            mBufferPoolSecond->collectMemObjects(mems);
+        }
+
+        for (auto* t : dirtyImported) {
+            if (t == nullptr || t->deviceId() == 0) {
+                continue;
+            }
+            cl_mem m = (*(cl::Buffer*)t->deviceId())();
+            if (m != nullptr) {
+                mems.push_back(m);
+            }
+        }
+
+        if (!mems.empty()) {
+            cl_int res = ::clEnqueueMigrateMemObjects(rawQueue,
+                                                     static_cast<cl_uint>(mems.size()),
+                                                     mems.data(),
+                                                     0,
+                                                     0, nullptr, nullptr);
+            if (res != CL_SUCCESS) {
+                MNN_PRINT("OpenCLBackend::onPrewarm migrate failed: %d\n", res);
+            } else {
+                didEnqueue = true;
+            }
+        }
     }
-    ::clFlush(rawQueue);
+
+    // -------- PREWARM_KEEPALIVE_FILL ----------------------------------
+    // Submits a 1-byte clEnqueueFillBuffer to a small device-only scratch.
+    // Goal: force the GPU job-slot / kernel driver out of an idle/suspended
+    // state when the prior consumer of the SoC was a non-OpenCL runtime
+    // (e.g. NPU / ENN). This is cheaper than a full kernel dispatch but is
+    // a real GPU command, not just a host-side hint like migrate.
+    if (prewarmFlags & FLAG_KEEPALIVE_FILL) {
+        if (mPrewarmScratch == nullptr) {
+            cl_int err = CL_SUCCESS;
+            mPrewarmScratch.reset(new cl::Buffer(mOpenCLRuntime->context(),
+                                                 CL_MEM_READ_WRITE,
+                                                 64,
+                                                 nullptr, &err));
+            if (err != CL_SUCCESS) {
+                MNN_PRINT("OpenCLBackend::onPrewarm fill-scratch alloc failed: %d\n", err);
+                mPrewarmScratch.reset();
+            }
+        }
+        if (mPrewarmScratch != nullptr) {
+            const cl_uchar pattern = 0;
+            cl_int res = ::clEnqueueFillBuffer(rawQueue,
+                                               (*mPrewarmScratch)(),
+                                               &pattern, sizeof(pattern),
+                                               0, 1,
+                                               0, nullptr, nullptr);
+            if (res != CL_SUCCESS) {
+                MNN_PRINT("OpenCLBackend::onPrewarm fillBuffer failed: %d\n", res);
+            } else {
+                didEnqueue = true;
+            }
+        }
+    }
+
+    if (didEnqueue) {
+        ::clFlush(rawQueue);
+    }
 }
 
 

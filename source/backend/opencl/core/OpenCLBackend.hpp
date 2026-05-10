@@ -98,7 +98,7 @@ public:
 
     virtual void onExecuteBegin() const override;
     virtual void onExecuteEnd() const override;
-    virtual void onPrewarm(const std::vector<Tensor*>& dirtyImported) override;
+    virtual void onPrewarm(const std::vector<Tensor*>& dirtyImported, int prewarmFlags) override;
 
     virtual int onSync(Tensor::MapType mtype, bool toCpu, const Tensor* dstTensor) override;
 
@@ -183,6 +183,11 @@ private:
     std::shared_ptr<OpenCLRuntime> mOpenCLRuntime;
 
     mutable std::pair<int, std::shared_ptr<cl::Buffer>> mHostBuffer;
+    // Scratch buffer used by onPrewarm(PREWARM_KEEPALIVE_FILL) — lazily allocated.
+    mutable std::shared_ptr<cl::Buffer> mPrewarmScratch;
+    // Cached touch-kernel + sink for onPrewarm(PREWARM_TOUCH_KERNEL) — lazily built.
+    mutable std::shared_ptr<cl::Kernel> mPrewarmTouchKernel;
+    mutable std::shared_ptr<cl::Buffer> mPrewarmTouchSink;
     BackendConfig::PrecisionMode mPrecision;
     BackendConfig::MemoryMode mMemory;
     bool mIsCreateError{false};

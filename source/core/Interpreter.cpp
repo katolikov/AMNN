@@ -609,7 +609,9 @@ ErrorCode Interpreter::updateSessionToModel(Session* session) {
     return session->updateToModel((Net*)mNet->net);
 }
 
-ErrorCode Interpreter::updateSessionToDevice(Session* session, const std::vector<Tensor*>& dirtyImported) {
+ErrorCode Interpreter::updateSessionToDevice(Session* session,
+                                              const std::vector<Tensor*>& dirtyImported,
+                                              int prewarmFlags) {
     if (session == nullptr) {
         return INPUT_DATA_ERROR;
     }
@@ -617,7 +619,7 @@ ErrorCode Interpreter::updateSessionToDevice(Session* session, const std::vector
     auto& info = session->getPipelineInfo(0);
     auto bn = info.first.cache.first.get();
     if (bn != nullptr) {
-        bn->onPrewarm(dirtyImported);
+        bn->onPrewarm(dirtyImported, prewarmFlags);
     }
     return NO_ERROR;
 }

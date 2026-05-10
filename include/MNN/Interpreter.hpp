@@ -401,6 +401,26 @@ public:
     ErrorCode updateSessionToModel(Session* session);
 
     /**
+     * @brief Bit flags controlling what updateSessionToDevice does on the GPU.
+     *        Combine with bitwise OR.
+     */
+    enum PrewarmFlag {
+        /** clEnqueueMigrateMemObjects on persistent and dirty-imported buffers.
+            Fixes GPU MMU residency and dma-buf coherency after an external runtime. */
+        PREWARM_MIGRATE = 1 << 0,
+        /** clEnqueueFillBuffer (1 byte) on a scratch buffer.
+            Forces the GPU job-slot / kernel driver out of an idle state — use this
+            if the GPU compute engine itself takes time to wake up between submissions. */
+        PREWARM_KEEPALIVE_FILL = 1 << 1,
+        /** Tiny compute kernel touching every persistent buffer's first cache lines.
+            Primes the GPU shader instruction cache and L1/L2 data cache with weight
+            data — use this if first kernels after an idle period stall on cache misses. */
+        PREWARM_TOUCH_KERNEL = 1 << 2,
+
+        PREWARM_ALL = PREWARM_MIGRATE | PREWARM_KEEPALIVE_FILL | PREWARM_TOUCH_KERNEL,
+    };
+
+    /**
      * @brief Bring the session's GPU memory back to device-resident state
      *        and prime hardware caches before the next runSession.
      *        Useful when another runtime (NPU/DSP) ran between two MNN
@@ -411,10 +431,15 @@ public:
      * @param dirtyImported   tensors imported via external dma-buf / fd that an
      *                        external producer (e.g. ENN) has written to since the
      *                        last runSession. Pass empty list to only prime weights.
+     * @param prewarmFlags    bitmask of PrewarmFlag values controlling what to do.
+     *                        Default keeps the original behaviour (migrate only).
+     *                        Use PREWARM_KEEPALIVE_FILL or PREWARM_TOUCH_KERNEL to
+     *                        diagnose cold-start issues that migrate alone doesn't fix.
      * @return NO_ERROR on success.
      */
     ErrorCode updateSessionToDevice(Session* session,
-                                    const std::vector<Tensor*>& dirtyImported = {});
+                                    const std::vector<Tensor*>& dirtyImported = {},
+                                    int prewarmFlags = PREWARM_MIGRATE);
 
     /**
      * @brief run session.
