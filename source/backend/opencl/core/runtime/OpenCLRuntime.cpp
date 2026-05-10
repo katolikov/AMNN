@@ -186,11 +186,14 @@ OpenCLRuntime::OpenCLRuntime(int platformSize, int platformId, int deviceId, voi
                 // Samsung Xclipse (Exynos 2200+) — AMD RDNA-based mobile GPU.
                 // Reports vendor "Samsung Electronics Co., Ltd." and name "Samsung Xclipse 9xx".
                 // Falls into OTHER without this branch, missing all vendor optimizations.
+                //
+                // Every shipping Xclipse part to date (920 / 930 / 940 / 950, and the
+                // upcoming 960 / 970) is the flagship-tier GPU of its generation, so
+                // the entire Xclipse line is treated as TOP. If a non-flagship Xclipse
+                // ever appears, refine the mapping here.
                 mGpuType = SAMSUNG;
                 mDeviceInfo = deviceName;
-                if (deviceName.find("950") != std::string::npos
-                    || deviceName.find("940") != std::string::npos
-                    || deviceName.find("930") != std::string::npos) {
+                if (deviceName.find("Xclipse") != std::string::npos) {
                     mGpuLevel = TOP;
                 }
             }
@@ -216,6 +219,12 @@ OpenCLRuntime::OpenCLRuntime(int platformSize, int platformId, int deviceId, voi
             #endif
             std::string deviceextensions = mFirstGPUDevicePtr.get()->getInfo<CL_DEVICE_EXTENSIONS>();
 #ifdef MNN_USE_LIB_WRAPPER
+            // AHardwareBuffer-import path. Mali ships cl_arm_import_memory_android_hardware_buffer.
+            // Samsung Xclipse does NOT — Xclipse exposes cl_arm_import_memory + _host +
+            // _dma_buf + _protected, so AHB-import is unavailable; dma-buf fd import
+            // (used by user code that calls clImportMemoryARM directly with
+            // CL_IMPORT_TYPE_DMA_BUF_ARM) is supported and goes through a different code
+            // path that does not need this gating flag.
             mIsSupportAHD = (getDeviceSupportsExtension(*(mFirstGPUDevicePtr.get()), "cl_arm_import_memory_android_hardware_buffer")
                  && mGpuType == MALI && OpenCLSymbolsOperator::getOpenclSymbolsPtr()->getFuncAddress(platforms[platformId](), "clImportMemoryARM"))
                  || (mGpuType == ADRENO && getDeviceSupportsExtension(*(mFirstGPUDevicePtr.get()), "cl_qcom_android_ahardwarebuffer_host_ptr"));
