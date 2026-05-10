@@ -557,16 +557,27 @@ void run3DKernelDefault(const ::std::shared_ptr<KernelWrap> &kernelw, const std:
     MNN_ASSERT(lws.size() >= 3);
 
     cl_int res = CL_SUCCESS;
+#ifdef ENABLE_OPENCL_TIME_PROFILER
+    cl::Event localEvent;
+    cl::Event* eventToPush = (eventPtr != nullptr) ? eventPtr : &localEvent;
+#else
+    cl::Event* eventToPush = eventPtr;
+#endif
     if(lws[0]==0 || lws[1]==0 || lws[2]==0){
         res        = runtime->commandQueue().enqueueNDRangeKernel(
             kernel, cl::NullRange, cl::NDRange(gws[0], gws[1], gws[2]),
-            cl::NullRange, nullptr, eventPtr);
+            cl::NullRange, nullptr, eventToPush);
     }else{
         res        = runtime->commandQueue().enqueueNDRangeKernel(
             kernel, cl::NullRange, cl::NDRange(gws[0], gws[1], gws[2]),
-            cl::NDRange(lws[0], lws[1], lws[2]), nullptr, eventPtr);
+            cl::NDRange(lws[0], lws[1], lws[2]), nullptr, eventToPush);
     }
     MNN_CHECK_CL_SUCCESS(res, "run3d");
+#ifdef ENABLE_OPENCL_TIME_PROFILER
+    if (res == CL_SUCCESS && eventToPush != nullptr) {
+        runtime->pushEvent({std::string("compute3d"), *eventToPush});
+    }
+#endif
 
     unsigned int num_flush = runtime->getQueueNum();
     // Flush interval: Adreno and RADEON (Samsung Xclipse / AMD) use a relaxed
@@ -595,15 +606,26 @@ void runKernel2D(const ::std::shared_ptr<KernelWrap> &kernelw, const std::vector
 #endif
     auto kernel = kernelw->get();
     cl_int res = CL_SUCCESS;
+#ifdef ENABLE_OPENCL_TIME_PROFILER
+    cl::Event localEvent2d;
+    cl::Event* eventToPush2d = (eventPtr != nullptr) ? eventPtr : &localEvent2d;
+#else
+    cl::Event* eventToPush2d = eventPtr;
+#endif
     if(lws[0]==0 || lws[1]==0){
         res = runtime->commandQueue().enqueueNDRangeKernel(
-            kernel, cl::NullRange, cl::NDRange(gws[0], gws[1]), cl::NullRange, nullptr, eventPtr);
+            kernel, cl::NullRange, cl::NDRange(gws[0], gws[1]), cl::NullRange, nullptr, eventToPush2d);
 
     }else{
         res = runtime->commandQueue().enqueueNDRangeKernel(
-            kernel, cl::NullRange, cl::NDRange(gws[0], gws[1]), cl::NDRange(lws[0], lws[1]), nullptr, eventPtr);
+            kernel, cl::NullRange, cl::NDRange(gws[0], gws[1]), cl::NDRange(lws[0], lws[1]), nullptr, eventToPush2d);
     }
     MNN_CHECK_CL_SUCCESS(res, "run2d");
+#ifdef ENABLE_OPENCL_TIME_PROFILER
+    if (res == CL_SUCCESS && eventToPush2d != nullptr) {
+        runtime->pushEvent({std::string("compute2d"), *eventToPush2d});
+    }
+#endif
 
     unsigned int num_flush = runtime->getQueueNum();
     if(runtime->getGpuType() == GpuType::ADRENO || runtime->getGpuType() == GpuType::RADEON) {
