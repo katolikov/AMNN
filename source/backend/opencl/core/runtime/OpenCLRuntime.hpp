@@ -39,7 +39,7 @@ namespace MNN {
 
 #define CL_KERNEL_WAVE_SIZE_QCOM 0xAA02
 
-enum GpuType { MALI = 0, ADRENO = 1, RADEON = 2, INTEL = 3, OTHER = 4 };
+enum GpuType { MALI = 0, ADRENO = 1, RADEON = 2, INTEL = 3, OTHER = 4, SAMSUNG = 5 };
 enum GpuLevel { UNDEFINED = 0, TOP = 1, MEDIUM = 2, LOW = 3 };
 enum MaliAr { MIDGARD = 0, BIFROST = 1, VALHALL = 2 };
 enum SvmType { FINE_BUFFER = 0, COARSE_BUFFER = 1, SVM_NONE = 2};

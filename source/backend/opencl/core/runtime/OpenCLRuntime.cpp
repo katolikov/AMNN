@@ -179,7 +179,20 @@ OpenCLRuntime::OpenCLRuntime(int platformSize, int platformId, int deviceId, voi
                     uint32_t maxThreadsPerExecutionUnit = num_threads_per_eu > 0 ? num_threads_per_eu : 7;
                     mMaxThreadsPerDevice =  maxThreadsPerExecutionUnit * execution_units_count;
                 }
-#endif 
+#endif
+            }
+            else if (deviceVendor.find("Samsung") != std::string::npos
+                     || deviceName.find("Xclipse")  != std::string::npos) {
+                // Samsung Xclipse (Exynos 2200+) — AMD RDNA-based mobile GPU.
+                // Reports vendor "Samsung Electronics Co., Ltd." and name "Samsung Xclipse 9xx".
+                // Falls into OTHER without this branch, missing all vendor optimizations.
+                mGpuType = SAMSUNG;
+                mDeviceInfo = deviceName;
+                if (deviceName.find("950") != std::string::npos
+                    || deviceName.find("940") != std::string::npos
+                    || deviceName.find("930") != std::string::npos) {
+                    mGpuLevel = TOP;
+                }
             }
             else {
                 mGpuType = OTHER;
@@ -240,7 +253,15 @@ OpenCLRuntime::OpenCLRuntime(int platformSize, int platformId, int deviceId, voi
                     return;
                 }
 
-                cl_queue_properties prop[] = {CL_QUEUE_PRIORITY_KHR, CL_QUEUE_PRIORITY_LOW_KHR,
+                // On Samsung Xclipse use HIGH priority — at contention with another
+                // SoC client (NPU running ENN, heavy CPU work like PNG encoding, etc.)
+                // the kernel driver will favour our queue for job-slot dispatch.
+                // Other GPUs keep LOW (preserves prior behaviour: lets the kernel
+                // driver interleave with UI thread on Adreno).
+                cl_uint priorityValue = (mGpuType == SAMSUNG)
+                    ? CL_QUEUE_PRIORITY_HIGH_KHR
+                    : CL_QUEUE_PRIORITY_LOW_KHR;
+                cl_queue_properties prop[] = {CL_QUEUE_PRIORITY_KHR, priorityValue,
 #ifdef ENABLE_OPENCL_TIME_PROFILER
                     CL_QUEUE_PROPERTIES, CL_QUEUE_PROFILING_ENABLE,
 #endif
