@@ -84,6 +84,21 @@ struct RuntimeHint {
     int divisionRatio = 41;
 
     int smeCores = 2; // Number of SME cores of the backend, default is 2, if supports sme
+
+    // Pin the calling inference thread to the top-K CPU cores by max frequency
+    // (prime + big cluster on heterogeneous Android SoCs). Useful when the same
+    // thread also runs another runtime (NPU/ENN) or heavy CPU work (PNG encode,
+    // image processing) between runSession calls — Android scheduler otherwise
+    // migrates the thread between cores and the OpenCL driver hot path goes
+    // cold, adding several ms to the next runSession on Samsung Xclipse and
+    // similar GPUs.
+    //
+    // 0 = disabled (default, no affinity changes)
+    // K > 0 = pin to the K cores with the highest cpuinfo_max_freq.
+    //         K=2 covers prime + 1 big core on most flagships (Exynos / Snapdragon)
+    //         K=3 leaves more headroom under thermal throttling but raises
+    //         contention with UI / other work.
+    int cpuPinInference = 0;
 };
 /** abstract backend */
 class Backend : public NonCopyable {

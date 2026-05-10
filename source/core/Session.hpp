@@ -50,6 +50,14 @@ public:
     Session* clone(RuntimeInfo&& runtime, std::shared_ptr<Schedule::ScheduleInfo> sharedConst);
     static void createPipelineBackend(Schedule::PipelineInfo& iter, RuntimeInfo& runtime);
 
+    // Pin the calling thread to the top-K CPU cores by max frequency
+    // (prime + big cluster). Cached per-thread so repeated calls are cheap.
+    // No-op when topK <= 0 or on non-Linux/Android. Used by
+    // Interpreter::HintMode::CPU_PIN_INFERENCE — see RuntimeHint::cpuPinInference.
+    // Called from Interpreter::createMultiPathSession before any backend
+    // / runtime worker thread is spawned, so they inherit the affinity.
+    static void pinInferenceThreadIfNeeded(int topK);
+
 public:
     /**
      * @brief infer.

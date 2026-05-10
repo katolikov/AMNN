@@ -264,7 +264,23 @@ public:
         CPU_SME2_NEON_DIVISION_RATIO = 17,
 
         // Set SME cores, default is 2, if supports sme
-        CPU_SME_CORES = 18
+        CPU_SME_CORES = 18,
+
+        // Pin the inference thread to the top-K CPU cores by max frequency
+        // (prime + big cluster). Value = K (number of top cores to pin to).
+        // 0 = disabled (default, no affinity changes).
+        // K = 2 typically gives the best result on Android flagships:
+        //     prime core (X-class) + 1 big core (A-class) — covers thermal
+        //     throttling without contention with UI thread / other heavy work.
+        //
+        // Use this when an external runtime (NPU/ENN) or heavy CPU work (PNG
+        // encoding, image processing) runs between runSession calls — Android
+        // scheduler otherwise migrates the thread between cores and the
+        // OpenCL driver hot path goes cold, adding several ms to the next
+        // runSession.
+        //
+        // Linux/Android only — no-op on other platforms.
+        CPU_PIN_INFERENCE = 19
     };
 
     enum ExternalPathType {

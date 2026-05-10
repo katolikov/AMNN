@@ -244,6 +244,11 @@ Interpreter::~Interpreter() {
 }
 
 Session* Interpreter::createMultiPathSession(const std::vector<ScheduleConfig>& configs) {
+    // Apply CPU pin BEFORE any background thread / runtime gets created.
+    // Linux/Android child threads inherit parent affinity at pthread_create —
+    // pinning here means OpenCL driver workers, BufferAllocator threadpool,
+    // anything spawned downstream is also pinned to the prime+big cluster.
+    Session::pinInferenceThreadIfNeeded(mNet->modes.runtimeHint.cpuPinInference);
     RuntimeInfo runtime = createRuntime(configs);
     if (runtime.first.empty()) {
         MNN_ERROR("Runtime not valid for create session\n");
@@ -253,6 +258,7 @@ Session* Interpreter::createMultiPathSession(const std::vector<ScheduleConfig>& 
 }
 
 Session* Interpreter::createMultiPathSession(const std::vector<ScheduleConfig>& configs, const RuntimeInfo& runtime) {
+    Session::pinInferenceThreadIfNeeded(mNet->modes.runtimeHint.cpuPinInference);
     for (auto& iter : runtime.first) {
         iter.second->setRuntimeHint(mNet->modes.runtimeHint);
         if (!mNet->cacheFile.empty()) {

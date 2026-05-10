@@ -18,6 +18,15 @@
 #include "core/WrapExecution.hpp"
 #include "utils/InitNet.hpp"
 
+#if defined(__linux__) || defined(__ANDROID__)
+#include <sched.h>
+#include <unistd.h>
+#include <fstream>
+#include <vector>
+#include <algorithm>
+#include <string>
+#endif
+
 namespace MNN {
 void Session::createPipelineBackend(Schedule::PipelineInfo& iter, RuntimeInfo& runtime) {
     if (iter.first.cache.first != nullptr) {
@@ -121,6 +130,9 @@ void Session::ModeGroup::setHint(Interpreter::HintMode hint, int value) {
         case Interpreter::CPU_SME_CORES:
             runtimeHint.smeCores = value;
             break;
+        case Interpreter::CPU_PIN_INFERENCE:
+            runtimeHint.cpuPinInference = value;
+            break;
         default:
             break;
     }
@@ -157,6 +169,14 @@ void Session::ModeGroup::setExternalPath(std::string path, int type) {
 Session::Session(Schedule::ScheduleInfo&& info, const ModeGroup& mode, RuntimeInfo&& runtime) {
     mMode    = mode;
     mRuntime = std::move(runtime);
+    // Pin BEFORE creating pipeline backends — Linux/Android: child threads
+    // inherit parent affinity at pthread_create. Doing this here means any
+    // internal helper / worker threads MNN spawns later (CPU backend threadpool,
+    // copy threads, etc.) are also pinned to the same prime+big cluster.
+    // Note: Interpreter::createMultiPathSession also calls this earlier (before
+    // RuntimeInfo construction) — both are needed: the earlier one covers
+    // runtime workers, this one covers anything created in this constructor.
+    Session::pinInferenceThreadIfNeeded(mMode.runtimeHint.cpuPinInference);
     if (info.pipelineInfo.empty()) {
         mValid = false;
         return;
@@ -240,11 +260,64 @@ std::pair<const void*, size_t> Session::getCache() {
     return std::make_pair(nullptr, 0);
 }
 
+// Pin the calling thread to the top-K CPU cores by max frequency. Caches the
+// last successful pin per-thread so repeated calls are essentially free.
+// No-op on non-Linux/Android. No-op when topK <= 0.
+//
+// Used by Interpreter::HintMode::CPU_PIN_INFERENCE to keep MNN's host enqueue
+// path on hot CPU caches when an external runtime (NPU/ENN) or heavy CPU work
+// (PNG encoding, image processing) runs between runSession calls and would
+// otherwise migrate the inference thread to a cold core.
+//
+// Public so Interpreter::createMultiPathSession can apply the pin before any
+// runtime / backend worker thread is spawned (Linux thread inheritance).
+void Session::pinInferenceThreadIfNeeded(int topK) {
+#if defined(__linux__) || defined(__ANDROID__)
+    if (topK <= 0) {
+        return;
+    }
+    static thread_local int sPinnedTopK = -1;
+    if (sPinnedTopK == topK) {
+        return;
+    }
+    int n = (int)sysconf(_SC_NPROCESSORS_CONF);
+    if (n <= 0) {
+        return;
+    }
+    std::vector<std::pair<long, int>> ranked;
+    ranked.reserve(n);
+    for (int i = 0; i < n; ++i) {
+        std::ifstream f("/sys/devices/system/cpu/cpu" + std::to_string(i)
+                        + "/cpufreq/cpuinfo_max_freq");
+        long khz = 0;
+        if (f >> khz) {
+            ranked.emplace_back(khz, i);
+        }
+    }
+    if (ranked.empty()) {
+        return;
+    }
+    std::sort(ranked.begin(), ranked.end(), std::greater<std::pair<long, int>>());
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    int taken = std::min(topK, (int)ranked.size());
+    for (int i = 0; i < taken; ++i) {
+        CPU_SET(ranked[i].second, &set);
+    }
+    if (sched_setaffinity(0, sizeof(set), &set) == 0) {
+        sPinnedTopK = topK;
+    }
+#else
+    (void)topK;
+#endif
+}
+
 ErrorCode Session::run() const {
     if (mNeedResize) {
         MNN_ERROR("Can't run session because not resized\n");
         return COMPUTE_SIZE_ERROR;
     }
+    Session::pinInferenceThreadIfNeeded(mMode.runtimeHint.cpuPinInference);
     for (auto& iter : mPipelines) {
         auto error = iter->execute();
         if (NO_ERROR != error) {
@@ -260,6 +333,7 @@ ErrorCode Session::runWithCallBack(const TensorCallBackWithInfo& before, const T
         MNN_ERROR("Can't run session because not resized\n");
         return COMPUTE_SIZE_ERROR;
     }
+    Session::pinInferenceThreadIfNeeded(mMode.runtimeHint.cpuPinInference);
     for (auto& iter : mPipelines) {
         auto error = iter->executeCallBack(before, end);
         if (NO_ERROR != error) {
