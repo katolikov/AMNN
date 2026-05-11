@@ -286,6 +286,8 @@ bool OpenCLSymbols::LoadLibraryFromPath(const std::string &library_path) {
     MNN_LOAD_FUNCTION_PTR(clEnqueueReadImage);
     MNN_LOAD_FUNCTION_PTR(clEnqueueWriteImage);
     MNN_LOAD_FUNCTION_PTR(clEnqueueMigrateMemObjects);
+    MNN_LOAD_FUNCTION_PTR(clEnqueueFillBuffer);
+    MNN_LOAD_FUNCTION_PTR(clEnqueueMarkerWithWaitList);
     MNN_LOAD_FUNCTION_PTR(clGetExtensionFunctionAddress);
     MNN_LOAD_FUNCTION_PTR(clGetExtensionFunctionAddressForPlatform);
 
@@ -679,6 +681,15 @@ cl_int CL_API_CALL clEnqueueFillBuffer(cl_command_queue command_queue, cl_mem bu
         return CL_INVALID_OPERATION;
     }
     return func(command_queue, buffer, pattern, pattern_size, offset, size, num_events_in_wait_list, event_wait_list, event);
+}
+
+cl_int CL_API_CALL clEnqueueMarkerWithWaitList(cl_command_queue command_queue, cl_uint num_events_in_wait_list,
+                                               const cl_event* event_wait_list, cl_event* event) {
+    auto func = MNN::OpenCLSymbolsOperator::getOpenclSymbolsPtr()->clEnqueueMarkerWithWaitList;
+    if (func == nullptr) {
+        return CL_INVALID_OPERATION;
+    }
+    return func(command_queue, num_events_in_wait_list, event_wait_list, event);
 }
 
 cl_int CL_API_CALL clFinish(cl_command_queue command_queue) {

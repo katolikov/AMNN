@@ -1005,9 +1005,58 @@ void OpenCLBackend::copyToDeviceInt8(const Tensor* srcTensor, const Tensor* dstT
         mOpenCLRuntime->commandQueue().enqueueWriteBuffer(*DeviceBuffer, CL_TRUE, 0, needSize, hostPtr);
 }
 int OpenCLBackend::onSync(Tensor::MapType mtype, bool toCpu, const Tensor* dstTensor) {
-    if (toCpu) {
-        mOpenCLRuntime->commandQueue().finish();
+    if (!toCpu) {
+        return 0;
     }
+    // On Samsung Xclipse, replace clFinish (blocking syscall) with a userspace
+    // busy-wait on a marker event. Profiling on Galaxy Z Fold6 / Xclipse 950
+    // showed total GPU kernel time is stable across scenarios (~10.7 ms with
+    // or without concurrent CPU work), yet user-visible wait() inflated by
+    // ~10 ms when another thread did heavy work (PNG encode, NPU on sibling
+    // thread). The inflation lives in kernel-scheduler latency between GPU
+    // IRQ and our thread resuming from clFinish — we go to sleep in the
+    // kernel and the scheduler picks us up only after running the active
+    // higher-priority thread for one more time slice.
+    //
+    // Busy-polling a marker event keeps the inference thread in userspace,
+    // so it sees the event status flip the moment the GPU finishes — no
+    // kernel round-trip, no scheduling latency. Costs ~10 ms of CPU @ 100%
+    // on one core during the wait — acceptable for a real-time pipeline
+    // where the alternative is +10 ms wall-clock latency.
+    //
+    // Other GPUs keep the original clFinish path. The marker symbol falls
+    // back to plain clFinish if cl_khr_extended_versioning / OpenCL 1.2
+    // isn't actually exposed by the loader.
+    if (mOpenCLRuntime->getGpuType() == SAMSUNG) {
+        auto rawQueue = mOpenCLRuntime->commandQueue()();
+        cl_event marker = nullptr;
+        cl_int markerErr = ::clEnqueueMarkerWithWaitList(rawQueue, 0, nullptr, &marker);
+        if (markerErr == CL_SUCCESS && marker != nullptr) {
+            // Flush so the marker actually reaches the device.
+            ::clFlush(rawQueue);
+            cl_int status = CL_QUEUED;
+            while (true) {
+                cl_int err = ::clGetEventInfo(marker, CL_EVENT_COMMAND_EXECUTION_STATUS,
+                                              sizeof(status), &status, nullptr);
+                if (err != CL_SUCCESS) {
+                    // Fall back to a blocking finish on unexpected errors.
+                    mOpenCLRuntime->commandQueue().finish();
+                    break;
+                }
+                if (status == CL_COMPLETE || status < 0) {
+                    break;
+                }
+                // No sched_yield / pause — we deliberately spin to avoid any
+                // scheduler involvement that re-introduces the latency we're
+                // trying to remove.
+            }
+            ::clReleaseEvent(marker);
+            return 0;
+        }
+        // Marker enqueue failed (extension missing on older drivers) —
+        // fall through to the blocking path.
+    }
+    mOpenCLRuntime->commandQueue().finish();
     return 0;
 }
 
