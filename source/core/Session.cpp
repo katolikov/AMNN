@@ -25,6 +25,7 @@
 #include <vector>
 #include <algorithm>
 #include <string>
+#include <sys/resource.h>  // setpriority
 #endif
 
 namespace MNN {
@@ -307,6 +308,13 @@ void Session::pinInferenceThreadIfNeeded(int topK) {
     if (sched_setaffinity(0, sizeof(set), &set) == 0) {
         sPinnedTopK = topK;
     }
+    // Boost scheduling priority of the inference thread. The measured penalty
+    // after a side workload (PNG encode / NPU on another thread) is NOT in GPU
+    // compute time (we verified GPU kernel times are stable across scenarios)
+    // — it lives in the host kernel-scheduler latency between GPU IRQ and our
+    // thread resuming from clFinish. Higher priority asks the scheduler to
+    // resume us sooner. -20 is the max nice value reachable without CAP_SYS_NICE.
+    setpriority(PRIO_PROCESS, 0, -20);
 #else
     (void)topK;
 #endif
