@@ -208,6 +208,7 @@ enum OpType : int {
     If    = 601,
     LayerNorm = 603,
     GridSample = 604,
+    Quantile = 605,
 }
 
 table Plugin {
@@ -260,6 +261,11 @@ table ShapeParam {
     start: int = 0;
     hasEnd: bool = false;
     end: int = 0;
+}
+
+table QuantileParam {
+    // quantile levels in [0, 1], computed over the fully-flattened input tensor
+    qLevels: [float];
 }
 
 table WhileParam {
@@ -440,7 +446,8 @@ union OpParameter {
     AttentionParam,
     StftParam,
     LinearAttentionParam,
-    ShapeParam
+    ShapeParam,
+    QuantileParam
 }
 
 table Op {

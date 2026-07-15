@@ -1844,6 +1844,16 @@ VARP _Sort(VARP x, int axis, bool arg, bool descend) {
     return Variable::create(expr, arg);
 }
 
+VARP _Quantile(VARP x, std::vector<float>&& qLevels) {
+    std::unique_ptr<OpT> op(new OpT);
+    op->type = OpType_Quantile;
+    op->main.type = OpParameter_QuantileParam;
+    auto param = new QuantileParamT;
+    param->qLevels = std::move(qLevels);
+    op->main.value = param;
+    return (Variable::create(Expr::create(std::move(op), {x})));
+}
+
 VARP _Raster(const std::vector<VARP>& vars, const std::vector<int>& region, const std::vector<int>& shape) {
     auto expr = Utils::makeRaster(vars, region, shape, halide_type_of<float>(), MNN_DATA_FORMAT_UNKNOWN);
     return (Variable::create(expr));

@@ -1,0 +1,22 @@
+
+{ "extraInfo": 
+{ "version": "3.5.0" }
+, "oplists": 
+[ 
+{ "main_type": "Input", "main": 
+{ "dims": 
+[ 1, 1, 1440, 1920 ]
+, "dformat": "NCHW" }
+, "name": "x", "outputIndexes": 
+[ 0 ]
+, "type": "Input" }
+, 
+{ "inputIndexes": 
+[ 0 ]
+, "main_type": 102, "main": (?), "name": "quantiles", "outputIndexes": 
+[ 1 ]
+, "type": 605 }
+ ]
+, "tensorName": 
+[ "x", "quantiles" ]
+ }

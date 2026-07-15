@@ -42,6 +42,9 @@ struct StftParamT;
 struct ShapeParam;
 struct ShapeParamT;
 
+struct QuantileParam;
+struct QuantileParamT;
+
 struct WhileParam;
 struct WhileParamT;
 
@@ -92,6 +95,8 @@ inline const flatbuffers::TypeTable *FmhcaParamTypeTable();
 inline const flatbuffers::TypeTable *StftParamTypeTable();
 
 inline const flatbuffers::TypeTable *ShapeParamTypeTable();
+
+inline const flatbuffers::TypeTable *QuantileParamTypeTable();
 
 inline const flatbuffers::TypeTable *WhileParamTypeTable();
 
@@ -299,11 +304,12 @@ enum OpType {
   OpType_If = 601,
   OpType_LayerNorm = 603,
   OpType_GridSample = 604,
+  OpType_Quantile = 605,
   OpType_MIN = OpType_AbsVal,
-  OpType_MAX = OpType_GridSample
+  OpType_MAX = OpType_Quantile
 };
 
-inline const OpType (&EnumValuesOpType())[183] {
+inline const OpType (&EnumValuesOpType())[184] {
   static const OpType values[] = {
     OpType_AbsVal,
     OpType_QuantizedAdd,
@@ -487,7 +493,8 @@ inline const OpType (&EnumValuesOpType())[183] {
     OpType_While,
     OpType_If,
     OpType_LayerNorm,
-    OpType_GridSample
+    OpType_GridSample,
+    OpType_Quantile
   };
   return values;
 }
@@ -1099,13 +1106,14 @@ inline const char * const *EnumNamesOpType() {
     "",
     "LayerNorm",
     "GridSample",
+    "Quantile",
     nullptr
   };
   return names;
 }
 
 inline const char *EnumNameOpType(OpType e) {
-  if (e < OpType_AbsVal || e > OpType_GridSample) return "";
+  if (e < OpType_AbsVal || e > OpType_Quantile) return "";
   const size_t index = static_cast<int>(e);
   return EnumNamesOpType()[index];
 }
@@ -1213,11 +1221,12 @@ enum OpParameter {
   OpParameter_StftParam = 99,
   OpParameter_LinearAttentionParam = 100,
   OpParameter_ShapeParam = 101,
+  OpParameter_QuantileParam = 102,
   OpParameter_MIN = OpParameter_NONE,
-  OpParameter_MAX = OpParameter_ShapeParam
+  OpParameter_MAX = OpParameter_QuantileParam
 };
 
-inline const OpParameter (&EnumValuesOpParameter())[102] {
+inline const OpParameter (&EnumValuesOpParameter())[103] {
   static const OpParameter values[] = {
     OpParameter_NONE,
     OpParameter_QuantizedAdd,
@@ -1320,7 +1329,8 @@ inline const OpParameter (&EnumValuesOpParameter())[102] {
     OpParameter_AttentionParam,
     OpParameter_StftParam,
     OpParameter_LinearAttentionParam,
-    OpParameter_ShapeParam
+    OpParameter_ShapeParam,
+    OpParameter_QuantileParam
   };
   return values;
 }
@@ -1429,13 +1439,14 @@ inline const char * const *EnumNamesOpParameter() {
     "StftParam",
     "LinearAttentionParam",
     "ShapeParam",
+    "QuantileParam",
     nullptr
   };
   return names;
 }
 
 inline const char *EnumNameOpParameter(OpParameter e) {
-  if (e < OpParameter_NONE || e > OpParameter_LinearAttentionParam) return "";
+  if (e < OpParameter_NONE || e > OpParameter_QuantileParam) return "";
   const size_t index = static_cast<int>(e);
   return EnumNamesOpParameter()[index];
 }
@@ -1668,10 +1679,6 @@ template<> struct OpParameterTraits<Resize> {
   static const OpParameter enum_value = OpParameter_Resize;
 };
 
-template<> struct OpParameterTraits<ShapeParam> {
-  static const OpParameter enum_value = OpParameter_ShapeParam;
-};
-
 template<> struct OpParameterTraits<RoiParameters> {
   static const OpParameter enum_value = OpParameter_RoiParameters;
 };
@@ -1846,6 +1853,14 @@ template<> struct OpParameterTraits<StftParam> {
 
 template<> struct OpParameterTraits<LinearAttentionParam> {
   static const OpParameter enum_value = OpParameter_LinearAttentionParam;
+};
+
+template<> struct OpParameterTraits<ShapeParam> {
+  static const OpParameter enum_value = OpParameter_ShapeParam;
+};
+
+template<> struct OpParameterTraits<QuantileParam> {
+  static const OpParameter enum_value = OpParameter_QuantileParam;
 };
 
 struct OpParameterUnion {
@@ -2327,14 +2342,6 @@ struct OpParameterUnion {
     return type == OpParameter_Resize ?
       reinterpret_cast<const ResizeT *>(value) : nullptr;
   }
-  ShapeParamT *AsShapeParam() {
-    return type == OpParameter_ShapeParam ?
-      reinterpret_cast<ShapeParamT *>(value) : nullptr;
-  }
-  const ShapeParamT *AsShapeParam() const {
-    return type == OpParameter_ShapeParam ?
-      reinterpret_cast<const ShapeParamT *>(value) : nullptr;
-  }
   RoiParametersT *AsRoiParameters() {
     return type == OpParameter_RoiParameters ?
       reinterpret_cast<RoiParametersT *>(value) : nullptr;
@@ -2686,6 +2693,22 @@ struct OpParameterUnion {
   const LinearAttentionParamT *AsLinearAttentionParam() const {
     return type == OpParameter_LinearAttentionParam ?
       reinterpret_cast<const LinearAttentionParamT *>(value) : nullptr;
+  }
+  ShapeParamT *AsShapeParam() {
+    return type == OpParameter_ShapeParam ?
+      reinterpret_cast<ShapeParamT *>(value) : nullptr;
+  }
+  const ShapeParamT *AsShapeParam() const {
+    return type == OpParameter_ShapeParam ?
+      reinterpret_cast<const ShapeParamT *>(value) : nullptr;
+  }
+  QuantileParamT *AsQuantileParam() {
+    return type == OpParameter_QuantileParam ?
+      reinterpret_cast<QuantileParamT *>(value) : nullptr;
+  }
+  const QuantileParamT *AsQuantileParam() const {
+    return type == OpParameter_QuantileParam ?
+      reinterpret_cast<const QuantileParamT *>(value) : nullptr;
   }
 };
 
@@ -3427,6 +3450,60 @@ inline flatbuffers::Offset<ShapeParam> CreateShapeParam(
 
 flatbuffers::Offset<ShapeParam> CreateShapeParam(flatbuffers::FlatBufferBuilder &_fbb, const ShapeParamT *_o, const flatbuffers::rehasher_function_t *_rehasher = nullptr);
 
+struct QuantileParamT : public flatbuffers::NativeTable {
+  typedef QuantileParam TableType;
+  std::vector<float> qLevels;
+  QuantileParamT() {
+  }
+};
+
+struct QuantileParam FLATBUFFERS_FINAL_CLASS : private flatbuffers::Table {
+  typedef QuantileParamT NativeTableType;
+  static const flatbuffers::TypeTable *MiniReflectTypeTable() {
+    return QuantileParamTypeTable();
+  }
+  const flatbuffers::Vector<float> *qLevels() const {
+    return GetPointer<const flatbuffers::Vector<float> *>(4);
+  }
+  bool Verify(flatbuffers::Verifier &verifier) const {
+    return VerifyTableStart(verifier) &&
+           VerifyOffset(verifier, 4) &&
+           verifier.VerifyVector(qLevels()) &&
+           verifier.EndTable();
+  }
+  QuantileParamT *UnPack(const flatbuffers::resolver_function_t *_resolver = nullptr) const;
+  void UnPackTo(QuantileParamT *_o, const flatbuffers::resolver_function_t *_resolver = nullptr) const;
+  static flatbuffers::Offset<QuantileParam> Pack(flatbuffers::FlatBufferBuilder &_fbb, const QuantileParamT* _o, const flatbuffers::rehasher_function_t *_rehasher = nullptr);
+};
+
+struct QuantileParamBuilder {
+  flatbuffers::FlatBufferBuilder &fbb_;
+  flatbuffers::uoffset_t start_;
+  void add_qLevels(flatbuffers::Offset<flatbuffers::Vector<float>> qLevels) {
+    fbb_.AddOffset(4, qLevels);
+  }
+  explicit QuantileParamBuilder(flatbuffers::FlatBufferBuilder &_fbb)
+        : fbb_(_fbb) {
+    start_ = fbb_.StartTable();
+  }
+  QuantileParamBuilder &operator=(const QuantileParamBuilder &);
+  flatbuffers::Offset<QuantileParam> Finish() {
+    const auto end = fbb_.EndTable(start_);
+    auto o = flatbuffers::Offset<QuantileParam>(end);
+    return o;
+  }
+};
+
+inline flatbuffers::Offset<QuantileParam> CreateQuantileParam(
+    flatbuffers::FlatBufferBuilder &_fbb,
+    flatbuffers::Offset<flatbuffers::Vector<float>> qLevels = 0) {
+  QuantileParamBuilder builder_(_fbb);
+  builder_.add_qLevels(qLevels);
+  return builder_.Finish();
+}
+
+flatbuffers::Offset<QuantileParam> CreateQuantileParam(flatbuffers::FlatBufferBuilder &_fbb, const QuantileParamT *_o, const flatbuffers::rehasher_function_t *_rehasher = nullptr);
+
 struct WhileParamT : public flatbuffers::NativeTable {
   typedef WhileParam TableType;
   std::string cond_graph;
@@ -4080,9 +4157,6 @@ struct Op FLATBUFFERS_FINAL_CLASS : private flatbuffers::Table {
   const Resize *main_as_Resize() const {
     return main_type() == OpParameter_Resize ? static_cast<const Resize *>(main()) : nullptr;
   }
-  const ShapeParam *main_as_ShapeParam() const {
-    return main_type() == OpParameter_ShapeParam ? static_cast<const ShapeParam *>(main()) : nullptr;
-  }
   const RoiParameters *main_as_RoiParameters() const {
     return main_type() == OpParameter_RoiParameters ? static_cast<const RoiParameters *>(main()) : nullptr;
   }
@@ -4214,6 +4288,12 @@ struct Op FLATBUFFERS_FINAL_CLASS : private flatbuffers::Table {
   }
   const LinearAttentionParam *main_as_LinearAttentionParam() const {
     return main_type() == OpParameter_LinearAttentionParam ? static_cast<const LinearAttentionParam *>(main()) : nullptr;
+  }
+  const ShapeParam *main_as_ShapeParam() const {
+    return main_type() == OpParameter_ShapeParam ? static_cast<const ShapeParam *>(main()) : nullptr;
+  }
+  const QuantileParam *main_as_QuantileParam() const {
+    return main_type() == OpParameter_QuantileParam ? static_cast<const QuantileParam *>(main()) : nullptr;
   }
   const flatbuffers::String *name() const {
     return GetPointer<const flatbuffers::String *>(10);
@@ -4476,10 +4556,6 @@ template<> inline const Resize *Op::main_as<Resize>() const {
   return main_as_Resize();
 }
 
-template<> inline const ShapeParam *Op::main_as<ShapeParam>() const {
-  return main_as_ShapeParam();
-}
-
 template<> inline const RoiParameters *Op::main_as<RoiParameters>() const {
   return main_as_RoiParameters();
 }
@@ -4654,6 +4730,14 @@ template<> inline const StftParam *Op::main_as<StftParam>() const {
 
 template<> inline const LinearAttentionParam *Op::main_as<LinearAttentionParam>() const {
   return main_as_LinearAttentionParam();
+}
+
+template<> inline const ShapeParam *Op::main_as<ShapeParam>() const {
+  return main_as_ShapeParam();
+}
+
+template<> inline const QuantileParam *Op::main_as<QuantileParam>() const {
+  return main_as_QuantileParam();
 }
 
 struct OpBuilder {
@@ -5639,6 +5723,32 @@ inline flatbuffers::Offset<ShapeParam> CreateShapeParam(flatbuffers::FlatBufferB
       _end);
 }
 
+inline QuantileParamT *QuantileParam::UnPack(const flatbuffers::resolver_function_t *_resolver) const {
+  auto _o = new QuantileParamT();
+  UnPackTo(_o, _resolver);
+  return _o;
+}
+
+inline void QuantileParam::UnPackTo(QuantileParamT *_o, const flatbuffers::resolver_function_t *_resolver) const {
+  (void)_o;
+  (void)_resolver;
+  { auto _e = qLevels(); if (_e) { _o->qLevels.resize(_e->size()); for (flatbuffers::uoffset_t _i = 0; _i < _e->size(); _i++) { _o->qLevels[_i] = _e->Get(_i); } } };
+}
+
+inline flatbuffers::Offset<QuantileParam> QuantileParam::Pack(flatbuffers::FlatBufferBuilder &_fbb, const QuantileParamT* _o, const flatbuffers::rehasher_function_t *_rehasher) {
+  return CreateQuantileParam(_fbb, _o, _rehasher);
+}
+
+inline flatbuffers::Offset<QuantileParam> CreateQuantileParam(flatbuffers::FlatBufferBuilder &_fbb, const QuantileParamT *_o, const flatbuffers::rehasher_function_t *_rehasher) {
+  (void)_rehasher;
+  (void)_o;
+  struct _VectorArgs { flatbuffers::FlatBufferBuilder *__fbb; const QuantileParamT* __o; const flatbuffers::rehasher_function_t *__rehasher; } _va = { &_fbb, _o, _rehasher}; (void)_va;
+  auto _qLevels = _o->qLevels.size() ? _fbb.CreateVector(_o->qLevels) : 0;
+  return MNN::CreateQuantileParam(
+      _fbb,
+      _qLevels);
+}
+
 inline WhileParamT *WhileParam::UnPack(const flatbuffers::resolver_function_t *_resolver) const {
   auto _o = new WhileParamT();
   UnPackTo(_o, _resolver);
@@ -6319,10 +6429,6 @@ inline bool VerifyOpParameter(flatbuffers::Verifier &verifier, const void *obj, 
       auto ptr = reinterpret_cast<const Resize *>(obj);
       return verifier.VerifyTable(ptr);
     }
-    case OpParameter_ShapeParam: {
-      auto ptr = reinterpret_cast<const ShapeParam *>(obj);
-      return verifier.VerifyTable(ptr);
-    }
     case OpParameter_RoiParameters: {
       auto ptr = reinterpret_cast<const RoiParameters *>(obj);
       return verifier.VerifyTable(ptr);
@@ -6497,6 +6603,14 @@ inline bool VerifyOpParameter(flatbuffers::Verifier &verifier, const void *obj, 
     }
     case OpParameter_LinearAttentionParam: {
       auto ptr = reinterpret_cast<const LinearAttentionParam *>(obj);
+      return verifier.VerifyTable(ptr);
+    }
+    case OpParameter_ShapeParam: {
+      auto ptr = reinterpret_cast<const ShapeParam *>(obj);
+      return verifier.VerifyTable(ptr);
+    }
+    case OpParameter_QuantileParam: {
+      auto ptr = reinterpret_cast<const QuantileParam *>(obj);
       return verifier.VerifyTable(ptr);
     }
     default: return false;
@@ -6741,10 +6855,6 @@ inline void *OpParameterUnion::UnPack(const void *obj, OpParameter type, const f
       auto ptr = reinterpret_cast<const Resize *>(obj);
       return ptr->UnPack(resolver);
     }
-    case OpParameter_ShapeParam: {
-      auto ptr = reinterpret_cast<const ShapeParam *>(obj);
-      return ptr->UnPack(resolver);
-    }
     case OpParameter_RoiParameters: {
       auto ptr = reinterpret_cast<const RoiParameters *>(obj);
       return ptr->UnPack(resolver);
@@ -6919,6 +7029,14 @@ inline void *OpParameterUnion::UnPack(const void *obj, OpParameter type, const f
     }
     case OpParameter_LinearAttentionParam: {
       auto ptr = reinterpret_cast<const LinearAttentionParam *>(obj);
+      return ptr->UnPack(resolver);
+    }
+    case OpParameter_ShapeParam: {
+      auto ptr = reinterpret_cast<const ShapeParam *>(obj);
+      return ptr->UnPack(resolver);
+    }
+    case OpParameter_QuantileParam: {
+      auto ptr = reinterpret_cast<const QuantileParam *>(obj);
       return ptr->UnPack(resolver);
     }
     default: return nullptr;
@@ -7151,10 +7269,6 @@ inline flatbuffers::Offset<void> OpParameterUnion::Pack(flatbuffers::FlatBufferB
       auto ptr = reinterpret_cast<const ResizeT *>(value);
       return CreateResize(_fbb, ptr, _rehasher).Union();
     }
-    case OpParameter_ShapeParam: {
-      auto ptr = reinterpret_cast<const ShapeParamT *>(value);
-      return CreateShapeParam(_fbb, ptr, _rehasher).Union();
-    }
     case OpParameter_RoiParameters: {
       auto ptr = reinterpret_cast<const RoiParametersT *>(value);
       return CreateRoiParameters(_fbb, ptr, _rehasher).Union();
@@ -7330,6 +7444,14 @@ inline flatbuffers::Offset<void> OpParameterUnion::Pack(flatbuffers::FlatBufferB
     case OpParameter_LinearAttentionParam: {
       auto ptr = reinterpret_cast<const LinearAttentionParamT *>(value);
       return CreateLinearAttentionParam(_fbb, ptr, _rehasher).Union();
+    }
+    case OpParameter_ShapeParam: {
+      auto ptr = reinterpret_cast<const ShapeParamT *>(value);
+      return CreateShapeParam(_fbb, ptr, _rehasher).Union();
+    }
+    case OpParameter_QuantileParam: {
+      auto ptr = reinterpret_cast<const QuantileParamT *>(value);
+      return CreateQuantileParam(_fbb, ptr, _rehasher).Union();
     }
     default: return 0;
   }
@@ -7561,10 +7683,6 @@ inline OpParameterUnion::OpParameterUnion(const OpParameterUnion &u) FLATBUFFERS
       value = new ResizeT(*reinterpret_cast<ResizeT *>(u.value));
       break;
     }
-    case OpParameter_ShapeParam: {
-      value = new ShapeParamT(*reinterpret_cast<ShapeParamT *>(u.value));
-      break;
-    }
     case OpParameter_RoiParameters: {
       value = new RoiParametersT(*reinterpret_cast<RoiParametersT *>(u.value));
       break;
@@ -7739,6 +7857,14 @@ inline OpParameterUnion::OpParameterUnion(const OpParameterUnion &u) FLATBUFFERS
     }
     case OpParameter_LinearAttentionParam: {
       value = new LinearAttentionParamT(*reinterpret_cast<LinearAttentionParamT *>(u.value));
+      break;
+    }
+    case OpParameter_ShapeParam: {
+      value = new ShapeParamT(*reinterpret_cast<ShapeParamT *>(u.value));
+      break;
+    }
+    case OpParameter_QuantileParam: {
+      value = new QuantileParamT(*reinterpret_cast<QuantileParamT *>(u.value));
       break;
     }
     default:
@@ -8028,11 +8154,6 @@ inline void OpParameterUnion::Reset() {
       delete ptr;
       break;
     }
-    case OpParameter_ShapeParam: {
-      auto ptr = reinterpret_cast<ShapeParamT *>(value);
-      delete ptr;
-      break;
-    }
     case OpParameter_RoiParameters: {
       auto ptr = reinterpret_cast<RoiParametersT *>(value);
       delete ptr;
@@ -8253,6 +8374,16 @@ inline void OpParameterUnion::Reset() {
       delete ptr;
       break;
     }
+    case OpParameter_ShapeParam: {
+      auto ptr = reinterpret_cast<ShapeParamT *>(value);
+      delete ptr;
+      break;
+    }
+    case OpParameter_QuantileParam: {
+      auto ptr = reinterpret_cast<QuantileParamT *>(value);
+      delete ptr;
+      break;
+    }
     default: break;
   }
   value = nullptr;
@@ -8443,12 +8574,13 @@ inline const flatbuffers::TypeTable *OpTypeTypeTable() {
     { flatbuffers::ET_INT, 0, 0 },
     { flatbuffers::ET_INT, 0, 0 },
     { flatbuffers::ET_INT, 0, 0 },
+    { flatbuffers::ET_INT, 0, 0 },
     { flatbuffers::ET_INT, 0, 0 }
   };
   static const flatbuffers::TypeFunction type_refs[] = {
     OpTypeTypeTable
   };
-  static const int64_t values[] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155, 156, 256, 257, 258, 259, 260, 261, 262, 263, 264, 265, 266, 267, 268, 269, 299, 300, 301, 302, 303, 304, 305, 512, 513, 514, 515, 517, 518, 600, 601, 603, 604 };
+  static const int64_t values[] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155, 156, 256, 257, 258, 259, 260, 261, 262, 263, 264, 265, 266, 267, 268, 269, 299, 300, 301, 302, 303, 304, 305, 512, 513, 514, 515, 517, 518, 600, 601, 603, 604, 605 };
   static const char * const names[] = {
     "AbsVal",
     "QuantizedAdd",
@@ -8632,10 +8764,11 @@ inline const flatbuffers::TypeTable *OpTypeTypeTable() {
     "While",
     "If",
     "LayerNorm",
-    "GridSample"
+    "GridSample",
+    "Quantile"
   };
   static const flatbuffers::TypeTable tt = {
-    flatbuffers::ST_ENUM, 183, type_codes, type_refs, values, names
+    flatbuffers::ST_ENUM, 184, type_codes, type_refs, values, names
   };
   return &tt;
 }
@@ -8743,7 +8876,8 @@ inline const flatbuffers::TypeTable *OpParameterTypeTable() {
     { flatbuffers::ET_SEQUENCE, 0, 97 },
     { flatbuffers::ET_SEQUENCE, 0, 98 },
     { flatbuffers::ET_SEQUENCE, 0, 99 },
-    { flatbuffers::ET_SEQUENCE, 0, 100 }
+    { flatbuffers::ET_SEQUENCE, 0, 100 },
+    { flatbuffers::ET_SEQUENCE, 0, 101 }
   };
   static const flatbuffers::TypeFunction type_refs[] = {
     QuantizedAddTypeTable,
@@ -8846,7 +8980,8 @@ inline const flatbuffers::TypeTable *OpParameterTypeTable() {
     AttentionParamTypeTable,
     StftParamTypeTable,
     LinearAttentionParamTypeTable,
-    ShapeParamTypeTable
+    ShapeParamTypeTable,
+    QuantileParamTypeTable
   };
   static const char * const names[] = {
     "NONE",
@@ -8950,10 +9085,11 @@ inline const flatbuffers::TypeTable *OpParameterTypeTable() {
     "AttentionParam",
     "StftParam",
     "LinearAttentionParam",
-    "ShapeParam"
+    "ShapeParam",
+    "QuantileParam"
   };
   static const flatbuffers::TypeTable tt = {
-    flatbuffers::ST_UNION, 102, type_codes, type_refs, nullptr, names
+    flatbuffers::ST_UNION, 103, type_codes, type_refs, nullptr, names
   };
   return &tt;
 }
@@ -9157,6 +9293,19 @@ inline const flatbuffers::TypeTable *ShapeParamTypeTable() {
   };
   static const flatbuffers::TypeTable tt = {
     flatbuffers::ST_TABLE, 4, type_codes, nullptr, nullptr, names
+  };
+  return &tt;
+}
+
+inline const flatbuffers::TypeTable *QuantileParamTypeTable() {
+  static const flatbuffers::TypeCode type_codes[] = {
+    { flatbuffers::ET_FLOAT, 1, -1 }
+  };
+  static const char * const names[] = {
+    "qLevels"
+  };
+  static const flatbuffers::TypeTable tt = {
+    flatbuffers::ST_TABLE, 1, type_codes, nullptr, nullptr, names
   };
   return &tt;
 }

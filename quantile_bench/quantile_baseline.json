@@ -1,0 +1,502 @@
+
+{ "bizCode": "quantile", "extraInfo": 
+{ "version": "3.5.0" }
+, "oplists": 
+[ 
+{ "main_type": "Input", "main": 
+{ "dims": 
+[ 1, 1, 1440, 1920 ]
+, "dtype": "DT_FLOAT", "dformat": "NCHW" }
+, "name": "x", "outputIndexes": 
+[ 0 ]
+, "type": "Input", "defaultDimentionFormat": "NHWC" }
+, 
+{ "main_type": "Blob", "main": 
+{ "dims": 
+[ 1 ]
+, "dataFormat": "NCHW", "dataType": "DT_INT32", "int32s": 
+[ -1 ]
+ }
+, "name": "flat_shape", "outputIndexes": 
+[ 1 ]
+, "type": "Const", "defaultDimentionFormat": "NHWC" }
+, 
+{ "inputIndexes": 
+[ 0, 1 ]
+, "main_type": "Reshape", "main": 
+{ "dimType": "NCHW" }
+, "name": "x_flat", "outputIndexes": 
+[ 2 ]
+, "type": "Reshape", "defaultDimentionFormat": "NHWC" }
+, 
+{ "main_type": "Blob", "main": 
+{ "dims": 
+[ 1 ]
+, "dataFormat": "NCHW", "dataType": "DT_INT32", "int32s": 
+[ 138241 ]
+ }
+, "name": "q0_k", "outputIndexes": 
+[ 3 ]
+, "type": "Const", "defaultDimentionFormat": "NHWC" }
+, 
+{ "main_type": "Blob", "main": 
+{ "dataFormat": "NCHW", "dataType": "DT_INT32", "int32s": 
+[ 0 ]
+ }
+, "name": "Const5", "outputIndexes": 
+[ 4 ]
+, "type": "Const", "defaultDimentionFormat": "NHWC" }
+, 
+{ "inputIndexes": 
+[ 2, 3, 4 ]
+, "main_type": "TopKV2", "main": 
+{ "T": "DT_FLOAT", "sorted": true, "largest": false }
+, "name": "q0_vals", "outputIndexes": 
+[ 5, 6 ]
+, "type": "TopKV2", "defaultDimentionFormat": "NHWC" }
+, 
+{ "main_type": "Blob", "main": 
+{ "dims": 
+[ 1 ]
+, "dataFormat": "NCHW", "dataType": "DT_INT32", "int32s": 
+[ 138239 ]
+ }
+, "name": "q0_lo_start", "outputIndexes": 
+[ 7 ]
+, "type": "Const", "defaultDimentionFormat": "NHWC" }
+, 
+{ "main_type": "Blob", "main": 
+{ "dims": 
+[ 1 ]
+, "dataFormat": "NCHW", "dataType": "DT_INT32", "int32s": 
+[ 138240 ]
+ }
+, "name": "q0_lo_end", "outputIndexes": 
+[ 8 ]
+, "type": "Const", "defaultDimentionFormat": "NHWC" }
+, 
+{ "main_type": "Blob", "main": 
+{ "dims": 
+[ 1 ]
+, "dataFormat": "NCHW", "dataType": "DT_INT32", "int32s": 
+[ 0 ]
+ }
+, "name": "q0_axes", "outputIndexes": 
+[ 9 ]
+, "type": "Const", "defaultDimentionFormat": "NHWC" }
+, 
+{ "inputIndexes": 
+[ 5, 7, 8, 9 ]
+, "main_type": "StridedSliceParam", "main": 
+{ "Index": "DT_INVALID", "T": "DT_INVALID", "beginMask": 0, "endMask": 0, "ellipsisMask": 0, "newAxisMask": 0, "shrinkAxisMask": 0, "fromType": 1 }
+, "name": "q0_lower", "outputIndexes": 
+[ 10 ]
+, "type": "StridedSlice", "defaultDimentionFormat": "NHWC" }
+, 
+{ "inputIndexes": 
+[ 5, 8, 3, 9 ]
+, "main_type": "StridedSliceParam", "main": 
+{ "Index": "DT_INVALID", "T": "DT_INVALID", "beginMask": 0, "endMask": 0, "ellipsisMask": 0, "newAxisMask": 0, "shrinkAxisMask": 0, "fromType": 1 }
+, "name": "q0_upper", "outputIndexes": 
+[ 11 ]
+, "type": "StridedSlice", "defaultDimentionFormat": "NHWC" }
+, 
+{ "inputIndexes": 
+[ 11, 10 ]
+, "main_type": "BinaryOp", "main": 
+{ "opType": "SUB", "T": "DT_FLOAT", "activationType": 0 }
+, "name": "q0_diff", "outputIndexes": 
+[ 12 ]
+, "type": "BinaryOp", "defaultDimentionFormat": "NHWC" }
+, 
+{ "main_type": "Blob", "main": 
+{ "dims": 
+[ 1 ]
+, "dataFormat": "NCHW", "dataType": "DT_FLOAT", "float32s": 
+[ 0.95 ]
+ }
+, "name": "q0_frac", "outputIndexes": 
+[ 13 ]
+, "type": "Const", "defaultDimentionFormat": "NHWC" }
+, 
+{ "inputIndexes": 
+[ 12, 13 ]
+, "main_type": "BinaryOp", "main": 
+{ "opType": "MUL", "T": "DT_FLOAT", "activationType": 0 }
+, "name": "q0_weighted", "outputIndexes": 
+[ 14 ]
+, "type": "BinaryOp", "defaultDimentionFormat": "NHWC" }
+, 
+{ "inputIndexes": 
+[ 10, 14 ]
+, "main_type": "BinaryOp", "main": 
+{ "opType": "ADD", "T": "DT_FLOAT", "activationType": 0 }
+, "name": "q0_result", "outputIndexes": 
+[ 15 ]
+, "type": "BinaryOp", "defaultDimentionFormat": "NHWC" }
+, 
+{ "main_type": "Blob", "main": 
+{ "dims": 
+[ 1 ]
+, "dataFormat": "NCHW", "dataType": "DT_INT32", "int32s": 
+[ 691201 ]
+ }
+, "name": "q1_k", "outputIndexes": 
+[ 16 ]
+, "type": "Const", "defaultDimentionFormat": "NHWC" }
+, 
+{ "inputIndexes": 
+[ 2, 16, 4 ]
+, "main_type": "TopKV2", "main": 
+{ "T": "DT_FLOAT", "sorted": true, "largest": false }
+, "name": "q1_vals", "outputIndexes": 
+[ 17, 18 ]
+, "type": "TopKV2", "defaultDimentionFormat": "NHWC" }
+, 
+{ "main_type": "Blob", "main": 
+{ "dims": 
+[ 1 ]
+, "dataFormat": "NCHW", "dataType": "DT_INT32", "int32s": 
+[ 691199 ]
+ }
+, "name": "q1_lo_start", "outputIndexes": 
+[ 19 ]
+, "type": "Const", "defaultDimentionFormat": "NHWC" }
+, 
+{ "main_type": "Blob", "main": 
+{ "dims": 
+[ 1 ]
+, "dataFormat": "NCHW", "dataType": "DT_INT32", "int32s": 
+[ 691200 ]
+ }
+, "name": "q1_lo_end", "outputIndexes": 
+[ 20 ]
+, "type": "Const", "defaultDimentionFormat": "NHWC" }
+, 
+{ "inputIndexes": 
+[ 17, 19, 20, 9 ]
+, "main_type": "StridedSliceParam", "main": 
+{ "Index": "DT_INVALID", "T": "DT_INVALID", "beginMask": 0, "endMask": 0, "ellipsisMask": 0, "newAxisMask": 0, "shrinkAxisMask": 0, "fromType": 1 }
+, "name": "q1_lower", "outputIndexes": 
+[ 21 ]
+, "type": "StridedSlice", "defaultDimentionFormat": "NHWC" }
+, 
+{ "inputIndexes": 
+[ 17, 20, 16, 9 ]
+, "main_type": "StridedSliceParam", "main": 
+{ "Index": "DT_INVALID", "T": "DT_INVALID", "beginMask": 0, "endMask": 0, "ellipsisMask": 0, "newAxisMask": 0, "shrinkAxisMask": 0, "fromType": 1 }
+, "name": "q1_upper", "outputIndexes": 
+[ 22 ]
+, "type": "StridedSlice", "defaultDimentionFormat": "NHWC" }
+, 
+{ "inputIndexes": 
+[ 22, 21 ]
+, "main_type": "BinaryOp", "main": 
+{ "opType": "SUB", "T": "DT_FLOAT", "activationType": 0 }
+, "name": "q1_diff", "outputIndexes": 
+[ 23 ]
+, "type": "BinaryOp", "defaultDimentionFormat": "NHWC" }
+, 
+{ "main_type": "Blob", "main": 
+{ "dims": 
+[ 1 ]
+, "dataFormat": "NCHW", "dataType": "DT_FLOAT", "float32s": 
+[ 0.75 ]
+ }
+, "name": "q1_frac", "outputIndexes": 
+[ 24 ]
+, "type": "Const", "defaultDimentionFormat": "NHWC" }
+, 
+{ "inputIndexes": 
+[ 23, 24 ]
+, "main_type": "BinaryOp", "main": 
+{ "opType": "MUL", "T": "DT_FLOAT", "activationType": 0 }
+, "name": "q1_weighted", "outputIndexes": 
+[ 25 ]
+, "type": "BinaryOp", "defaultDimentionFormat": "NHWC" }
+, 
+{ "inputIndexes": 
+[ 21, 25 ]
+, "main_type": "BinaryOp", "main": 
+{ "opType": "ADD", "T": "DT_FLOAT", "activationType": 0 }
+, "name": "q1_result", "outputIndexes": 
+[ 26 ]
+, "type": "BinaryOp", "defaultDimentionFormat": "NHWC" }
+, 
+{ "main_type": "Blob", "main": 
+{ "dims": 
+[ 1 ]
+, "dataFormat": "NCHW", "dataType": "DT_INT32", "int32s": 
+[ 1382401 ]
+ }
+, "name": "q2_k", "outputIndexes": 
+[ 27 ]
+, "type": "Const", "defaultDimentionFormat": "NHWC" }
+, 
+{ "inputIndexes": 
+[ 2, 27, 4 ]
+, "main_type": "TopKV2", "main": 
+{ "T": "DT_FLOAT", "sorted": true, "largest": false }
+, "name": "q2_vals", "outputIndexes": 
+[ 28, 29 ]
+, "type": "TopKV2", "defaultDimentionFormat": "NHWC" }
+, 
+{ "main_type": "Blob", "main": 
+{ "dims": 
+[ 1 ]
+, "dataFormat": "NCHW", "dataType": "DT_INT32", "int32s": 
+[ 1382399 ]
+ }
+, "name": "q2_lo_start", "outputIndexes": 
+[ 30 ]
+, "type": "Const", "defaultDimentionFormat": "NHWC" }
+, 
+{ "main_type": "Blob", "main": 
+{ "dims": 
+[ 1 ]
+, "dataFormat": "NCHW", "dataType": "DT_INT32", "int32s": 
+[ 1382400 ]
+ }
+, "name": "q2_lo_end", "outputIndexes": 
+[ 31 ]
+, "type": "Const", "defaultDimentionFormat": "NHWC" }
+, 
+{ "inputIndexes": 
+[ 28, 30, 31, 9 ]
+, "main_type": "StridedSliceParam", "main": 
+{ "Index": "DT_INVALID", "T": "DT_INVALID", "beginMask": 0, "endMask": 0, "ellipsisMask": 0, "newAxisMask": 0, "shrinkAxisMask": 0, "fromType": 1 }
+, "name": "q2_lower", "outputIndexes": 
+[ 32 ]
+, "type": "StridedSlice", "defaultDimentionFormat": "NHWC" }
+, 
+{ "inputIndexes": 
+[ 28, 31, 27, 9 ]
+, "main_type": "StridedSliceParam", "main": 
+{ "Index": "DT_INVALID", "T": "DT_INVALID", "beginMask": 0, "endMask": 0, "ellipsisMask": 0, "newAxisMask": 0, "shrinkAxisMask": 0, "fromType": 1 }
+, "name": "q2_upper", "outputIndexes": 
+[ 33 ]
+, "type": "StridedSlice", "defaultDimentionFormat": "NHWC" }
+, 
+{ "inputIndexes": 
+[ 33, 32 ]
+, "main_type": "BinaryOp", "main": 
+{ "opType": "SUB", "T": "DT_FLOAT", "activationType": 0 }
+, "name": "q2_diff", "outputIndexes": 
+[ 34 ]
+, "type": "BinaryOp", "defaultDimentionFormat": "NHWC" }
+, 
+{ "main_type": "Blob", "main": 
+{ "dims": 
+[ 1 ]
+, "dataFormat": "NCHW", "dataType": "DT_FLOAT", "float32s": 
+[ 0.5 ]
+ }
+, "name": "q2_frac", "outputIndexes": 
+[ 35 ]
+, "type": "Const", "defaultDimentionFormat": "NHWC" }
+, 
+{ "inputIndexes": 
+[ 34, 35 ]
+, "main_type": "BinaryOp", "main": 
+{ "opType": "MUL", "T": "DT_FLOAT", "activationType": 0 }
+, "name": "q2_weighted", "outputIndexes": 
+[ 36 ]
+, "type": "BinaryOp", "defaultDimentionFormat": "NHWC" }
+, 
+{ "inputIndexes": 
+[ 32, 36 ]
+, "main_type": "BinaryOp", "main": 
+{ "opType": "ADD", "T": "DT_FLOAT", "activationType": 0 }
+, "name": "q2_result", "outputIndexes": 
+[ 37 ]
+, "type": "BinaryOp", "defaultDimentionFormat": "NHWC" }
+, 
+{ "main_type": "Blob", "main": 
+{ "dims": 
+[ 1 ]
+, "dataFormat": "NCHW", "dataType": "DT_INT32", "int32s": 
+[ 2073601 ]
+ }
+, "name": "q3_k", "outputIndexes": 
+[ 38 ]
+, "type": "Const", "defaultDimentionFormat": "NHWC" }
+, 
+{ "inputIndexes": 
+[ 2, 38, 4 ]
+, "main_type": "TopKV2", "main": 
+{ "T": "DT_FLOAT", "sorted": true, "largest": false }
+, "name": "q3_vals", "outputIndexes": 
+[ 39, 40 ]
+, "type": "TopKV2", "defaultDimentionFormat": "NHWC" }
+, 
+{ "main_type": "Blob", "main": 
+{ "dims": 
+[ 1 ]
+, "dataFormat": "NCHW", "dataType": "DT_INT32", "int32s": 
+[ 2073599 ]
+ }
+, "name": "q3_lo_start", "outputIndexes": 
+[ 41 ]
+, "type": "Const", "defaultDimentionFormat": "NHWC" }
+, 
+{ "main_type": "Blob", "main": 
+{ "dims": 
+[ 1 ]
+, "dataFormat": "NCHW", "dataType": "DT_INT32", "int32s": 
+[ 2073600 ]
+ }
+, "name": "q3_lo_end", "outputIndexes": 
+[ 42 ]
+, "type": "Const", "defaultDimentionFormat": "NHWC" }
+, 
+{ "inputIndexes": 
+[ 39, 41, 42, 9 ]
+, "main_type": "StridedSliceParam", "main": 
+{ "Index": "DT_INVALID", "T": "DT_INVALID", "beginMask": 0, "endMask": 0, "ellipsisMask": 0, "newAxisMask": 0, "shrinkAxisMask": 0, "fromType": 1 }
+, "name": "q3_lower", "outputIndexes": 
+[ 43 ]
+, "type": "StridedSlice", "defaultDimentionFormat": "NHWC" }
+, 
+{ "inputIndexes": 
+[ 39, 42, 38, 9 ]
+, "main_type": "StridedSliceParam", "main": 
+{ "Index": "DT_INVALID", "T": "DT_INVALID", "beginMask": 0, "endMask": 0, "ellipsisMask": 0, "newAxisMask": 0, "shrinkAxisMask": 0, "fromType": 1 }
+, "name": "q3_upper", "outputIndexes": 
+[ 44 ]
+, "type": "StridedSlice", "defaultDimentionFormat": "NHWC" }
+, 
+{ "inputIndexes": 
+[ 44, 43 ]
+, "main_type": "BinaryOp", "main": 
+{ "opType": "SUB", "T": "DT_FLOAT", "activationType": 0 }
+, "name": "q3_diff", "outputIndexes": 
+[ 45 ]
+, "type": "BinaryOp", "defaultDimentionFormat": "NHWC" }
+, 
+{ "main_type": "Blob", "main": 
+{ "dims": 
+[ 1 ]
+, "dataFormat": "NCHW", "dataType": "DT_FLOAT", "float32s": 
+[ 0.25 ]
+ }
+, "name": "q3_frac", "outputIndexes": 
+[ 46 ]
+, "type": "Const", "defaultDimentionFormat": "NHWC" }
+, 
+{ "inputIndexes": 
+[ 45, 46 ]
+, "main_type": "BinaryOp", "main": 
+{ "opType": "MUL", "T": "DT_FLOAT", "activationType": 0 }
+, "name": "q3_weighted", "outputIndexes": 
+[ 47 ]
+, "type": "BinaryOp", "defaultDimentionFormat": "NHWC" }
+, 
+{ "inputIndexes": 
+[ 43, 47 ]
+, "main_type": "BinaryOp", "main": 
+{ "opType": "ADD", "T": "DT_FLOAT", "activationType": 0 }
+, "name": "q3_result", "outputIndexes": 
+[ 48 ]
+, "type": "BinaryOp", "defaultDimentionFormat": "NHWC" }
+, 
+{ "main_type": "Blob", "main": 
+{ "dims": 
+[ 1 ]
+, "dataFormat": "NCHW", "dataType": "DT_INT32", "int32s": 
+[ 2626561 ]
+ }
+, "name": "q4_k", "outputIndexes": 
+[ 49 ]
+, "type": "Const", "defaultDimentionFormat": "NHWC" }
+, 
+{ "inputIndexes": 
+[ 2, 49, 4 ]
+, "main_type": "TopKV2", "main": 
+{ "T": "DT_FLOAT", "sorted": true, "largest": false }
+, "name": "q4_vals", "outputIndexes": 
+[ 50, 51 ]
+, "type": "TopKV2", "defaultDimentionFormat": "NHWC" }
+, 
+{ "main_type": "Blob", "main": 
+{ "dims": 
+[ 1 ]
+, "dataFormat": "NCHW", "dataType": "DT_INT32", "int32s": 
+[ 2626559 ]
+ }
+, "name": "q4_lo_start", "outputIndexes": 
+[ 52 ]
+, "type": "Const", "defaultDimentionFormat": "NHWC" }
+, 
+{ "main_type": "Blob", "main": 
+{ "dims": 
+[ 1 ]
+, "dataFormat": "NCHW", "dataType": "DT_INT32", "int32s": 
+[ 2626560 ]
+ }
+, "name": "q4_lo_end", "outputIndexes": 
+[ 53 ]
+, "type": "Const", "defaultDimentionFormat": "NHWC" }
+, 
+{ "inputIndexes": 
+[ 50, 52, 53, 9 ]
+, "main_type": "StridedSliceParam", "main": 
+{ "Index": "DT_INVALID", "T": "DT_INVALID", "beginMask": 0, "endMask": 0, "ellipsisMask": 0, "newAxisMask": 0, "shrinkAxisMask": 0, "fromType": 1 }
+, "name": "q4_lower", "outputIndexes": 
+[ 54 ]
+, "type": "StridedSlice", "defaultDimentionFormat": "NHWC" }
+, 
+{ "inputIndexes": 
+[ 50, 53, 49, 9 ]
+, "main_type": "StridedSliceParam", "main": 
+{ "Index": "DT_INVALID", "T": "DT_INVALID", "beginMask": 0, "endMask": 0, "ellipsisMask": 0, "newAxisMask": 0, "shrinkAxisMask": 0, "fromType": 1 }
+, "name": "q4_upper", "outputIndexes": 
+[ 55 ]
+, "type": "StridedSlice", "defaultDimentionFormat": "NHWC" }
+, 
+{ "inputIndexes": 
+[ 55, 54 ]
+, "main_type": "BinaryOp", "main": 
+{ "opType": "SUB", "T": "DT_FLOAT", "activationType": 0 }
+, "name": "q4_diff", "outputIndexes": 
+[ 56 ]
+, "type": "BinaryOp", "defaultDimentionFormat": "NHWC" }
+, 
+{ "main_type": "Blob", "main": 
+{ "dims": 
+[ 1 ]
+, "dataFormat": "NCHW", "dataType": "DT_FLOAT", "float32s": 
+[ 0.05 ]
+ }
+, "name": "q4_frac", "outputIndexes": 
+[ 57 ]
+, "type": "Const", "defaultDimentionFormat": "NHWC" }
+, 
+{ "inputIndexes": 
+[ 56, 57 ]
+, "main_type": "BinaryOp", "main": 
+{ "opType": "MUL", "T": "DT_FLOAT", "activationType": 0 }
+, "name": "q4_weighted", "outputIndexes": 
+[ 58 ]
+, "type": "BinaryOp", "defaultDimentionFormat": "NHWC" }
+, 
+{ "inputIndexes": 
+[ 54, 58 ]
+, "main_type": "BinaryOp", "main": 
+{ "opType": "ADD", "T": "DT_FLOAT", "activationType": 0 }
+, "name": "q4_result", "outputIndexes": 
+[ 59 ]
+, "type": "BinaryOp", "defaultDimentionFormat": "NHWC" }
+, 
+{ "inputIndexes": 
+[ 15, 26, 37, 48, 59 ]
+, "main_type": "Axis", "main": 
+{ "axis": 0 }
+, "name": "quantiles", "outputIndexes": 
+[ 60 ]
+, "type": "Concat", "defaultDimentionFormat": "NHWC" }
+ ]
+, "outputName": 
+[ "quantiles" ]
+, "preferForwardType": "CPU", "sourceType": "ONNX", "tensorName": 
+[ "x", "flat_shape", "x_flat", "q0_k", "Const5", "q0_vals", "q0_idxs", "q0_lo_start", "q0_lo_end", "q0_axes", "q0_lower", "q0_upper", "q0_diff", "q0_frac", "q0_weighted", "q0_result", "q1_k", "q1_vals", "q1_idxs", "q1_lo_start", "q1_lo_end", "q1_lower", "q1_upper", "q1_diff", "q1_frac", "q1_weighted", "q1_result", "q2_k", "q2_vals", "q2_idxs", "q2_lo_start", "q2_lo_end", "q2_lower", "q2_upper", "q2_diff", "q2_frac", "q2_weighted", "q2_result", "q3_k", "q3_vals", "q3_idxs", "q3_lo_start", "q3_lo_end", "q3_lower", "q3_upper", "q3_diff", "q3_frac", "q3_weighted", "q3_result", "q4_k", "q4_vals", "q4_idxs", "q4_lo_start", "q4_lo_end", "q4_lower", "q4_upper", "q4_diff", "q4_frac", "q4_weighted", "q4_result", "quantiles" ]
+, "tensorNumber": 0, "usage": "INFERENCE", "mnn_uuid": "78adfa25-b954-4c5d-8763-d7ad79789009" }

@@ -1,0 +1,6 @@
+{
+  "inputs": [
+    {"name": "x", "shape": [1, 1, 1440, 1920]}
+  ],
+  "outputs": ["quantiles"]
+}
