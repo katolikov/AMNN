@@ -266,6 +266,15 @@ table ShapeParam {
 table QuantileParam {
     // quantile levels in [0, 1], computed over the fully-flattened input tensor
     qLevels: [float];
+    // opt-in fast path: caller asserts every input element is already
+    // exactly representable as round(level)/255 for some uint8 level in
+    // [0,255] (e.g. a uint8 image plane normalized to [0,1]). When true,
+    // the OpenCL backend re-quantizes to the nearest of the 256 possible
+    // source levels and resolves all quantile levels from a single exact
+    // shared 256-bucket histogram, with no bisection/refinement pass.
+    // Must NOT be set for general (non-uint8-sourced, non-[0,1]) inputs --
+    // doing so silently clamps/quantizes the data and gives wrong results.
+    assumeUint8Source: bool = false;
 }
 
 table WhileParam {

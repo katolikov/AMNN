@@ -3453,7 +3453,9 @@ flatbuffers::Offset<ShapeParam> CreateShapeParam(flatbuffers::FlatBufferBuilder 
 struct QuantileParamT : public flatbuffers::NativeTable {
   typedef QuantileParam TableType;
   std::vector<float> qLevels;
-  QuantileParamT() {
+  bool assumeUint8Source;
+  QuantileParamT()
+      : assumeUint8Source(false) {
   }
 };
 
@@ -3465,10 +3467,14 @@ struct QuantileParam FLATBUFFERS_FINAL_CLASS : private flatbuffers::Table {
   const flatbuffers::Vector<float> *qLevels() const {
     return GetPointer<const flatbuffers::Vector<float> *>(4);
   }
+  bool assumeUint8Source() const {
+    return GetField<uint8_t>(6, 0) != 0;
+  }
   bool Verify(flatbuffers::Verifier &verifier) const {
     return VerifyTableStart(verifier) &&
            VerifyOffset(verifier, 4) &&
            verifier.VerifyVector(qLevels()) &&
+           VerifyField<uint8_t>(verifier, 6) &&
            verifier.EndTable();
   }
   QuantileParamT *UnPack(const flatbuffers::resolver_function_t *_resolver = nullptr) const;
@@ -3481,6 +3487,9 @@ struct QuantileParamBuilder {
   flatbuffers::uoffset_t start_;
   void add_qLevels(flatbuffers::Offset<flatbuffers::Vector<float>> qLevels) {
     fbb_.AddOffset(4, qLevels);
+  }
+  void add_assumeUint8Source(bool assumeUint8Source) {
+    fbb_.AddElement<uint8_t>(6, static_cast<uint8_t>(assumeUint8Source), 0);
   }
   explicit QuantileParamBuilder(flatbuffers::FlatBufferBuilder &_fbb)
         : fbb_(_fbb) {
@@ -3496,9 +3505,11 @@ struct QuantileParamBuilder {
 
 inline flatbuffers::Offset<QuantileParam> CreateQuantileParam(
     flatbuffers::FlatBufferBuilder &_fbb,
-    flatbuffers::Offset<flatbuffers::Vector<float>> qLevels = 0) {
+    flatbuffers::Offset<flatbuffers::Vector<float>> qLevels = 0,
+    bool assumeUint8Source = false) {
   QuantileParamBuilder builder_(_fbb);
   builder_.add_qLevels(qLevels);
+  builder_.add_assumeUint8Source(assumeUint8Source);
   return builder_.Finish();
 }
 
@@ -5733,6 +5744,7 @@ inline void QuantileParam::UnPackTo(QuantileParamT *_o, const flatbuffers::resol
   (void)_o;
   (void)_resolver;
   { auto _e = qLevels(); if (_e) { _o->qLevels.resize(_e->size()); for (flatbuffers::uoffset_t _i = 0; _i < _e->size(); _i++) { _o->qLevels[_i] = _e->Get(_i); } } };
+  { auto _e = assumeUint8Source(); _o->assumeUint8Source = _e; };
 }
 
 inline flatbuffers::Offset<QuantileParam> QuantileParam::Pack(flatbuffers::FlatBufferBuilder &_fbb, const QuantileParamT* _o, const flatbuffers::rehasher_function_t *_rehasher) {
@@ -5744,9 +5756,11 @@ inline flatbuffers::Offset<QuantileParam> CreateQuantileParam(flatbuffers::FlatB
   (void)_o;
   struct _VectorArgs { flatbuffers::FlatBufferBuilder *__fbb; const QuantileParamT* __o; const flatbuffers::rehasher_function_t *__rehasher; } _va = { &_fbb, _o, _rehasher}; (void)_va;
   auto _qLevels = _o->qLevels.size() ? _fbb.CreateVector(_o->qLevels) : 0;
+  auto _assumeUint8Source = _o->assumeUint8Source;
   return MNN::CreateQuantileParam(
       _fbb,
-      _qLevels);
+      _qLevels,
+      _assumeUint8Source);
 }
 
 inline WhileParamT *WhileParam::UnPack(const flatbuffers::resolver_function_t *_resolver) const {
@@ -9299,13 +9313,15 @@ inline const flatbuffers::TypeTable *ShapeParamTypeTable() {
 
 inline const flatbuffers::TypeTable *QuantileParamTypeTable() {
   static const flatbuffers::TypeCode type_codes[] = {
-    { flatbuffers::ET_FLOAT, 1, -1 }
+    { flatbuffers::ET_FLOAT, 1, -1 },
+    { flatbuffers::ET_BOOL, 0, -1 }
   };
   static const char * const names[] = {
-    "qLevels"
+    "qLevels",
+    "assumeUint8Source"
   };
   static const flatbuffers::TypeTable tt = {
-    flatbuffers::ST_TABLE, 1, type_codes, nullptr, nullptr, names
+    flatbuffers::ST_TABLE, 2, type_codes, nullptr, nullptr, names
   };
   return &tt;
 }

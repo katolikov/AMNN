@@ -39,6 +39,9 @@ extern const char* conv_2d_int_buf;
 extern const char* interp_buf;
 #endif
 extern const char* scale;
+#ifndef MNN_OPENCL_BUFFER_CLOSED
+extern const char* quantile_u8_buf;
+#endif
 extern const char* softmax;
 #ifndef MNN_OPENCL_BUFFER_CLOSED
 extern const char* binary_buf;
@@ -218,6 +221,9 @@ const std::map<std::string, const char*> OpenCLProgramMap =
   { "interp_buf", interp_buf },
 #endif
   { "scale", scale },
+#ifndef MNN_OPENCL_BUFFER_CLOSED
+  { "quantile_u8_buf", quantile_u8_buf },
+#endif
   { "softmax", softmax },
 #ifndef MNN_OPENCL_BUFFER_CLOSED
   { "binary_buf", binary_buf },
@@ -379,6 +385,7 @@ const std::map<std::string, std::string> OpenCLProgramMd5Map =
   { "conv_2d_int_buf", "6903dc7ca47d116549ac2b7c4bbf4587" },
   { "interp_buf", "2e5ff1b5184be705580ab6a221864a0c" },
   { "scale", "95773334e603db663c594945a064b9cc" },
+  { "quantile_u8_buf", "51b4488f86a51894d0a67df48876e5b2" },
   { "softmax", "aaa633bb6dd2c40f4379d09d754b5adc" },
   { "binary_buf", "6c5ee786c70aa485d9b49368517296e3" },
   { "quantile_buf", "1277cad8e18463e2aee7cc46cdbde62f" },

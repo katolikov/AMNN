@@ -1844,12 +1844,13 @@ VARP _Sort(VARP x, int axis, bool arg, bool descend) {
     return Variable::create(expr, arg);
 }
 
-VARP _Quantile(VARP x, std::vector<float>&& qLevels) {
+VARP _Quantile(VARP x, std::vector<float>&& qLevels, bool assumeUint8Source) {
     std::unique_ptr<OpT> op(new OpT);
     op->type = OpType_Quantile;
     op->main.type = OpParameter_QuantileParam;
     auto param = new QuantileParamT;
     param->qLevels = std::move(qLevels);
+    param->assumeUint8Source = assumeUint8Source;
     op->main.value = param;
     return (Variable::create(Expr::create(std::move(op), {x})));
 }

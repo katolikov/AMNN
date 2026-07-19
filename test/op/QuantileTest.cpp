@@ -3,6 +3,7 @@
 //  MNNTests
 //
 
+#include <algorithm>
 #include <cmath>
 #include <vector>
 #include <MNN/expr/Expr.hpp>
@@ -66,6 +67,31 @@ public:
             std::vector<float> expected = {-0.98768635f, -0.70706722f, 0.00011102f, 0.70706646f, 0.98768652f};
             if (!checkVectorByRelativeError<float>(got, expected.data(), expected.size(), 0.005f)) {
                 MNN_ERROR("QuantileTest case3 (full [1,1,1440,1920] shape) failed!\n");
+                return false;
+            }
+        }
+
+        // ===== case 4: assumeUint8Source fast path, data already exactly on the =====
+        // ===== 256-level grid (level/255) -- must match numpy exactly, no approximation =====
+        {
+            const int H = 1440, W = 1920;
+            const int n = H * W;
+            VARP input = _Input({1, 1, H, W}, NCHW, halide_type_of<float>());
+            auto ptr = input->writeMap<float>();
+            for (int i = 0; i < n; ++i) {
+                float raw = sinf(i * 0.001f) * 0.5f + 0.5f;
+                int level = (int)(raw * 255.0f + 0.5f);
+                level = std::max(0, std::min(255, level));
+                ptr[i] = level / 255.0f;
+            }
+            std::vector<float> qLevels = {0.05f, 0.25f, 0.5f, 0.75f, 0.95f};
+            auto output = _Quantile(input, std::move(qLevels), /*assumeUint8Source=*/true);
+            auto got = output->readMap<float>();
+            // computed via: level = round((sin(arange(n)*0.001)*0.5+0.5) * 255) in [0,255],
+            // numpy.quantile(level/255.0, qs, method='linear')
+            std::vector<float> expected = {0.00784314f, 0.14509805f, 0.50196081f, 0.85490197f, 0.99215686f};
+            if (!checkVectorByRelativeError<float>(got, expected.data(), expected.size(), 0.005f)) {
+                MNN_ERROR("QuantileTest case4 (assumeUint8Source fast path) failed!\n");
                 return false;
             }
         }

@@ -24,6 +24,7 @@ QuantileBufExecution::QuantileBufExecution(const MNN::Op *op, Backend *backend)
     for (int i = 0; i < mQLevels.size(); ++i) {
         mQLevels[i] = param->qLevels()->Get(i);
     }
+    mAssumeUint8Source = param->assumeUint8Source();
 }
 
 QuantileBufExecution::~QuantileBufExecution() = default;
@@ -38,6 +39,13 @@ ErrorCode QuantileBufExecution::onResize(const std::vector<Tensor *> &inputs, co
     return CommonExecution::onResize(inputs, outputs);
 }
 
+ErrorCode QuantileBufExecution::onEncode(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) {
+    if (mAssumeUint8Source) {
+        return onEncodeUint8Source(inputs, outputs);
+    }
+    return onEncodeGeneral(inputs, outputs);
+}
+
 // Single shared histogram over the top kHistBits bits of the monotonic key
 // (built once for all targets, not once per target -- an earlier per-target
 // radix-select attempt lost to the exact bisection below specifically
@@ -48,7 +56,7 @@ ErrorCode QuantileBufExecution::onResize(const std::vector<Tensor *> &inputs, co
 // pure 16-iteration bisection (~7.7ms -> ~2.4-2.9ms) at the real production
 // shape, because the histogram pass gains 12 bits of information in one
 // global pass instead of 12 sequential ones.
-ErrorCode QuantileBufExecution::onEncode(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) {
+ErrorCode QuantileBufExecution::onEncodeGeneral(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) {
     MNN_ASSERT(inputs.size() == 1 && outputs.size() == 1);
     auto input  = inputs[0];
     auto output = outputs[0];
@@ -177,6 +185,97 @@ ErrorCode QuantileBufExecution::onEncode(const std::vector<Tensor *> &inputs, co
         pushUnit(updateKernel, (uint32_t)mNumTargets, 0);
     }
     pushUnit(finalizeKernel, (uint32_t)mQLevels.size(), 0);
+
+    return NO_ERROR;
+}
+
+// Opt-in fast path: the caller has asserted every input element is already
+// exactly round(level)/255 for a uint8 level, so there are only 256 possible
+// distinct values total. A single exact shared histogram resolves every
+// quantile level directly -- no bisection/refinement pass at all, unlike
+// onEncodeGeneral above. Measured ~2.4-2.9ms -> well under 1ms at the real
+// production shape (see algorithm-selection investigation).
+ErrorCode QuantileBufExecution::onEncodeUint8Source(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) {
+    MNN_ASSERT(inputs.size() == 1 && outputs.size() == 1);
+    auto input  = inputs[0];
+    auto output = outputs[0];
+    const int n = input->elementSize();
+    MNN_ASSERT(n > 0);
+
+    const int numQ = (int)mQLevels.size();
+    mLoRank.resize(numQ);
+    mHiRank.resize(numQ);
+    mFrac.resize(numQ);
+    for (int i = 0; i < numQ; ++i) {
+        const float idx = mQLevels[i] * (n - 1);
+        const int lo = (int)std::floor(idx);
+        const int hi = (int)std::ceil(idx);
+        mLoRank[i] = lo;
+        mHiRank[i] = hi;
+        mFrac[i] = idx - lo;
+    }
+
+    auto runtime = mOpenCLBackend->getOpenCLRuntime();
+    auto context = &runtime->context();
+
+    static const int kU8Buckets = 256;
+    mHistBuffer.reset(new cl::Buffer(*context, CL_MEM_READ_WRITE, kU8Buckets * sizeof(uint32_t)));
+    mLoRankBuffer.reset(new cl::Buffer(*context, CL_MEM_READ_WRITE, numQ * sizeof(int32_t)));
+    mHiRankBuffer.reset(new cl::Buffer(*context, CL_MEM_READ_WRITE, numQ * sizeof(int32_t)));
+    mFracBuffer.reset(new cl::Buffer(*context, CL_MEM_READ_WRITE, numQ * sizeof(float)));
+
+    runtime->commandQueue().enqueueWriteBuffer(*mLoRankBuffer, CL_TRUE, 0, numQ * sizeof(int32_t), mLoRank.data());
+    runtime->commandQueue().enqueueWriteBuffer(*mHiRankBuffer, CL_TRUE, 0, numQ * sizeof(int32_t), mHiRank.data());
+    runtime->commandQueue().enqueueWriteBuffer(*mFracBuffer, CL_TRUE, 0, numQ * sizeof(float), mFrac.data());
+
+    std::set<std::string> buildOptions;
+    auto histInitKernel = runtime->buildKernel("quantile_u8_buf", "quantile_u8_hist_init_buf", buildOptions, mOpenCLBackend->getPrecision());
+    auto histBuildKernel = runtime->buildKernel("quantile_u8_buf", "quantile_u8_hist_build_buf", buildOptions, mOpenCLBackend->getPrecision());
+    auto finalizeKernel = runtime->buildKernel("quantile_u8_buf", "quantile_u8_finalize_buf", buildOptions, mOpenCLBackend->getPrecision());
+    if (histInitKernel == nullptr || histBuildKernel == nullptr || finalizeKernel == nullptr) {
+        return NOT_SUPPORT;
+    }
+
+    const int workGroups = std::max(1, std::min(512, (n + kLocalSize - 1) / kLocalSize));
+    const uint32_t buildGlobal = (uint32_t)workGroups * kLocalSize;
+    const uint32_t histInitGlobal = std::max(1, (kU8Buckets + kLocalSize - 1) / kLocalSize) * kLocalSize;
+
+    cl_int ret = CL_SUCCESS;
+    {
+        uint32_t idx = 0;
+        ret |= histInitKernel->get().setArg(idx++, *mHistBuffer);
+    }
+    {
+        uint32_t idx = 0;
+        ret |= histBuildKernel->get().setArg(idx++, openCLBuffer(input));
+        ret |= histBuildKernel->get().setArg(idx++, *mHistBuffer);
+        ret |= histBuildKernel->get().setArg(idx++, n);
+    }
+    {
+        uint32_t idx = 0;
+        ret |= finalizeKernel->get().setArg(idx++, *mHistBuffer);
+        ret |= finalizeKernel->get().setArg(idx++, *mLoRankBuffer);
+        ret |= finalizeKernel->get().setArg(idx++, *mHiRankBuffer);
+        ret |= finalizeKernel->get().setArg(idx++, *mFracBuffer);
+        ret |= finalizeKernel->get().setArg(idx++, openCLBuffer(output));
+        ret |= finalizeKernel->get().setArg(idx++, numQ);
+    }
+    MNN_CHECK_CL_SUCCESS(ret, "setArg QuantileBufExecution(uint8Source)");
+
+    mUnits.clear();
+    mUnits.reserve(3);
+
+    auto pushUnit = [&](std::shared_ptr<KernelWrap> kernel, uint32_t global, uint32_t local) {
+        Unit unit;
+        unit.kernel = kernel;
+        unit.globalWorkSize = {global, 1, 1};
+        unit.localWorkSize  = local > 0 ? cl::NDRange(local, 1, 1) : cl::NDRange(1, 1, 1);
+        mUnits.emplace_back(std::move(unit));
+    };
+
+    pushUnit(histInitKernel, histInitGlobal, kLocalSize);
+    pushUnit(histBuildKernel, buildGlobal, kLocalSize);
+    pushUnit(finalizeKernel, (uint32_t)numQ, 0);
 
     return NO_ERROR;
 }
