@@ -70,6 +70,9 @@ extern const char* pooling_buf;
 #endif
 extern const char* winogradTransformSource2_5_1;
 #ifndef MNN_OPENCL_BUFFER_CLOSED
+extern const char* quantile_hist_buf;
+#endif
+#ifndef MNN_OPENCL_BUFFER_CLOSED
 extern const char* unary_buf;
 #endif
 #ifndef MNN_OPENCL_BUFFER_CLOSED
@@ -246,6 +249,9 @@ const std::map<std::string, const char*> OpenCLProgramMap =
 #endif
   { "winogradTransformSource2_5_1", winogradTransformSource2_5_1 },
 #ifndef MNN_OPENCL_BUFFER_CLOSED
+  { "quantile_hist_buf", quantile_hist_buf },
+#endif
+#ifndef MNN_OPENCL_BUFFER_CLOSED
   { "unary_buf", unary_buf },
 #endif
 #ifndef MNN_OPENCL_BUFFER_CLOSED
@@ -383,6 +389,7 @@ const std::map<std::string, std::string> OpenCLProgramMd5Map =
   { "pooling_subgroup_buf", "9c935c0caabe2ee20822fcfd7722472e" },
   { "pooling_buf", "806c95095431e361be2af7f4e9eae65e" },
   { "winogradTransformSource2_5_1", "f0ee12556faf4fe0222e2a4e64c53c5c" },
+  { "quantile_hist_buf", "a743ad11e83890c31bf079fe351633ee" },
   { "unary_buf", "bfa4bab8f0cf486ae77eb27193f03b9a" },
   { "depthwise_conv2d_buf", "d1c201a09afccebe794d50027acabdc1" },
   { "glmem_convert", "ee4866b2d889824e48d58fa3a78795d4" },

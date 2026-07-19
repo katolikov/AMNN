@@ -3,8 +3,10 @@
 //  MNN
 //
 //  OpenCL buffer-path implementation of Quantile. Selects exact order
-//  statistics via monotonic-key binary search instead of a full sort/TopK,
-//  so it has no k<=1024-style size cap (see TopKV2BufExecution).
+//  statistics via a shared monotonic-key histogram (one pass, all targets)
+//  followed by a short exact-bisection refinement tail, so it has no
+//  k<=1024-style size cap (see TopKV2BufExecution) and no k<=1024-per-target
+//  cost of a pure sort/select.
 //
 
 #ifndef QuantileBufExecution_hpp
@@ -34,15 +36,20 @@ private:
     std::shared_ptr<cl::Buffer> mLoKeyBuffer;
     std::shared_ptr<cl::Buffer> mHiKeyBuffer;
     std::shared_ptr<cl::Buffer> mCountBuffer;
+    std::shared_ptr<cl::Buffer> mHistBuffer;
     std::shared_ptr<cl::Buffer> mTargetRankBuffer;
     std::shared_ptr<cl::Buffer> mFracBuffer;
 
-    // 16 (not 32) bits of the monotonic key resolved: measured to already
-    // match the fp16-tolerance reference exactly while halving runtime (32
-    // iters: ~15.4ms GPU / 12 iters started showing visible error; see
-    // algorithm-selection investigation). Each iteration costs ~1 count +
-    // 1 update kernel dispatch.
-    static const int kIters = 16;
+    // kHistBits+kRefineIters=16 bits of the monotonic key resolved in total,
+    // matching the precision already validated against the fp16-tolerance
+    // reference (pure bisection: 16 iters correct, 12 already visibly
+    // degraded). 4096 buckets (2^12) uses half this device's 32KB local
+    // memory budget, leaving headroom rather than the 8192-bucket/13-bit
+    // alternative that used all of it for the same total precision and
+    // measured no faster. See the algorithm-selection investigation:
+    // pure 16-iter bisection ~7.7ms -> shared-histogram+refine ~2.4-2.9ms.
+    static const int kHistBits = 12;
+    static const int kRefineIters = 4;
 };
 
 } // namespace OpenCL

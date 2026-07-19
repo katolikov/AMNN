@@ -38,12 +38,24 @@ ErrorCode QuantileBufExecution::onResize(const std::vector<Tensor *> &inputs, co
     return CommonExecution::onResize(inputs, outputs);
 }
 
+// Single shared histogram over the top kHistBits bits of the monotonic key
+// (built once for all targets, not once per target -- an earlier per-target
+// radix-select attempt lost to the exact bisection below specifically
+// because of that 10x redundant histogram work), followed by kRefineIters
+// passes of the same exact-bisection kernels used to finish resolving the
+// remaining bits. kHistBits+kRefineIters=16 matches the precision already
+// validated against the fp16-tolerance reference; measured ~3x faster than
+// pure 16-iteration bisection (~7.7ms -> ~2.4-2.9ms) at the real production
+// shape, because the histogram pass gains 12 bits of information in one
+// global pass instead of 12 sequential ones.
 ErrorCode QuantileBufExecution::onEncode(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) {
     MNN_ASSERT(inputs.size() == 1 && outputs.size() == 1);
     auto input  = inputs[0];
     auto output = outputs[0];
     const int n = input->elementSize();
     MNN_ASSERT(n > 0);
+
+    const int histBuckets = 1 << kHistBits;
 
     // rank/interpolation-weight computation depends only on n and the
     // (compile-time-fixed) q levels, not on tensor contents, so it happens
@@ -66,6 +78,7 @@ ErrorCode QuantileBufExecution::onEncode(const std::vector<Tensor *> &inputs, co
     mLoKeyBuffer.reset(new cl::Buffer(*context, CL_MEM_READ_WRITE, mNumTargets * sizeof(uint32_t)));
     mHiKeyBuffer.reset(new cl::Buffer(*context, CL_MEM_READ_WRITE, mNumTargets * sizeof(uint32_t)));
     mCountBuffer.reset(new cl::Buffer(*context, CL_MEM_READ_WRITE, mNumTargets * sizeof(uint32_t)));
+    mHistBuffer.reset(new cl::Buffer(*context, CL_MEM_READ_WRITE, (size_t)histBuckets * sizeof(uint32_t)));
     mTargetRankBuffer.reset(new cl::Buffer(*context, CL_MEM_READ_WRITE, mNumTargets * sizeof(int32_t)));
     mFracBuffer.reset(new cl::Buffer(*context, CL_MEM_READ_WRITE, mQLevels.size() * sizeof(float)));
 
@@ -78,27 +91,46 @@ ErrorCode QuantileBufExecution::onEncode(const std::vector<Tensor *> &inputs, co
     // kMaxTargets(16) cap: measured ~10% faster at low target counts with no
     // regression at 16, since it avoids allocating/spilling unused lanes.
     buildOptions.insert("-DMAX_TARGETS=" + std::to_string(mNumTargets));
+    std::set<std::string> histBuildOptions;
+    histBuildOptions.insert("-DHIST_BITS=" + std::to_string(kHistBits));
 
-    auto initKernel     = runtime->buildKernel("quantile_buf", "quantile_init_buf", buildOptions, mOpenCLBackend->getPrecision());
+    auto histInitKernel  = runtime->buildKernel("quantile_hist_buf", "quantile_hist_init_buf", histBuildOptions, mOpenCLBackend->getPrecision());
+    auto histBuildKernel = runtime->buildKernel("quantile_hist_buf", "quantile_hist_build_buf", histBuildOptions, mOpenCLBackend->getPrecision());
+    auto histScanKernel  = runtime->buildKernel("quantile_hist_buf", "quantile_hist_scan_buf", histBuildOptions, mOpenCLBackend->getPrecision());
+    // reuse the already-verified exact-bisection kernels for the refinement tail
     auto countKernel     = runtime->buildKernel("quantile_buf", "quantile_count_buf", buildOptions, mOpenCLBackend->getPrecision());
     auto updateKernel    = runtime->buildKernel("quantile_buf", "quantile_update_buf", buildOptions, mOpenCLBackend->getPrecision());
     auto finalizeKernel  = runtime->buildKernel("quantile_buf", "quantile_finalize_buf", buildOptions, mOpenCLBackend->getPrecision());
-    if (initKernel == nullptr || countKernel == nullptr || updateKernel == nullptr || finalizeKernel == nullptr) {
+    if (histInitKernel == nullptr || histBuildKernel == nullptr || histScanKernel == nullptr ||
+        countKernel == nullptr || updateKernel == nullptr || finalizeKernel == nullptr) {
         return NOT_SUPPORT;
     }
 
     // enough workgroups to keep the GPU busy; each work-item grid-strides
     // over the remainder, so this doesn't need to divide n evenly.
     const int workGroups = std::max(1, std::min(512, (n + kLocalSize - 1) / kLocalSize));
-    const uint32_t countGlobal = (uint32_t)workGroups * kLocalSize;
+    const uint32_t buildGlobal = (uint32_t)workGroups * kLocalSize;
+    const uint32_t histInitGlobal = std::max(1, (histBuckets + kLocalSize - 1) / kLocalSize) * kLocalSize;
 
     cl_int ret = CL_SUCCESS;
     {
         uint32_t idx = 0;
-        ret |= initKernel->get().setArg(idx++, *mLoKeyBuffer);
-        ret |= initKernel->get().setArg(idx++, *mHiKeyBuffer);
-        ret |= initKernel->get().setArg(idx++, *mCountBuffer);
-        ret |= initKernel->get().setArg(idx++, mNumTargets);
+        ret |= histInitKernel->get().setArg(idx++, *mHistBuffer);
+    }
+    {
+        uint32_t idx = 0;
+        ret |= histBuildKernel->get().setArg(idx++, openCLBuffer(input));
+        ret |= histBuildKernel->get().setArg(idx++, *mHistBuffer);
+        ret |= histBuildKernel->get().setArg(idx++, n);
+    }
+    {
+        uint32_t idx = 0;
+        ret |= histScanKernel->get().setArg(idx++, *mHistBuffer);
+        ret |= histScanKernel->get().setArg(idx++, *mLoKeyBuffer);
+        ret |= histScanKernel->get().setArg(idx++, *mHiKeyBuffer);
+        ret |= histScanKernel->get().setArg(idx++, *mCountBuffer);
+        ret |= histScanKernel->get().setArg(idx++, *mTargetRankBuffer);
+        ret |= histScanKernel->get().setArg(idx++, mNumTargets);
     }
     {
         uint32_t idx = 0;
@@ -127,7 +159,7 @@ ErrorCode QuantileBufExecution::onEncode(const std::vector<Tensor *> &inputs, co
     MNN_CHECK_CL_SUCCESS(ret, "setArg QuantileBufExecution");
 
     mUnits.clear();
-    mUnits.reserve(2 + 2 * kIters);
+    mUnits.reserve(4 + 2 * kRefineIters);
 
     auto pushUnit = [&](std::shared_ptr<KernelWrap> kernel, uint32_t global, uint32_t local) {
         Unit unit;
@@ -137,9 +169,11 @@ ErrorCode QuantileBufExecution::onEncode(const std::vector<Tensor *> &inputs, co
         mUnits.emplace_back(std::move(unit));
     };
 
-    pushUnit(initKernel, (uint32_t)mNumTargets, 0);
-    for (int it = 0; it < kIters; ++it) {
-        pushUnit(countKernel, countGlobal, kLocalSize);
+    pushUnit(histInitKernel, histInitGlobal, kLocalSize);
+    pushUnit(histBuildKernel, buildGlobal, kLocalSize);
+    pushUnit(histScanKernel, (uint32_t)mNumTargets, 0);
+    for (int it = 0; it < kRefineIters; ++it) {
+        pushUnit(countKernel, buildGlobal, kLocalSize);
         pushUnit(updateKernel, (uint32_t)mNumTargets, 0);
     }
     pushUnit(finalizeKernel, (uint32_t)mQLevels.size(), 0);
