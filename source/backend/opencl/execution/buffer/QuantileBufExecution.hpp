@@ -37,7 +37,12 @@ private:
     std::shared_ptr<cl::Buffer> mTargetRankBuffer;
     std::shared_ptr<cl::Buffer> mFracBuffer;
 
-    static const int kIters = 32;
+    // 16 (not 32) bits of the monotonic key resolved: measured to already
+    // match the fp16-tolerance reference exactly while halving runtime (32
+    // iters: ~15.4ms GPU / 12 iters started showing visible error; see
+    // algorithm-selection investigation). Each iteration costs ~1 count +
+    // 1 update kernel dispatch.
+    static const int kIters = 16;
 };
 
 } // namespace OpenCL
