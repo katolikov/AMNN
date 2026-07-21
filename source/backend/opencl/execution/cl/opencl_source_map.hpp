@@ -134,6 +134,9 @@ extern const char* gemm_int;
 extern const char* buffer_to_image;
 extern const char* winogradTransformDest2_3_1;
 #ifndef MNN_OPENCL_BUFFER_CLOSED
+extern const char* bincount_buf;
+#endif
+#ifndef MNN_OPENCL_BUFFER_CLOSED
 extern const char* layernorm_buf;
 #endif
 #ifndef MNN_OPENCL_BUFFER_CLOSED
@@ -307,6 +310,9 @@ const std::map<std::string, const char*> OpenCLProgramMap =
   { "buffer_to_image", buffer_to_image },
   { "winogradTransformDest2_3_1", winogradTransformDest2_3_1 },
 #ifndef MNN_OPENCL_BUFFER_CLOSED
+  { "bincount_buf", bincount_buf },
+#endif
+#ifndef MNN_OPENCL_BUFFER_CLOSED
   { "layernorm_buf", layernorm_buf },
 #endif
 #ifndef MNN_OPENCL_BUFFER_CLOSED
@@ -405,6 +411,7 @@ const std::map<std::string, std::string> OpenCLProgramMd5Map =
   { "gemm_int", "41770c2a12943f8fbdbfe259889ddf2d" },
   { "buffer_to_image", "bad95040692206db84b5a1bcc0b6f248" },
   { "winogradTransformDest2_3_1", "f2aaa52d652565e70a44868d4f6028e9" },
+  { "bincount_buf", "d2d98a924a42a464aa2e4d6d7a064242" },
   { "layernorm_buf", "5f6b88b29da72f51bdc85064b5663bb2" },
   { "softmax_buf", "12052d403f3fa0cdfea2559296e88e6c" },
   { "conv_2d_c16_subgroup_buf", "81f9027f323b6890d08d49dab10a15e4" },
