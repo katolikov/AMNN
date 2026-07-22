@@ -2,8 +2,9 @@
 //  BinCountBufExecution.hpp
 //  MNN
 //
-//  OpenCL buffer-path implementation of BinCount. Unweighted (int32 counts)
-//  only; the weighted path falls back to CPU. Uses a per-work-item
+//  OpenCL buffer-path implementation of BinCount. Supports unweighted int32
+//  counts and the binary-mask variant (2nd input, mask != 0 kept, int32
+//  counts); float weight-sums fall back to CPU. Uses a per-work-item
 //  register-resident histogram (contention-free) merged via log-tree reduction
 //  plus one global atomic per bin per workgroup.
 //
@@ -27,6 +28,7 @@ public:
 private:
     OpenCLBackend *mOpenCLBackend = nullptr;
     int mBinNum = 0;
+    bool mBinaryMask = false;
 };
 
 } // namespace OpenCL

@@ -38,6 +38,19 @@
 #define TO_BIN(x) (x)
 #endif
 
+// Optional binary mask (second input): elements with mask != 0 are counted,
+// others dropped, output stays int32 counts. Mask may be int32 or float
+// (fp16 buffer); a component's contribution is gated by (m != 0).
+#ifdef BINCOUNT_MASK
+#ifdef BINCOUNT_MASK_FLOAT
+#define MASK_T  FLOAT
+#define MASK_T4 FLOAT4
+#else
+#define MASK_T  int
+#define MASK_T4 int4
+#endif
+#endif
+
 __kernel void bincount_init_buf(
     __global int *output,
     __private const int binNum) {
@@ -50,6 +63,9 @@ __kernel void bincount_init_buf(
 
 __kernel void bincount_count_buf(
     __global const IN_T *input,
+#ifdef BINCOUNT_MASK
+    __global const MASK_T *mask,
+#endif
     __global int *output,
     __private const int n,
     __private const int binNum) {
@@ -65,21 +81,36 @@ __kernel void bincount_count_buf(
     // Vectorized loads: one 128-bit (int4) / 64-bit (half4) transaction per 4
     // elements improves memory throughput. Scalar-component comparisons each
     // return 0/1 in OpenCL C, so summing them gives this group's contribution
-    // to bin b.
+    // to bin b. With a mask, each component is additionally gated by (m != 0).
     const int n4 = n >> 2;
     for (int i = gid; i < n4; i += gsize) {
         IN_T4 v = vload4(i, input);
         int vx = TO_BIN(v.x), vy = TO_BIN(v.y), vz = TO_BIN(v.z), vw = TO_BIN(v.w);
+#ifdef BINCOUNT_MASK
+        MASK_T4 m = vload4(i, mask);
+        int mx = (m.x != 0), my = (m.y != 0), mz = (m.z != 0), mw = (m.w != 0);
+        for (int b = 0; b < BIN_NUM; ++b) {
+            priv[b] += (vx == b) * mx + (vy == b) * my + (vz == b) * mz + (vw == b) * mw;
+        }
+#else
         for (int b = 0; b < BIN_NUM; ++b) {
             priv[b] += (vx == b) + (vy == b) + (vz == b) + (vw == b);
         }
+#endif
     }
     // Tail: the up-to-3 trailing elements when n is not a multiple of 4.
     for (int i = (n4 << 2) + gid; i < n; i += gsize) {
         int v = TO_BIN(input[i]);
+#ifdef BINCOUNT_MASK
+        int keep = (mask[i] != 0);
+        for (int b = 0; b < BIN_NUM; ++b) {
+            priv[b] += ((v == b) ? 1 : 0) * keep;
+        }
+#else
         for (int b = 0; b < BIN_NUM; ++b) {
             priv[b] += (v == b) ? 1 : 0;
         }
+#endif
     }
 
     // ---- cross-work-item merge ----

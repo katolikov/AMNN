@@ -22,12 +22,14 @@ BinCountBufExecution::BinCountBufExecution(const MNN::Op *op, Backend *backend)
     mOpenCLBackend = static_cast<OpenCLBackend *>(backend);
     auto param = op->main_as_BinCountParam();
     mBinNum = param->binNum();
+    mBinaryMask = param->binaryMask();
 }
 
 BinCountBufExecution::~BinCountBufExecution() = default;
 
 ErrorCode BinCountBufExecution::onEncode(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) {
-    MNN_ASSERT(inputs.size() == 1 && outputs.size() == 1);
+    const bool masked = mBinaryMask && (inputs.size() == 2);
+    MNN_ASSERT((inputs.size() == 1 || masked) && outputs.size() == 1);
     auto input  = inputs[0];
     auto output = outputs[0];
     const int n = input->elementSize();
@@ -44,11 +46,18 @@ ErrorCode BinCountBufExecution::onEncode(const std::vector<Tensor *> &inputs, co
     if (floatInput) {
         buildOptions.insert("-DBINCOUNT_IN_FLOAT");
     }
+    if (masked) {
+        buildOptions.insert("-DBINCOUNT_MASK");
+        if (inputs[1]->getType().code == halide_type_float) {
+            buildOptions.insert("-DBINCOUNT_MASK_FLOAT");
+        }
+    }
 
     auto initKernel  = runtime->buildKernel("bincount_buf", "bincount_init_buf", buildOptions, mOpenCLBackend->getPrecision());
     // Env toggle: MNN_BINCOUNT_NAIVE=1 selects the global-atomic-per-element
     // baseline instead of the register-histogram path (on-device benchmarking).
-    const bool useNaive = (getenv("MNN_BINCOUNT_NAIVE") != nullptr);
+    // The naive kernel has no mask variant, so it is disabled when masking.
+    const bool useNaive = (getenv("MNN_BINCOUNT_NAIVE") != nullptr) && !masked;
     auto countKernel = runtime->buildKernel("bincount_buf",
                                             useNaive ? "bincount_naive_buf" : "bincount_count_buf",
                                             buildOptions, mOpenCLBackend->getPrecision());
@@ -87,6 +96,9 @@ ErrorCode BinCountBufExecution::onEncode(const std::vector<Tensor *> &inputs, co
     {
         uint32_t idx = 0;
         ret |= countKernel->get().setArg(idx++, openCLBuffer(input));
+        if (masked) {
+            ret |= countKernel->get().setArg(idx++, openCLBuffer(inputs[1]));
+        }
         ret |= countKernel->get().setArg(idx++, openCLBuffer(output));
         ret |= countKernel->get().setArg(idx++, n);
         ret |= countKernel->get().setArg(idx++, mBinNum);
@@ -114,21 +126,25 @@ class BinCountBufCreator : public OpenCLBackend::Creator {
 public:
     virtual Execution *onCreate(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs,
                                 const MNN::Op *op, Backend *backend) const override {
-        // Unweighted only on GPU; weighted (2 inputs) falls back to CPU.
-        if (inputs.size() != 1) {
-            return nullptr;
-        }
         // Register-histogram path requires a small, compile-time-fixed bin count
-        // and an int32 input; otherwise fall back to CPU.
+        // and an int32/float input; otherwise fall back to CPU.
         auto param = op->main_as_BinCountParam();
         if (param == nullptr || param->binNum() <= 0 || param->binNum() > kMaxBins) {
             return nullptr;
         }
-        // Accept int32 or float (fp32/fp16-buffer) input; the count kernel is
-        // specialized per input type. Other dtypes fall back to CPU.
-        const auto t = inputs[0]->getType();
-        const bool okType = (t == halide_type_of<int>()) || (t.code == halide_type_float);
-        if (!okType) {
+        // One input (counts) or two inputs with binaryMask (masked counts) run
+        // on GPU; float weight-sums (two inputs, no mask) fall back to CPU.
+        const bool masked = (inputs.size() == 2) && param->binaryMask();
+        if (inputs.size() != 1 && !masked) {
+            return nullptr;
+        }
+        // Accept int32 or float (fp32/fp16-buffer) value/mask; the count kernel
+        // is specialized per type. Other dtypes fall back to CPU.
+        auto typeOk = [](const Tensor* t) {
+            const auto h = t->getType();
+            return (h == halide_type_of<int>()) || (h.code == halide_type_float);
+        };
+        if (!typeOk(inputs[0]) || (masked && !typeOk(inputs[1]))) {
             return nullptr;
         }
         if (TensorUtils::getDescribe(inputs[0])->dimensionFormat == MNN_DATA_FORMAT_NC4HW4) {

@@ -268,6 +268,11 @@ table BinCountParam {
     // Input values outside [0, binNum) are ignored. If a weights input is
     // present the output holds float32 weight-sums, otherwise int32 counts.
     binNum: int = 0;
+    // When true and a second input is present, that input is a per-element
+    // binary mask: only elements with mask != 0 are counted, and the output
+    // is int32 counts (not float weight-sums). Enables the masked histogram
+    // on the GPU register-histogram fast path.
+    binaryMask: bool = false;
 }
 
 table WhileParam {

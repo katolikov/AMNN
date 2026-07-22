@@ -27,8 +27,10 @@ class BinCountSizeComputer : public SizeComputer {
         auto output = outputs[0];
         output->buffer().dimensions = 1;
         output->setLength(0, binNum);
-        const bool weighted = (inputs.size() == 2);
-        output->buffer().type = weighted ? halide_type_of<float>() : halide_type_of<int>();
+        // Two inputs: a binary mask keeps int32 counts; float weights give
+        // float32 weight-sums. One input is always int32 counts.
+        const bool weightedSums = (inputs.size() == 2) && !param->binaryMask();
+        output->buffer().type = weightedSums ? halide_type_of<float>() : halide_type_of<int>();
         TensorUtils::getDescribe(output)->dimensionFormat = MNN_DATA_FORMAT_NCHW;
         return true;
     }

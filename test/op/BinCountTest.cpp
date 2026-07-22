@@ -141,6 +141,61 @@ public:
             }
         }
 
+        // ===== case 7: binary mask over the full [1,1,1440,1920] frame =====
+        // value[i] = i%16, mask[i] = (i%2==0). Since i%16==b implies i and b
+        // share parity, even bins keep all n/16 elements and odd bins keep none
+        // -- a deterministic check of the masked-count path (int32 value+mask).
+        {
+            const int H = 1440, W = 1920;
+            const int n = H * W;
+            VARP input = _Input({1, 1, H, W}, NCHW, halide_type_of<int>());
+            VARP mask  = _Input({1, 1, H, W}, NCHW, halide_type_of<int>());
+            auto ip = input->writeMap<int>();
+            auto mp = mask->writeMap<int>();
+            for (int i = 0; i < n; ++i) {
+                ip[i] = i % 16;
+                mp[i] = (i % 2 == 0) ? 1 : 0;
+            }
+            auto output = _BinCount(input, 16, mask, /*binaryMask=*/true);
+            auto got = output->readMap<int>();
+            const int keptPerEvenBin = n / 16;
+            for (int b = 0; b < 16; ++b) {
+                const int want = (b % 2 == 0) ? keptPerEvenBin : 0;
+                if (got[b] != want) {
+                    MNN_ERROR("BinCountTest case7 (int mask) failed at bin %d: got %d, want %d\n",
+                              b, got[b], want);
+                    return false;
+                }
+            }
+        }
+
+        // ===== case 8: binary mask, float value + float mask (fp16 buffer) =====
+        // Same construction as case 7 but exercises BINCOUNT_IN_FLOAT +
+        // BINCOUNT_MASK_FLOAT (both stored as half under OpenCL Low precision).
+        {
+            const int H = 1440, W = 1920;
+            const int n = H * W;
+            VARP input = _Input({1, 1, H, W}, NCHW, halide_type_of<float>());
+            VARP mask  = _Input({1, 1, H, W}, NCHW, halide_type_of<float>());
+            auto ip = input->writeMap<float>();
+            auto mp = mask->writeMap<float>();
+            for (int i = 0; i < n; ++i) {
+                ip[i] = (float)(i % 16);
+                mp[i] = (i % 2 == 0) ? 1.0f : 0.0f;
+            }
+            auto output = _BinCount(input, 16, mask, /*binaryMask=*/true);
+            auto got = output->readMap<int>();
+            const int keptPerEvenBin = n / 16;
+            for (int b = 0; b < 16; ++b) {
+                const int want = (b % 2 == 0) ? keptPerEvenBin : 0;
+                if (got[b] != want) {
+                    MNN_ERROR("BinCountTest case8 (float mask) failed at bin %d: got %d, want %d\n",
+                              b, got[b], want);
+                    return false;
+                }
+            }
+        }
+
         return true;
     }
 };

@@ -24,6 +24,7 @@ public:
 
 private:
     int mBinNum;
+    bool mBinaryMask;
 };
 } // namespace MNN
 
