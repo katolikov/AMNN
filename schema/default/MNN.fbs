@@ -273,6 +273,11 @@ table BinCountParam {
     // is int32 counts (not float weight-sums). Enables the masked histogram
     // on the GPU register-histogram fast path.
     binaryMask: bool = false;
+    // Spatial downsampling stride applied to the last two dims before counting
+    // (input[..., ::sampleStride, ::sampleStride], and the mask likewise). A
+    // value <= 1 counts every element (no downsampling). Produces an
+    // approximate histogram from ~1/stride^2 of the pixels for speed.
+    sampleStride: int = 1;
 }
 
 table WhileParam {

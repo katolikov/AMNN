@@ -26,11 +26,14 @@ void BinCountOnnx::run(MNN::OpT* dstOp, const onnx::NodeProto* onnxNode,
     auto param = new MNN::BinCountParamT;
     param->binNum = 0;
     param->binaryMask = false;
+    param->sampleStride = 1;
     for (const auto& attr : onnxNode->attribute()) {
         if (attr.name() == "binNum" || attr.name() == "minlength") {
             param->binNum = attr.i();
         } else if (attr.name() == "binaryMask") {
             param->binaryMask = (attr.i() != 0);
+        } else if (attr.name() == "sampleStride" || attr.name() == "sample_stride") {
+            param->sampleStride = attr.i();
         }
     }
     dstOp->main.value = param;

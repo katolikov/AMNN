@@ -196,6 +196,59 @@ public:
             }
         }
 
+        // ===== case 9: sample_stride=8 downsampling over the full frame =====
+        // value[h,w] = h%16. Sampled rows h=0,8,16,.. give h%16 alternating
+        // 0,8, so bins 0 and 8 each get (Hs/2)*Ws counts, everything else 0.
+        {
+            const int H = 1440, W = 1920, S = 8;
+            const int n = H * W;
+            const int Hs = (H + S - 1) / S, Ws = (W + S - 1) / S;
+            VARP input = _Input({1, 1, H, W}, NCHW, halide_type_of<int>());
+            auto ip = input->writeMap<int>();
+            for (int i = 0; i < n; ++i) {
+                ip[i] = (i / W) % 16;
+            }
+            auto output = _BinCount(input, 16, nullptr, /*binaryMask=*/false, /*sampleStride=*/S);
+            auto got = output->readMap<int>();
+            const int perHitBin = (Hs / 2) * Ws;   // rows with h%16==0 (and ==8)
+            for (int b = 0; b < 16; ++b) {
+                const int want = (b == 0 || b == 8) ? perHitBin : 0;
+                if (got[b] != want) {
+                    MNN_ERROR("BinCountTest case9 (stride=8) failed at bin %d: got %d, want %d\n",
+                              b, got[b], want);
+                    return false;
+                }
+            }
+        }
+
+        // ===== case 10: sample_stride=8 + binary mask, float value + mask =====
+        // value[h,w]=h%16 (bins 0/8); mask keeps sampled columns with ws even
+        // (mask = ((w/S)%2==0)), so bins 0 and 8 get (Hs/2)*(Ws/2) counts.
+        {
+            const int H = 1440, W = 1920, S = 8;
+            const int n = H * W;
+            const int Hs = (H + S - 1) / S, Ws = (W + S - 1) / S;
+            VARP input = _Input({1, 1, H, W}, NCHW, halide_type_of<float>());
+            VARP mask  = _Input({1, 1, H, W}, NCHW, halide_type_of<float>());
+            auto ip = input->writeMap<float>();
+            auto mp = mask->writeMap<float>();
+            for (int i = 0; i < n; ++i) {
+                ip[i] = (float)((i / W) % 16);
+                mp[i] = (((i % W) / S) % 2 == 0) ? 1.0f : 0.0f;
+            }
+            auto output = _BinCount(input, 16, mask, /*binaryMask=*/true, /*sampleStride=*/S);
+            auto got = output->readMap<int>();
+            const int perHitBin = (Hs / 2) * (Ws / 2);
+            for (int b = 0; b < 16; ++b) {
+                const int want = (b == 0 || b == 8) ? perHitBin : 0;
+                if (got[b] != want) {
+                    MNN_ERROR("BinCountTest case10 (stride+mask) failed at bin %d: got %d, want %d\n",
+                              b, got[b], want);
+                    return false;
+                }
+            }
+        }
+
         return true;
     }
 };

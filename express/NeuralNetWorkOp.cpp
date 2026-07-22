@@ -1844,13 +1844,14 @@ VARP _Sort(VARP x, int axis, bool arg, bool descend) {
     return Variable::create(expr, arg);
 }
 
-VARP _BinCount(VARP x, int binNum, VARP weights, bool binaryMask) {
+VARP _BinCount(VARP x, int binNum, VARP weights, bool binaryMask, int sampleStride) {
     std::unique_ptr<OpT> op(new OpT);
     op->type = OpType_BinCount;
     op->main.type = OpParameter_BinCountParam;
     auto param = new BinCountParamT;
     param->binNum = binNum;
     param->binaryMask = binaryMask;
+    param->sampleStride = sampleStride;
     op->main.value = param;
     if (nullptr == weights) {
         return (Variable::create(Expr::create(std::move(op), {x})));

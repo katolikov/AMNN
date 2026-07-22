@@ -29,6 +29,7 @@ private:
     OpenCLBackend *mOpenCLBackend = nullptr;
     int mBinNum = 0;
     bool mBinaryMask = false;
+    int mSampleStride = 1;
 };
 
 } // namespace OpenCL

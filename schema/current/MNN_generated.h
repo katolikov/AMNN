@@ -3455,9 +3455,11 @@ struct BinCountParamT : public flatbuffers::NativeTable {
   typedef BinCountParam TableType;
   int32_t binNum;
   bool binaryMask;
+  int32_t sampleStride;
   BinCountParamT()
       : binNum(0),
-        binaryMask(false) {
+        binaryMask(false),
+        sampleStride(1) {
   }
 };
 
@@ -3472,10 +3474,14 @@ struct BinCountParam FLATBUFFERS_FINAL_CLASS : private flatbuffers::Table {
   bool binaryMask() const {
     return GetField<uint8_t>(6, 0) != 0;
   }
+  int32_t sampleStride() const {
+    return GetField<int32_t>(8, 1);
+  }
   bool Verify(flatbuffers::Verifier &verifier) const {
     return VerifyTableStart(verifier) &&
            VerifyField<int32_t>(verifier, 4) &&
            VerifyField<uint8_t>(verifier, 6) &&
+           VerifyField<int32_t>(verifier, 8) &&
            verifier.EndTable();
   }
   BinCountParamT *UnPack(const flatbuffers::resolver_function_t *_resolver = nullptr) const;
@@ -3492,6 +3498,9 @@ struct BinCountParamBuilder {
   void add_binaryMask(bool binaryMask) {
     fbb_.AddElement<uint8_t>(6, static_cast<uint8_t>(binaryMask), 0);
   }
+  void add_sampleStride(int32_t sampleStride) {
+    fbb_.AddElement<int32_t>(8, sampleStride, 1);
+  }
   explicit BinCountParamBuilder(flatbuffers::FlatBufferBuilder &_fbb)
         : fbb_(_fbb) {
     start_ = fbb_.StartTable();
@@ -3507,8 +3516,10 @@ struct BinCountParamBuilder {
 inline flatbuffers::Offset<BinCountParam> CreateBinCountParam(
     flatbuffers::FlatBufferBuilder &_fbb,
     int32_t binNum = 0,
-    bool binaryMask = false) {
+    bool binaryMask = false,
+    int32_t sampleStride = 1) {
   BinCountParamBuilder builder_(_fbb);
+  builder_.add_sampleStride(sampleStride);
   builder_.add_binNum(binNum);
   builder_.add_binaryMask(binaryMask);
   return builder_.Finish();
@@ -5746,6 +5757,7 @@ inline void BinCountParam::UnPackTo(BinCountParamT *_o, const flatbuffers::resol
   (void)_resolver;
   { auto _e = binNum(); _o->binNum = _e; };
   { auto _e = binaryMask(); _o->binaryMask = _e; };
+  { auto _e = sampleStride(); _o->sampleStride = _e; };
 }
 
 inline flatbuffers::Offset<BinCountParam> BinCountParam::Pack(flatbuffers::FlatBufferBuilder &_fbb, const BinCountParamT* _o, const flatbuffers::rehasher_function_t *_rehasher) {
@@ -5758,10 +5770,12 @@ inline flatbuffers::Offset<BinCountParam> CreateBinCountParam(flatbuffers::FlatB
   struct _VectorArgs { flatbuffers::FlatBufferBuilder *__fbb; const BinCountParamT* __o; const flatbuffers::rehasher_function_t *__rehasher; } _va = { &_fbb, _o, _rehasher}; (void)_va;
   auto _binNum = _o->binNum;
   auto _binaryMask = _o->binaryMask;
+  auto _sampleStride = _o->sampleStride;
   return MNN::CreateBinCountParam(
       _fbb,
       _binNum,
-      _binaryMask);
+      _binaryMask,
+      _sampleStride);
 }
 
 inline WhileParamT *WhileParam::UnPack(const flatbuffers::resolver_function_t *_resolver) const {
@@ -9315,14 +9329,16 @@ inline const flatbuffers::TypeTable *ShapeParamTypeTable() {
 inline const flatbuffers::TypeTable *BinCountParamTypeTable() {
   static const flatbuffers::TypeCode type_codes[] = {
     { flatbuffers::ET_INT, 0, -1 },
-    { flatbuffers::ET_BOOL, 0, -1 }
+    { flatbuffers::ET_BOOL, 0, -1 },
+    { flatbuffers::ET_INT, 0, -1 }
   };
   static const char * const names[] = {
     "binNum",
-    "binaryMask"
+    "binaryMask",
+    "sampleStride"
   };
   static const flatbuffers::TypeTable tt = {
-    flatbuffers::ST_TABLE, 2, type_codes, nullptr, nullptr, names
+    flatbuffers::ST_TABLE, 3, type_codes, nullptr, nullptr, names
   };
   return &tt;
 }

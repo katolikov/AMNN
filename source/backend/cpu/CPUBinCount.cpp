@@ -15,6 +15,7 @@ CPUBinCount::CPUBinCount(Backend* backend, const Op* op) : Execution(backend) {
     auto param = op->main_as_BinCountParam();
     mBinNum = param->binNum();
     mBinaryMask = param->binaryMask();
+    mSampleStride = param->sampleStride() > 1 ? param->sampleStride() : 1;
 }
 
 // Read the i-th element of a (int32 or float) tensor as a "kept" flag.
@@ -42,34 +43,45 @@ ErrorCode CPUBinCount::onExecute(const std::vector<Tensor*>& inputs, const std::
     const bool maskMode  = hasSecond && mBinaryMask;
     const bool weighted  = hasSecond && !mBinaryMask;
 
-    if (maskMode) {
-        // Binary mask -> int32 counts of kept (mask != 0) elements per bin.
-        auto optr = output->host<int>();
-        ::memset(optr, 0, mBinNum * sizeof(int));
-        auto mask = inputs[1];
-        for (int i = 0; i < n; ++i) {
-            const int bin = readBin(input, i);
-            if (bin >= 0 && bin < mBinNum && masked(mask, i)) {
-                optr[bin] += 1;
-            }
-        }
-    } else if (weighted) {
-        auto optr = output->host<float>();
-        ::memset(optr, 0, mBinNum * sizeof(float));
-        auto wptr = inputs[1]->host<float>();
-        for (int i = 0; i < n; ++i) {
-            const int bin = readBin(input, i);
-            if (bin >= 0 && bin < mBinNum) {
-                optr[bin] += wptr[i];
-            }
-        }
+    // Spatial downsampling over the last two dims: input[..., ::s, ::s].
+    const int stride = mSampleStride;
+    const int rank = input->dimensions();
+    const int W  = rank >= 1 ? input->length(rank - 1) : 1;
+    const int H  = rank >= 2 ? input->length(rank - 2) : 1;
+    const int HW = H * W;
+    const int B  = HW > 0 ? n / HW : 1;
+    const int Ws = (W + stride - 1) / stride;
+    const int Hs = (H + stride - 1) / stride;
+
+    int*   optrI = nullptr;
+    float* optrF = nullptr;
+    if (weighted) {
+        optrF = output->host<float>();
+        ::memset(optrF, 0, mBinNum * sizeof(float));
     } else {
-        auto optr = output->host<int>();
-        ::memset(optr, 0, mBinNum * sizeof(int));
-        for (int i = 0; i < n; ++i) {
-            const int bin = readBin(input, i);
-            if (bin >= 0 && bin < mBinNum) {
-                optr[bin] += 1;
+        optrI = output->host<int>();
+        ::memset(optrI, 0, mBinNum * sizeof(int));
+    }
+    auto mask = hasSecond ? inputs[1] : nullptr;
+    const float* wptr = weighted ? inputs[1]->host<float>() : nullptr;
+
+    for (int b = 0; b < B; ++b) {
+        for (int hs = 0; hs < Hs; ++hs) {
+            for (int ws = 0; ws < Ws; ++ws) {
+                const int flat = b * HW + (hs * stride) * W + ws * stride;
+                const int bin = readBin(input, flat);
+                if (bin < 0 || bin >= mBinNum) {
+                    continue;
+                }
+                if (maskMode) {
+                    if (masked(mask, flat)) {
+                        optrI[bin] += 1;
+                    }
+                } else if (weighted) {
+                    optrF[bin] += wptr[flat];
+                } else {
+                    optrI[bin] += 1;
+                }
             }
         }
     }

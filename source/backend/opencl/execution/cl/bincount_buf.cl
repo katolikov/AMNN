@@ -161,6 +161,93 @@ __kernel void bincount_count_buf(
 #endif
 }
 
+// Downsampled variant: counts only input[..., ::stride, ::stride] over the last
+// two dims (nSampled ~= N/stride^2 elements), an approximate histogram that is
+// far cheaper at large stride. Each work-item maps a linear sampled index k to
+// a full-tensor flat offset via the sampled-grid geometry (Ws sampled columns
+// per row, HsWs sampled elements per HW plane) and gathers that element. Reads
+// are strided (not vectorizable/coalesced), but at stride^2-fewer elements the
+// gather cost is small. Merge is identical to bincount_count_buf.
+__kernel void bincount_sample_buf(
+    __global const IN_T *input,
+#ifdef BINCOUNT_MASK
+    __global const MASK_T *mask,
+#endif
+    __global int *output,
+    __private const int nSampled,
+    __private const int stride,
+    __private const int W,
+    __private const int Ws,
+    __private const int HsWs,
+    __private const int HW,
+    __private const int binNum) {
+    const int gid = get_global_id(0);
+    const int gsize = get_global_size(0);
+    const int lid = get_local_id(0);
+
+    int priv[BIN_NUM];
+    for (int b = 0; b < BIN_NUM; ++b) {
+        priv[b] = 0;
+    }
+
+    for (int k = gid; k < nSampled; k += gsize) {
+        const int plane = k / HsWs;
+        const int r  = k - plane * HsWs;
+        const int ph = r / Ws;
+        const int pw = r - ph * Ws;
+        const int flat = plane * HW + (ph * stride) * W + pw * stride;
+        int v = TO_BIN(input[flat]);
+#ifdef BINCOUNT_MASK
+        int keep = (mask[flat] != 0);
+        for (int b = 0; b < BIN_NUM; ++b) {
+            priv[b] += ((v == b) ? 1 : 0) * keep;
+        }
+#else
+        for (int b = 0; b < BIN_NUM; ++b) {
+            priv[b] += (v == b) ? 1 : 0;
+        }
+#endif
+    }
+
+    // ---- cross-work-item merge (identical to bincount_count_buf) ----
+#if (BIN_NUM * LOCAL_SIZE) <= 4096
+    __local int reduceBuf[BIN_NUM * LOCAL_SIZE];
+    for (int b = 0; b < BIN_NUM; ++b) {
+        reduceBuf[b * LOCAL_SIZE + lid] = priv[b];
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int off = LOCAL_SIZE >> 1; off > 0; off >>= 1) {
+        if (lid < off) {
+            for (int b = 0; b < BIN_NUM; ++b) {
+                reduceBuf[b * LOCAL_SIZE + lid] += reduceBuf[b * LOCAL_SIZE + lid + off];
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if (lid == 0) {
+        for (int b = 0; b < BIN_NUM; ++b) {
+            atomic_add(&output[b], reduceBuf[b * LOCAL_SIZE]);
+        }
+    }
+#else
+    __local int reduceBuf[LOCAL_SIZE];
+    for (int b = 0; b < BIN_NUM; ++b) {
+        reduceBuf[lid] = priv[b];
+        barrier(CLK_LOCAL_MEM_FENCE);
+        for (int off = LOCAL_SIZE >> 1; off > 0; off >>= 1) {
+            if (lid < off) {
+                reduceBuf[lid] += reduceBuf[lid + off];
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
+        }
+        if (lid == 0) {
+            atomic_add(&output[b], reduceBuf[0]);
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+#endif
+}
+
 // Naive baseline kept for on-device benchmarking only: one global atomic per
 // input element straight into the BIN_NUM-sized output. Suffers heavy
 // contention when BIN_NUM is small (few addresses hammered by many threads).

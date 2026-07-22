@@ -25,6 +25,7 @@ public:
 private:
     int mBinNum;
     bool mBinaryMask;
+    int mSampleStride;
 };
 } // namespace MNN
 

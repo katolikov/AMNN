@@ -23,6 +23,7 @@ BinCountBufExecution::BinCountBufExecution(const MNN::Op *op, Backend *backend)
     auto param = op->main_as_BinCountParam();
     mBinNum = param->binNum();
     mBinaryMask = param->binaryMask();
+    mSampleStride = param->sampleStride() > 1 ? param->sampleStride() : 1;
 }
 
 BinCountBufExecution::~BinCountBufExecution() = default;
@@ -53,14 +54,28 @@ ErrorCode BinCountBufExecution::onEncode(const std::vector<Tensor *> &inputs, co
         }
     }
 
+    // Spatial downsampling geometry over the last two dims (input[..,::s,::s]).
+    const int stride = mSampleStride;
+    const bool sampled = stride > 1;
+    const int rank = input->dimensions();
+    const int W  = rank >= 1 ? input->length(rank - 1) : 1;
+    const int H  = rank >= 2 ? input->length(rank - 2) : 1;
+    const int HW = H * W;
+    const int planes = HW > 0 ? n / HW : 1;
+    const int Ws = (W + stride - 1) / stride;
+    const int Hs = (H + stride - 1) / stride;
+    const int HsWs = Hs * Ws;
+    const int nSampled = planes * HsWs;   // == n when stride == 1
+    const int workItems = sampled ? nSampled : n;
+
     auto initKernel  = runtime->buildKernel("bincount_buf", "bincount_init_buf", buildOptions, mOpenCLBackend->getPrecision());
     // Env toggle: MNN_BINCOUNT_NAIVE=1 selects the global-atomic-per-element
     // baseline instead of the register-histogram path (on-device benchmarking).
-    // The naive kernel has no mask variant, so it is disabled when masking.
-    const bool useNaive = (getenv("MNN_BINCOUNT_NAIVE") != nullptr) && !masked;
-    auto countKernel = runtime->buildKernel("bincount_buf",
-                                            useNaive ? "bincount_naive_buf" : "bincount_count_buf",
-                                            buildOptions, mOpenCLBackend->getPrecision());
+    // The naive kernel has no mask/sample variant, so it is disabled for those.
+    const bool useNaive = (getenv("MNN_BINCOUNT_NAIVE") != nullptr) && !masked && !sampled;
+    const char* countName = sampled ? "bincount_sample_buf"
+                                    : (useNaive ? "bincount_naive_buf" : "bincount_count_buf");
+    auto countKernel = runtime->buildKernel("bincount_buf", countName, buildOptions, mOpenCLBackend->getPrecision());
     if (initKernel == nullptr || countKernel == nullptr) {
         return NOT_SUPPORT;
     }
@@ -76,7 +91,7 @@ ErrorCode BinCountBufExecution::onEncode(const std::vector<Tensor *> &inputs, co
     uint32_t countLocal;
     if (useNaive) {
         countLocal  = kLocalSize;
-        countGlobal = (uint32_t)((n + kLocalSize - 1) / kLocalSize) * kLocalSize;
+        countGlobal = (uint32_t)((workItems + kLocalSize - 1) / kLocalSize) * kLocalSize;
     } else {
         // Grid sizing: the merge (per-workgroup reduction + BIN_NUM global
         // atomics) is fixed overhead per workgroup, so the sweet spot is a
@@ -89,7 +104,7 @@ ErrorCode BinCountBufExecution::onEncode(const std::vector<Tensor *> &inputs, co
         if (const char* e = getenv("MNN_BINCOUNT_WG")) {
             wgCap = std::max(1, atoi(e));
         }
-        const int workGroups = std::max(1, std::min(wgCap, (n + kLocalSize - 1) / kLocalSize));
+        const int workGroups = std::max(1, std::min(wgCap, (workItems + kLocalSize - 1) / kLocalSize));
         countLocal  = kLocalSize;
         countGlobal = (uint32_t)workGroups * kLocalSize;
     }
@@ -100,7 +115,17 @@ ErrorCode BinCountBufExecution::onEncode(const std::vector<Tensor *> &inputs, co
             ret |= countKernel->get().setArg(idx++, openCLBuffer(inputs[1]));
         }
         ret |= countKernel->get().setArg(idx++, openCLBuffer(output));
-        ret |= countKernel->get().setArg(idx++, n);
+        if (sampled) {
+            // bincount_sample_buf(input, [mask], output, nSampled, stride, W, Ws, HsWs, HW, binNum)
+            ret |= countKernel->get().setArg(idx++, nSampled);
+            ret |= countKernel->get().setArg(idx++, stride);
+            ret |= countKernel->get().setArg(idx++, W);
+            ret |= countKernel->get().setArg(idx++, Ws);
+            ret |= countKernel->get().setArg(idx++, HsWs);
+            ret |= countKernel->get().setArg(idx++, HW);
+        } else {
+            ret |= countKernel->get().setArg(idx++, n);
+        }
         ret |= countKernel->get().setArg(idx++, mBinNum);
     }
     MNN_CHECK_CL_SUCCESS(ret, "setArg BinCountBufExecution");
