@@ -249,6 +249,57 @@ public:
             }
         }
 
+        // ===== case 11: binNum=256 -> local-memory histogram path =====
+        // binNum>16 dispatches to bincount_local_buf on GPU. value=i%256 over
+        // 512x512 gives every bin exactly 512x512/256 = 1024 counts.
+        {
+            const int H = 512, W = 512;
+            const int n = H * W;
+            VARP input = _Input({1, 1, H, W}, NCHW, halide_type_of<int>());
+            auto ptr = input->writeMap<int>();
+            for (int i = 0; i < n; ++i) {
+                ptr[i] = i % 256;
+            }
+            auto output = _BinCount(input, 256);
+            auto got = output->readMap<int>();
+            const int expectedPerBin = n / 256; // 1024
+            for (int b = 0; b < 256; ++b) {
+                if (got[b] != expectedPerBin) {
+                    MNN_ERROR("BinCountTest case11 (local 256-bin) failed at bin %d: got %d, want %d\n",
+                              b, got[b], expectedPerBin);
+                    return false;
+                }
+            }
+        }
+
+        // ===== case 12: local path + binary mask + stride together =====
+        // binNum=32 (>16 -> local), stride=2, mask keeps ws-even columns.
+        // value[h,w]=h%32; sampled h=hs*2 -> value=2*(hs%16) (even values only),
+        // each even value V has 8 sampled rows; mask keeps 64 of 128 columns.
+        // So bins {0,2,..,30} get 8*64=512, everything else 0.
+        {
+            const int H = 256, W = 256, S = 2;
+            const int n = H * W;
+            VARP input = _Input({1, 1, H, W}, NCHW, halide_type_of<int>());
+            VARP mask  = _Input({1, 1, H, W}, NCHW, halide_type_of<int>());
+            auto ip = input->writeMap<int>();
+            auto mp = mask->writeMap<int>();
+            for (int i = 0; i < n; ++i) {
+                ip[i] = (i / W) % 32;
+                mp[i] = (((i % W) / S) % 2 == 0) ? 1 : 0;
+            }
+            auto output = _BinCount(input, 32, mask, /*binaryMask=*/true, /*sampleStride=*/S);
+            auto got = output->readMap<int>();
+            for (int b = 0; b < 32; ++b) {
+                const int want = (b % 2 == 0) ? 512 : 0;
+                if (got[b] != want) {
+                    MNN_ERROR("BinCountTest case12 (local+mask+stride) failed at bin %d: got %d, want %d\n",
+                              b, got[b], want);
+                    return false;
+                }
+            }
+        }
+
         return true;
     }
 };

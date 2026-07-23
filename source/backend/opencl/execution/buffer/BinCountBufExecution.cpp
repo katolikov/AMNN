@@ -16,6 +16,9 @@ static const int kLocalSize = 256;
 // Register array size cap: above this the per-work-item private histogram is
 // too large to stay in registers, so we defer to the CPU reference instead.
 static const int kMaxBins = 256;
+// Above this bin count the register-histogram spills; use the local-memory
+// histogram kernel instead. (16 is where the fused reduction stops fitting.)
+static const int kRegisterBinCap = 16;
 
 BinCountBufExecution::BinCountBufExecution(const MNN::Op *op, Backend *backend)
     : CommonExecution(backend, op) {
@@ -66,15 +69,28 @@ ErrorCode BinCountBufExecution::onEncode(const std::vector<Tensor *> &inputs, co
     const int Hs = (H + stride - 1) / stride;
     const int HsWs = Hs * Ws;
     const int nSampled = planes * HsWs;   // == n when stride == 1
-    const int workItems = sampled ? nSampled : n;
+
+    // Large binNum: the register-histogram (priv[BIN_NUM] + BIN_NUM-way
+    // reduction) spills and collapses above ~16 bins, so switch to a
+    // local-memory histogram (atomic-add into a per-workgroup on-chip
+    // histogram). Env MNN_BINCOUNT_LOCAL=1/0 forces the path for A/B benchmarks.
+    bool useLocal = mBinNum > kRegisterBinCap;
+    if (const char* e = getenv("MNN_BINCOUNT_LOCAL")) {
+        useLocal = atoi(e) != 0;
+    }
+    // The local and sampled kernels both take the sampled-grid geometry.
+    const bool geomArgs = sampled || useLocal;
+    const int workItems = geomArgs ? nSampled : n;
 
     auto initKernel  = runtime->buildKernel("bincount_buf", "bincount_init_buf", buildOptions, mOpenCLBackend->getPrecision());
     // Env toggle: MNN_BINCOUNT_NAIVE=1 selects the global-atomic-per-element
     // baseline instead of the register-histogram path (on-device benchmarking).
-    // The naive kernel has no mask/sample variant, so it is disabled for those.
-    const bool useNaive = (getenv("MNN_BINCOUNT_NAIVE") != nullptr) && !masked && !sampled;
-    const char* countName = sampled ? "bincount_sample_buf"
-                                    : (useNaive ? "bincount_naive_buf" : "bincount_count_buf");
+    // The naive kernel has no mask/sample/local variant, so it is disabled then.
+    const bool useNaive = (getenv("MNN_BINCOUNT_NAIVE") != nullptr) && !masked && !sampled && !useLocal;
+    const char* countName = useLocal  ? "bincount_local_buf"
+                          : sampled   ? "bincount_sample_buf"
+                          : useNaive  ? "bincount_naive_buf"
+                                      : "bincount_count_buf";
     auto countKernel = runtime->buildKernel("bincount_buf", countName, buildOptions, mOpenCLBackend->getPrecision());
     if (initKernel == nullptr || countKernel == nullptr) {
         return NOT_SUPPORT;
@@ -115,8 +131,8 @@ ErrorCode BinCountBufExecution::onEncode(const std::vector<Tensor *> &inputs, co
             ret |= countKernel->get().setArg(idx++, openCLBuffer(inputs[1]));
         }
         ret |= countKernel->get().setArg(idx++, openCLBuffer(output));
-        if (sampled) {
-            // bincount_sample_buf(input, [mask], output, nSampled, stride, W, Ws, HsWs, HW, binNum)
+        if (geomArgs) {
+            // sample/local kernel(input, [mask], output, nSampled, stride, W, Ws, HsWs, HW, binNum)
             ret |= countKernel->get().setArg(idx++, nSampled);
             ret |= countKernel->get().setArg(idx++, stride);
             ret |= countKernel->get().setArg(idx++, W);

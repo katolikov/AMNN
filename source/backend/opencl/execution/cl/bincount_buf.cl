@@ -248,6 +248,70 @@ __kernel void bincount_sample_buf(
 #endif
 }
 
+// Local-memory histogram for large BIN_NUM. The register-histogram path keeps
+// priv[BIN_NUM] per work-item, which spills out of registers (and forces a
+// BIN_NUM-way tree reduction) once BIN_NUM is large -- catastrophic at 256.
+// Here each workgroup instead keeps a single BIN_NUM-sized histogram in local
+// memory (256 ints = 1KB, easily on-chip), work-items atomic-add into it, then
+// cooperatively merge it to the global output (BIN_NUM global atomics per
+// workgroup). Uses the sampled-grid geometry so one kernel serves both the
+// contiguous (stride==1, flat==k) and downsampled (stride>1) cases.
+__kernel void bincount_local_buf(
+    __global const IN_T *input,
+#ifdef BINCOUNT_MASK
+    __global const MASK_T *mask,
+#endif
+    __global int *output,
+    __private const int nSampled,
+    __private const int stride,
+    __private const int W,
+    __private const int Ws,
+    __private const int HsWs,
+    __private const int HW,
+    __private const int binNum) {
+    const int gid = get_global_id(0);
+    const int gsize = get_global_size(0);
+    const int lid = get_local_id(0);
+    const int lsize = get_local_size(0);
+
+    __local int localHist[BIN_NUM];
+    for (int b = lid; b < BIN_NUM; b += lsize) {
+        localHist[b] = 0;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    for (int k = gid; k < nSampled; k += gsize) {
+        int flat;
+        if (stride <= 1) {
+            flat = k;
+        } else {
+            const int plane = k / HsWs;
+            const int r  = k - plane * HsWs;
+            const int ph = r / Ws;
+            const int pw = r - ph * Ws;
+            flat = plane * HW + (ph * stride) * W + pw * stride;
+        }
+        int v = TO_BIN(input[flat]);
+        if (v >= 0 && v < binNum) {
+#ifdef BINCOUNT_MASK
+            if (mask[flat] != 0) {
+                atomic_add(&localHist[v], 1);
+            }
+#else
+            atomic_add(&localHist[v], 1);
+#endif
+        }
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    for (int b = lid; b < BIN_NUM; b += lsize) {
+        int c = localHist[b];
+        if (c != 0) {
+            atomic_add(&output[b], c);
+        }
+    }
+}
+
 // Naive baseline kept for on-device benchmarking only: one global atomic per
 // input element straight into the BIN_NUM-sized output. Suffers heavy
 // contention when BIN_NUM is small (few addresses hammered by many threads).
