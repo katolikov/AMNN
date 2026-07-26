@@ -208,6 +208,7 @@ enum OpType : int {
     If    = 601,
     LayerNorm = 603,
     GridSample = 604,
+    MockChain = 607,
 }
 
 table Plugin {
@@ -260,6 +261,18 @@ table ShapeParam {
     start: int = 0;
     hasEnd: bool = false;
     end: int = 0;
+}
+
+// MockChain is a template/demonstration op showing how a single custom OpType
+// can dispatch several OpenCL kernels sequentially (fan-out / fan-in DAG).
+// Two inputs A,B are each pushed through func1->func2 (two independent runs),
+// their results merged by func3, then func4->func5 run twice to produce two
+// outputs. The kernels are trivial elementwise arithmetic -- the point is the
+// dispatch/sync skeleton, not the math. offset0/offset1 are the per-run
+// additive constants applied by func4 (they make the two outputs distinct).
+table MockChainParam {
+    offset0: float = 10.0;
+    offset1: float = 20.0;
 }
 
 table WhileParam {
@@ -440,7 +453,8 @@ union OpParameter {
     AttentionParam,
     StftParam,
     LinearAttentionParam,
-    ShapeParam
+    ShapeParam,
+    MockChainParam
 }
 
 table Op {

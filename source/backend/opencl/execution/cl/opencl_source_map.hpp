@@ -93,6 +93,9 @@ extern const char* buffer_convert_quant;
 extern const char* gemm_buf;
 #endif
 extern const char* conv_2d_int;
+#ifndef MNN_OPENCL_BUFFER_CLOSED
+extern const char* mockchain_buf;
+#endif
 extern const char* copy_buffer_to_image2d;
 extern const char* loop;
 #ifndef MNN_OPENCL_BUFFER_CLOSED
@@ -266,6 +269,9 @@ const std::map<std::string, const char*> OpenCLProgramMap =
   { "gemm_buf", gemm_buf },
 #endif
   { "conv_2d_int", conv_2d_int },
+#ifndef MNN_OPENCL_BUFFER_CLOSED
+  { "mockchain_buf", mockchain_buf },
+#endif
   { "copy_buffer_to_image2d", copy_buffer_to_image2d },
   { "loop", loop },
 #ifndef MNN_OPENCL_BUFFER_CLOSED
@@ -387,6 +393,7 @@ const std::map<std::string, std::string> OpenCLProgramMd5Map =
   { "buffer_convert_quant", "ce4ac18b78e746f7ed338f35e5237dbd" },
   { "gemm_buf", "b030b6eacaf65a54e8eabee2755f892a" },
   { "conv_2d_int", "985925b9f24d85fa38df2df9b01fafc5" },
+  { "mockchain_buf", "431e45153ffba6633d35f1812a852eb0" },
   { "copy_buffer_to_image2d", "a72ed287711f9bb78a2cfa9726a1fa92" },
   { "loop", "4849a55cd99f0ebab72a10527455341f" },
   { "argmax_buf", "ae4a1ae3461b2758609022ac7569b11b" },

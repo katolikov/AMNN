@@ -1844,6 +1844,21 @@ VARP _Sort(VARP x, int axis, bool arg, bool descend) {
     return Variable::create(expr, arg);
 }
 
+std::vector<VARP> _MockChain(VARP a, VARP b, float offset0, float offset1) {
+    std::unique_ptr<OpT> op(new OpT);
+    op->type = OpType_MockChain;
+    op->main.type = OpParameter_MockChainParam;
+    auto param = new MockChainParamT;
+    param->offset0 = offset0;
+    param->offset1 = offset1;
+    op->main.value = param;
+    EXPRP expr = Expr::create(std::move(op), {a, b}, 2);
+    std::vector<VARP> res;
+    res.emplace_back(Variable::create(expr, 0));
+    res.emplace_back(Variable::create(expr, 1));
+    return res;
+}
+
 VARP _Raster(const std::vector<VARP>& vars, const std::vector<int>& region, const std::vector<int>& shape) {
     auto expr = Utils::makeRaster(vars, region, shape, halide_type_of<float>(), MNN_DATA_FORMAT_UNKNOWN);
     return (Variable::create(expr));
