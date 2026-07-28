@@ -44,6 +44,9 @@ extern const char* softmax;
 extern const char* binary_buf;
 #endif
 #ifndef MNN_OPENCL_BUFFER_CLOSED
+extern const char* dualrangehist_buf;
+#endif
+#ifndef MNN_OPENCL_BUFFER_CLOSED
 extern const char* raster_buf;
 #endif
 #ifndef MNN_OPENCL_BUFFER_CLOSED
@@ -217,6 +220,9 @@ const std::map<std::string, const char*> OpenCLProgramMap =
   { "binary_buf", binary_buf },
 #endif
 #ifndef MNN_OPENCL_BUFFER_CLOSED
+  { "dualrangehist_buf", dualrangehist_buf },
+#endif
+#ifndef MNN_OPENCL_BUFFER_CLOSED
   { "raster_buf", raster_buf },
 #endif
 #ifndef MNN_OPENCL_BUFFER_CLOSED
@@ -369,6 +375,7 @@ const std::map<std::string, std::string> OpenCLProgramMd5Map =
   { "scale", "95773334e603db663c594945a064b9cc" },
   { "softmax", "aaa633bb6dd2c40f4379d09d754b5adc" },
   { "binary_buf", "6c5ee786c70aa485d9b49368517296e3" },
+  { "dualrangehist_buf", "405d8f28058d4acd49ef12a66b79c0fc" },
   { "raster_buf", "7e9c4013c436cc929c8e1b4d69cf1bd4" },
   { "binary_subgroup_buf", "8444f988543cd4a4d9b124442f02f999" },
   { "depthwise_conv2d_subgroup_buf", "3e37457e72b7e629655aa04bd03e559e" },

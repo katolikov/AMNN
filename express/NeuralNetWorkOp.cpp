@@ -1844,6 +1844,32 @@ VARP _Sort(VARP x, int axis, bool arg, bool descend) {
     return Variable::create(expr, arg);
 }
 
+std::vector<VARP> _DualRangeHist(VARP a, VARP b, VARP base, int binNum, float low, float high,
+                                 int sampleStride, bool emitValidCount) {
+    std::unique_ptr<OpT> op(new OpT);
+    op->type      = OpType_DualRangeHist;
+    op->main.type = OpParameter_DualRangeHistParam;
+    auto param = new DualRangeHistParamT;
+    param->binNum         = binNum;
+    param->low            = low;
+    param->high           = high;
+    param->sampleStride   = sampleStride;
+    param->emitValidCount = emitValidCount;
+    op->main.value = param;
+    std::vector<VARP> inputs = {a, b};
+    if (nullptr != base) {
+        inputs.emplace_back(base);
+    }
+    const int outputSize = emitValidCount ? 3 : 2;
+    EXPRP expr = Expr::create(std::move(op), std::move(inputs), outputSize);
+    std::vector<VARP> res;
+    res.reserve(outputSize);
+    for (int i = 0; i < outputSize; ++i) {
+        res.emplace_back(Variable::create(expr, i));
+    }
+    return res;
+}
+
 VARP _Raster(const std::vector<VARP>& vars, const std::vector<int>& region, const std::vector<int>& shape) {
     auto expr = Utils::makeRaster(vars, region, shape, halide_type_of<float>(), MNN_DATA_FORMAT_UNKNOWN);
     return (Variable::create(expr));

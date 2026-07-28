@@ -208,6 +208,9 @@ enum OpType : int {
     If    = 601,
     LayerNorm = 603,
     GridSample = 604,
+    // 605 (Quantile) and 606 (BinCount) are not present in this repo; DualRangeHist
+    // keeps its MNN op id 607 so models convert cross-repo.
+    DualRangeHist = 607,
 }
 
 table Plugin {
@@ -260,6 +263,29 @@ table ShapeParam {
     start: int = 0;
     hasEnd: bool = false;
     end: int = 0;
+}
+
+// Dual masked range-histogram. Single-pass fusion over two float frames A, B
+// (inputs 0 and 1) plus an optional per-element base validity mask (input 2).
+// For each pixel it computes a SHARED keep bit
+//   keep = base & (low <= A <= high) & (low <= B <= high)   (raw values, inclusive)
+// and, when kept, increments histA[rint(A*(binNum-1))] and histB[rint(B*(binNum-1))]
+// (round-half-to-even, done inside the op). Outputs: histA[binNum], histB[binNum]
+// (int32 counts). When emitValidCount is set a third int32 output holds
+// validCount = sum(keep) == sum(histA) == sum(histB) (else derive it host-side).
+table DualRangeHistParam {
+    // Fixed number of output bins (each histogram is length binNum).
+    binNum: int = 0;
+    // Shared inclusive validity range applied to the RAW frame values.
+    low: float = 0.0;
+    high: float = 1.0;
+    // Spatial downsampling stride over the last two dims (A[..,::s,::s], B, base
+    // alike); <= 1 counts every pixel. Approximate histogram from ~1/stride^2 px.
+    sampleStride: int = 1;
+    // Emit validCount as an explicit third int32 output ([1]). Defaults on: the
+    // counter is free, so the op produces it unless a caller opts out (and then
+    // derives it host-side as sum(histA)).
+    emitValidCount: bool = true;
 }
 
 table WhileParam {
@@ -440,7 +466,8 @@ union OpParameter {
     AttentionParam,
     StftParam,
     LinearAttentionParam,
-    ShapeParam
+    ShapeParam,
+    DualRangeHistParam
 }
 
 table Op {
