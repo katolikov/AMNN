@@ -48,20 +48,23 @@ class DualRangeHistSizeComputer : public SizeComputer {
             return false;
         }
 
-        auto setHist = [&](Tensor* t) {
-            t->buffer().dimensions = 1;
-            t->setLength(0, binNum);
+        // 4-D NCHW int32 outputs: histA/histB carry binNum along the channel
+        // axis -> [1, binNum, 1, 1]; validCount is a scalar -> [1, 1, 1, 1].
+        // The buffers stay flat/contiguous (H == W == 1), so the CPU and OpenCL
+        // kernels that index them as length-binNum vectors are unaffected.
+        auto setHist = [&](Tensor* t, int channels) {
+            t->buffer().dimensions = 4;
+            t->setLength(0, 1);
+            t->setLength(1, channels);
+            t->setLength(2, 1);
+            t->setLength(3, 1);
             t->buffer().type = halide_type_of<int>();
             TensorUtils::getDescribe(t)->dimensionFormat = MNN_DATA_FORMAT_NCHW;
         };
-        setHist(outputs[0]);
-        setHist(outputs[1]);
+        setHist(outputs[0], binNum);
+        setHist(outputs[1], binNum);
         if (emitValidCount) {
-            auto c = outputs[2];
-            c->buffer().dimensions = 1;
-            c->setLength(0, 1);
-            c->buffer().type = halide_type_of<int>();
-            TensorUtils::getDescribe(c)->dimensionFormat = MNN_DATA_FORMAT_NCHW;
+            setHist(outputs[2], 1);
         }
         return true;
     }
