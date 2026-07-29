@@ -208,6 +208,7 @@ enum OpType : int {
     If    = 601,
     LayerNorm = 603,
     GridSample = 604,
+    ApplyLUT = 608,
 }
 
 table Plugin {
@@ -260,6 +261,22 @@ table ShapeParam {
     start: int = 0;
     hasEnd: bool = false;
     end: int = 0;
+}
+
+// Per-element 1-D lookup-table remap. Input 0 is a single-plane float image
+// (values nominally in [0,1]); input 1 is the LUT, a 1-D float tensor of length
+// N (N in [8,256], 16 in the current pipeline) supplied at runtime. For each
+// pixel x:
+//   pos  = x * (N-1)
+//   i0   = clamp((int)floor(pos), 0, N-1);  i1 = min(i0+1, N-1)
+//   frac = pos - (float)i0                       // clamp-index-only: frac may
+//   out  = lut[i0] + frac * (lut[i1] - lut[i0])  // extrapolate past an endpoint
+// In-range input is standard linear interpolation; out-of-range input keeps the
+// clamped endpoints' slope. Output matches input 0's shape/dtype/format.
+table ApplyLUTParam {
+    // Interpolation mode, reserved for future use: 1 = linear (only mode
+    // implemented), 0 = nearest. N is derived from the LUT tensor's length.
+    interp: int = 1;
 }
 
 table WhileParam {
@@ -440,7 +457,8 @@ union OpParameter {
     AttentionParam,
     StftParam,
     LinearAttentionParam,
-    ShapeParam
+    ShapeParam,
+    ApplyLUTParam
 }
 
 table Op {

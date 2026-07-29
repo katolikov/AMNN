@@ -161,6 +161,11 @@ MNN_PUBLIC std::vector<VARP> _TopKV2(VARP input0, VARP input1);
 MNN_PUBLIC VARP _ImageProcess(VARP input, CV::ImageProcess::Config config, CV::Matrix matrix, int oh, int ow, int oc, int dtype, uint8_t padVal = 0);
 MNN_PUBLIC VARP _Where(VARP x);
 MNN_PUBLIC VARP _Sort(VARP x, int axis = -1, bool arg = false, bool descend = false);
+// Per-element 1-D LUT remap with linear interpolation. `input` is a single-plane
+// float image (values nominally in [0,1]); `lut` is a [N] float table (runtime).
+// Returns an identically-shaped tensor: out = lerp(lut[i0], lut[i1], frac) with
+// pos = input*(N-1), i0 = clamp(floor(pos),0,N-1) (clamp-index-only).
+MNN_PUBLIC VARP _ApplyLUT(VARP input, VARP lut);
 MNN_PUBLIC VARP _Raster(const std::vector<VARP>& vars, const std::vector<int>& regions, const std::vector<int>& shape);
 MNN_PUBLIC VARP _RasterRaw(const std::vector<VARP>& vars, const std::vector<int>& region, const std::vector<int>& shape, halide_type_t dataType, Dimensionformat format);
 

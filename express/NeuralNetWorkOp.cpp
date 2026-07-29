@@ -1844,6 +1844,17 @@ VARP _Sort(VARP x, int axis, bool arg, bool descend) {
     return Variable::create(expr, arg);
 }
 
+VARP _ApplyLUT(VARP input, VARP lut) {
+    std::unique_ptr<OpT> op(new OpT);
+    op->type       = OpType_ApplyLUT;
+    op->main.type  = OpParameter_ApplyLUTParam;
+    auto param     = new ApplyLUTParamT;
+    param->interp  = 1;
+    op->main.value = param;
+    EXPRP expr = Expr::create(std::move(op), {input, lut}, 1);
+    return Variable::create(expr);
+}
+
 VARP _Raster(const std::vector<VARP>& vars, const std::vector<int>& region, const std::vector<int>& shape) {
     auto expr = Utils::makeRaster(vars, region, shape, halide_type_of<float>(), MNN_DATA_FORMAT_UNKNOWN);
     return (Variable::create(expr));

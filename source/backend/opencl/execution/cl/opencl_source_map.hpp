@@ -85,6 +85,9 @@ extern const char* winogradTransform_subgroup_buf;
 extern const char* splitgelu_buf;
 #endif
 #ifndef MNN_OPENCL_BUFFER_CLOSED
+extern const char* applylut_buf;
+#endif
+#ifndef MNN_OPENCL_BUFFER_CLOSED
 extern const char* select_buf;
 #endif
 extern const char* grid_sample;
@@ -258,6 +261,9 @@ const std::map<std::string, const char*> OpenCLProgramMap =
   { "splitgelu_buf", splitgelu_buf },
 #endif
 #ifndef MNN_OPENCL_BUFFER_CLOSED
+  { "applylut_buf", applylut_buf },
+#endif
+#ifndef MNN_OPENCL_BUFFER_CLOSED
   { "select_buf", select_buf },
 #endif
   { "grid_sample", grid_sample },
@@ -382,6 +388,7 @@ const std::map<std::string, std::string> OpenCLProgramMd5Map =
   { "winogradTransform_buf", "efa5fda527fce5820ba48b90a4707fa7" },
   { "winogradTransform_subgroup_buf", "904f2a0f1a062378418c6c90133ed5e0" },
   { "splitgelu_buf", "86d5b31ea14330d2b99273e4e868bd35" },
+  { "applylut_buf", "301fec9b92a8a1b173252e535b505d8a" },
   { "select_buf", "1516b3f3c52ba8e8a0a5cd7f03ea86f2" },
   { "grid_sample", "0e08897ea35a57c04b834b2a83be8383" },
   { "buffer_convert_quant", "ce4ac18b78e746f7ed338f35e5237dbd" },
