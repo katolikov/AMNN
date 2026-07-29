@@ -5,7 +5,7 @@
 // DualRangeHist: single-pass dual masked range-histogram over two float frames
 // A, B (values ~[0,1]) plus an optional per-element base validity mask. Per
 // pixel it computes a SHARED keep bit
-//   keep = base & (low <= A <= high) & (low <= B <= high)   (raw values, inclusive)
+//   keep = base & (low < A < high) & (low < B < high)   (raw values, exclusive)
 // and, when kept, increments histA[rint(A*(binNum-1))] and histB[rint(B*(binNum-1))]
 // (round-half-to-even, matching torch.round, done inside the op). Optionally it
 // also accumulates validCount = sum(keep) == sum(histA) == sum(histB).
@@ -24,8 +24,12 @@
 #endif
 
 // Frames are logically float; read through the precision-dependent FLOAT macro
-// (half in fp16 buffer mode, float in high precision). The bin math is done in
-// float to match the fp32 CPU reference (rint of a small product is exact).
+// (half in fp16 buffer mode, float in high precision). The range test and the
+// bin math are done at FLOAT precision (NOT force-upcast to float) so that in
+// fp16 buffer mode they run in half -- bit-exact to a PyTorch reference that
+// keeps fp16 tensors: torch computes `round(A_f16 * (binNum-1))` and the
+// low/high compares in fp16 (the python scalars demote to the tensor dtype).
+// In high precision FLOAT == float, so the fp32 behaviour is unchanged.
 #define IN_T   FLOAT
 #define IN_T4  FLOAT4
 
@@ -41,11 +45,32 @@
 #endif
 #endif
 
+// Round a non-negative value to the nearest integer, ties-to-even. Matches
+// torch.round / std::rint (default rounding) exactly, and -- unlike the GPU's
+// built-in rint on some devices under -cl-mad-enable -- is deterministic at the
+// k+0.5 ties, so the bin decision is reproducible across devices.
+static inline int roundHalfEven(float x) {
+    int   fl   = (int)floor(x);
+    float frac = x - (float)fl;
+    if (frac < 0.5f) return fl;
+    if (frac > 0.5f) return fl + 1;
+    return (fl & 1) ? (fl + 1) : fl;   // exact .5 -> nearest even
+}
+
 // keep bit for one component; bin index via round-half-to-even. `a`,`b` are the
 // raw frame values; `mkeep` folds in the optional base mask (1 when no base).
+// Compares are at FLOAT precision (half in fp16 mode) against fp16-rounded
+// low/high, matching torch's fp16 range test. For the bin, torch evaluates
+// `A_f16 * (binNum-1)` in fp16 THEN rounds; so in fp16 mode we round the product
+// to half (RTE) before roundHalfEven -- otherwise the un-rounded product (e.g.
+// 4.5007 instead of 4.5) would round up and disagree with torch at the ties.
 #define COMPUTE_KEEP(a, b, mkeep) \
-    (((float)(a) >= low) & ((float)(a) <= high) & ((float)(b) >= low) & ((float)(b) <= high) & (mkeep))
-#define TO_BIN(v) ((int)rint((float)(v) * scaleF))
+    (((FLOAT)(a) > lowF) & ((FLOAT)(a) < highF) & ((FLOAT)(b) > lowF) & ((FLOAT)(b) < highF) & (mkeep))
+#ifdef MNN_SUPPORT_FP16
+#define TO_BIN(v) roundHalfEven((float)convert_half_rte((float)(v) * (float)scaleF))
+#else
+#define TO_BIN(v) roundHalfEven((float)(v) * (float)scaleF)
+#endif
 
 __kernel void dualrangehist_init_buf(
     __global int *histA,
@@ -146,7 +171,9 @@ __kernel void dualrangehist_count_buf(
     const int gid   = get_global_id(0);
     const int gsize = get_global_size(0);
     const int lid   = get_local_id(0);
-    const float scaleF = (float)(binNum - 1);
+    const FLOAT scaleF = (FLOAT)(binNum - 1);
+    const FLOAT lowF   = (FLOAT)low;
+    const FLOAT highF  = (FLOAT)high;
 
     int privA[BIN_NUM];
     int privB[BIN_NUM];
@@ -224,7 +251,9 @@ __kernel void dualrangehist_sample_buf(
     const int gid   = get_global_id(0);
     const int gsize = get_global_size(0);
     const int lid   = get_local_id(0);
-    const float scaleF = (float)(binNum - 1);
+    const FLOAT scaleF = (FLOAT)(binNum - 1);
+    const FLOAT lowF   = (FLOAT)low;
+    const FLOAT highF  = (FLOAT)high;
 
     int privA[BIN_NUM];
     int privB[BIN_NUM];

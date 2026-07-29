@@ -19,7 +19,7 @@ MNN::OpParameter DualRangeHistOnnx::type() {
 // custom node with op_type "DualRangeHist". Inputs 0 and 1 are the float frames
 // A and B; an optional input 2 is a per-element base validity mask. Attributes:
 //   binNum (alias minlength) : int   number of bins per histogram (output length)
-//   low, high                : float shared inclusive validity range on raw values
+//   low, high                : float shared exclusive validity range on raw values
 //   sampleStride (sample_stride): int >1 downsamples the last two dims
 //   emitValidCount (valid_count): int 0/1 - emit a 3rd int32 output = sum(keep)
 // Outputs: histA[binNum], histB[binNum] (int32), and optionally validCount[1].

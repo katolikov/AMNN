@@ -11,7 +11,7 @@ DualRangeHist has no standard ONNX operator, so this emits a custom node:
     op_type = "DualRangeHist"     (default ONNX domain "")
     attrs:
         binNum         : int   bins per histogram (each output length)
-        low, high      : float shared inclusive validity range on the raw values
+        low, high      : float shared exclusive validity range on the raw values
         sampleStride   : int   >1 downsamples the last two dims (approx histogram)
         emitValidCount : int   0/1 - emit a 3rd int32 output = sum(keep)
     inputs:
@@ -23,7 +23,7 @@ DualRangeHist has no standard ONNX operator, so this emits a custom node:
         (+ validCount[1] int32 when emitValidCount=1)
 
 Semantics reproduced by the op:
-    keep = base & (low<=A<=high) & (low<=B<=high)      # raw values, inclusive
+    keep = base & (low<A<high) & (low<B<high)      # raw values, exclusive
     histA[rint(A*(binNum-1))] += keep;  histB[rint(B*(binNum-1))] += keep
     validCount = sum(keep) == sum(histA) == sum(histB)
 
@@ -128,8 +128,8 @@ def main():
     p.add_argument("--bins", type=int, required=True, help="binNum: bins per histogram (each output length)")
     p.add_argument("--shape", default="1,1,1440,1920",
                    help="frame shape, comma-separated (default 1,1,1440,1920)")
-    p.add_argument("--low", type=float, default=0.05, help="shared inclusive range low (default 0.05)")
-    p.add_argument("--high", type=float, default=0.95, help="shared inclusive range high (default 0.95)")
+    p.add_argument("--low", type=float, default=0.05, help="shared exclusive range low (default 0.05)")
+    p.add_argument("--high", type=float, default=0.95, help="shared exclusive range high (default 0.95)")
     p.add_argument("--base", action="store_true", help="add a 3rd base-mask input (!=0 kept)")
     p.add_argument("--base-dtype", choices=list(_DTYPES), default="float32",
                    help="dtype of the base-mask input when --base (default float32)")

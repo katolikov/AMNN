@@ -59,7 +59,7 @@ ErrorCode CPUDualRangeHist::onExecute(const std::vector<Tensor*>& inputs, const 
             const int flat = (hs * stride) * W + ws * stride;   // batch == 1
             const float a = readF(A, flat);
             const float b = readF(B, flat);
-            const bool inRange = (a >= mLow && a <= mHigh && b >= mLow && b <= mHigh);
+            const bool inRange = (a > mLow && a < mHigh && b > mLow && b < mHigh);
             const bool keepBase = (base == nullptr) ? true : (readF(base, flat) != 0.0f);
             if (!(inRange && keepBase)) {
                 continue;
