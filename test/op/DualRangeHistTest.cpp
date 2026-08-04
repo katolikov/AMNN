@@ -313,6 +313,39 @@ public:
             }
         }
 
+        // ===== cases 7-8: local-memory GPU path (binNum > 16), stride=8, base
+        // mask, validCount -- exercises dualrangehist_local_buf at binNum 32 and
+        // 64. Same fp16-stable k/15 values as cases 3-5; accept whichever precision
+        // reference the op matches (fp16 on OpenCL Low, fp32 on CPU/High), as case6.
+        for (int localBins : {32, 64}) {
+            char tag[64];
+            snprintf(tag, sizeof(tag), "case(local/stride8/bins%d)", localBins);
+            VARP va = _Input({1, 1, H, W}, NCHW, halide_type_of<float>());
+            VARP vb = _Input({1, 1, H, W}, NCHW, halide_type_of<float>());
+            VARP vm = _Input({1, 1, H, W}, NCHW, halide_type_of<float>());
+            ::memcpy(va->writeMap<float>(), A.data(), n * sizeof(float));
+            ::memcpy(vb->writeMap<float>(), B.data(), n * sizeof(float));
+            ::memcpy(vm->writeMap<float>(), base.data(), n * sizeof(float));
+            auto out = _DualRangeHist(va, vb, vm, localBins, low, high, 8, true);
+            std::vector<int> f16A, f16B; int f16Count;
+            std::vector<int> f32A, f32B; int f32Count;
+            referenceDualRangeHistF16(A, B, &base, H, W, localBins, low, high, 8, f16A, f16B, f16Count);
+            referenceDualRangeHist(A, B, &base, H, W, localBins, low, high, 8, f32A, f32B, f32Count);
+            auto eq = [&](const std::vector<int>& rA, const std::vector<int>& rB, int rc) {
+                auto gA = out[0]->readMap<int>();
+                auto gB = out[1]->readMap<int>();
+                if (out[2]->readMap<int>()[0] != rc) return false;
+                for (int b = 0; b < localBins; ++b) {
+                    if (gA[b] != rA[b] || gB[b] != rB[b]) return false;
+                }
+                return true;
+            };
+            if (!eq(f16A, f16B, f16Count) && !eq(f32A, f32B, f32Count)) {
+                MNN_ERROR("DualRangeHistTest %s matched neither reference (prec=%d)\n", tag, precision);
+                return false;
+            }
+        }
+
         return true;
     }
 };

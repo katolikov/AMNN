@@ -152,6 +152,13 @@ __kernel void dualrangehist_init_buf(
 #define MERGE_COUNTER()
 #endif
 
+// The register-histogram kernels below keep two priv[BIN_NUM] arrays per
+// work-item and a fused BIN_NUM*LOCAL_SIZE reduction buffer, both of which only
+// fit for small BIN_NUM. Above that (BIN_NUM*LOCAL_SIZE > 4096, i.e. BIN_NUM > 16
+// at LOCAL_SIZE 256) they are compiled out and the local-memory path below is
+// used instead -- so the program still builds at BIN_NUM 32/64/256.
+#if (BIN_NUM * LOCAL_SIZE) <= 4096
+
 // Contiguous fast path (stride == 1): vectorized 4-wide loads over A, B, base.
 __kernel void dualrangehist_count_buf(
     __global const IN_T *A,
@@ -284,4 +291,103 @@ __kernel void dualrangehist_sample_buf(
 
     MERGE_HISTOGRAMS();
     MERGE_COUNTER();
+}
+
+#endif // (BIN_NUM * LOCAL_SIZE) <= 4096
+
+// Local-memory path for large BIN_NUM (> 16). The register path keeps two
+// priv[BIN_NUM] arrays and a BIN_NUM-way reduction that spill / overflow local
+// memory once BIN_NUM is large; here each workgroup instead keeps two shared
+// __local int[BIN_NUM] histograms (256 bins = 1KB each, on-chip) that all its
+// work-items atomic-add into, then cooperatively merges them to the global
+// output (BIN_NUM global atomics per histogram per workgroup). One kernel serves
+// both the contiguous (stride <= 1 -> flat == k) and strided (stride > 1)
+// cases via the sampled-grid geometry (batch == 1). validCount, when requested,
+// is a per-work-item private counter reduced once at the end (no per-element
+// contention on a shared counter). Range test / bin math use the same exclusive,
+// fp16-exact COMPUTE_KEEP / TO_BIN macros as the register path.
+__kernel void dualrangehist_local_buf(
+    __global const IN_T *A,
+    __global const IN_T *B,
+#ifdef HAS_BASE
+    __global const BASE_T *base,
+#endif
+    __global int *histA,
+    __global int *histB,
+#ifdef EMIT_VALIDCOUNT
+    __global int *validCount,
+#endif
+    __private const int N,
+    __private const int stride,
+    __private const int W,
+    __private const int Ws,
+    __private const float low,
+    __private const float high,
+    __private const int binNum) {
+    const int gid   = get_global_id(0);
+    const int gsize = get_global_size(0);
+    const int lid   = get_local_id(0);
+    const int lsize = get_local_size(0);
+    const FLOAT scaleF = (FLOAT)(binNum - 1);
+    const FLOAT lowF   = (FLOAT)low;
+    const FLOAT highF  = (FLOAT)high;
+
+    __local int localHistA[BIN_NUM];
+    __local int localHistB[BIN_NUM];
+#ifdef EMIT_VALIDCOUNT
+    __local int cbuf[LOCAL_SIZE];
+    int counter = 0;
+#endif
+    for (int b = lid; b < BIN_NUM; b += lsize) {
+        localHistA[b] = 0;
+        localHistB[b] = 0;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    for (int k = gid; k < N; k += gsize) {
+        int flat;
+        if (stride <= 1) {
+            flat = k;
+        } else {
+            const int ph = k / Ws;
+            const int pw = k - ph * Ws;
+            flat = (ph * stride) * W + pw * stride;
+        }
+        float a = (float)A[flat];
+        float b = (float)B[flat];
+#ifdef HAS_BASE
+        int keep = COMPUTE_KEEP(a, b, (base[flat] != 0));
+#else
+        int keep = COMPUTE_KEEP(a, b, 1);
+#endif
+        if (keep) {
+            // keep guarantees in-range, so the bin index is in [0, binNum).
+            atomic_add(&localHistA[TO_BIN(a)], 1);
+            atomic_add(&localHistB[TO_BIN(b)], 1);
+        }
+#ifdef EMIT_VALIDCOUNT
+        counter += keep;
+#endif
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    for (int b = lid; b < BIN_NUM; b += lsize) {
+        int ca = localHistA[b];
+        if (ca != 0) atomic_add(&histA[b], ca);
+        int cb = localHistB[b];
+        if (cb != 0) atomic_add(&histB[b], cb);
+    }
+#ifdef EMIT_VALIDCOUNT
+    cbuf[lid] = counter;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int off = LOCAL_SIZE >> 1; off > 0; off >>= 1) {
+        if (lid < off) {
+            cbuf[lid] += cbuf[lid + off];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if (lid == 0) {
+        atomic_add(&validCount[0], cbuf[0]);
+    }
+#endif
 }

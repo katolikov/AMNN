@@ -13,10 +13,14 @@ namespace MNN {
 namespace OpenCL {
 
 static const int kLocalSize = 256;
-// Register path holds two priv[BIN_NUM] histograms and a fused reduction buffer
-// of BIN_NUM*LOCAL_SIZE ints; both stay valid only while BIN_NUM stays small.
-// (BIN_NUM*LOCAL_SIZE <= 4096 at binNum 16.) Larger binNum falls back to CPU.
+// At/below this bin count the register-histogram path is used (two priv[BIN_NUM]
+// arrays + a fused BIN_NUM*LOCAL_SIZE reduction buffer, which only fit while
+// BIN_NUM*LOCAL_SIZE <= 4096, i.e. binNum <= 16). Above it, the local-memory
+// histogram path (two __local int[BIN_NUM] + atomic_add) is used instead.
 static const int kRegisterBinCap = 16;
+// Upper bound for the GPU (local) path: two __local int[binNum] histograms stay
+// on-chip. Larger binNum falls back to CPU.
+static const int kMaxBins = 256;
 
 DualRangeHistBufExecution::DualRangeHistBufExecution(const MNN::Op *op, Backend *backend)
     : CommonExecution(backend, op) {
@@ -67,8 +71,22 @@ ErrorCode DualRangeHistBufExecution::onEncode(const std::vector<Tensor *> &input
     const int nSampled = Hs * Ws;   // == n when stride == 1 (batch == 1)
     const int workItems = sampled ? nSampled : n;
 
+    // binNum > 16: the register path spills/overflows, so use the local-memory
+    // histogram kernel (works for any stride via the sampled-grid geometry).
+    // Env MNN_DUALHIST_LOCAL=1/0 forces the path for A/B benchmarks.
+    bool useLocal = mBinNum > kRegisterBinCap;
+    if (const char* e = getenv("MNN_DUALHIST_LOCAL")) {
+        useLocal = atoi(e) != 0;
+    }
+    // The local kernel and the sampled register kernel both take the geometry
+    // args (N, stride, W, Ws); the contiguous register kernel takes just n.
+    const bool geomArgs = useLocal || sampled;
+    const int countN = sampled ? nSampled : n;
+
     auto initKernel  = runtime->buildKernel("dualrangehist_buf", "dualrangehist_init_buf", buildOptions, mOpenCLBackend->getPrecision());
-    const char* countName = sampled ? "dualrangehist_sample_buf" : "dualrangehist_count_buf";
+    const char* countName = useLocal ? "dualrangehist_local_buf"
+                          : sampled  ? "dualrangehist_sample_buf"
+                                     : "dualrangehist_count_buf";
     auto countKernel = runtime->buildKernel("dualrangehist_buf", countName, buildOptions, mOpenCLBackend->getPrecision());
     if (initKernel == nullptr || countKernel == nullptr) {
         return NOT_SUPPORT;
@@ -110,9 +128,10 @@ ErrorCode DualRangeHistBufExecution::onEncode(const std::vector<Tensor *> &input
         if (mEmitValidCount) {
             ret |= countKernel->get().setArg(idx++, openCLBuffer(outputs[2]));
         }
-        if (sampled) {
-            // sample(A, B, [base], histA, histB, [vc], nSampled, stride, W, Ws, low, high, binNum)
-            ret |= countKernel->get().setArg(idx++, nSampled);
+        if (geomArgs) {
+            // local/sample(A, B, [base], histA, histB, [vc], N, stride, W, Ws, low, high, binNum)
+            // N == nSampled when stride>1, else n (local path with stride<=1 uses flat==k).
+            ret |= countKernel->get().setArg(idx++, countN);
             ret |= countKernel->get().setArg(idx++, stride);
             ret |= countKernel->get().setArg(idx++, W);
             ret |= countKernel->get().setArg(idx++, Ws);
@@ -149,8 +168,9 @@ public:
     virtual Execution *onCreate(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs,
                                 const MNN::Op *op, Backend *backend) const override {
         auto param = op->main_as_DualRangeHistParam();
-        // Register-fused path requires a small, compile-time-fixed bin count.
-        if (param == nullptr || param->binNum() <= 0 || param->binNum() > kRegisterBinCap) {
+        // GPU handles binNum up to kMaxBins (register path <= 16, local path above);
+        // larger falls back to CPU.
+        if (param == nullptr || param->binNum() <= 0 || param->binNum() > kMaxBins) {
             return nullptr;
         }
         // Two frames (+ optional base mask); frames must be float (fp32/fp16-buffer).
