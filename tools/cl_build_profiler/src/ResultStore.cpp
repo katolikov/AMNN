@@ -16,10 +16,11 @@ namespace clprof {
 
 namespace {
 
-const char kEnvironmentRecord = 'E';
-const char kMarkerRecord      = 'M';
-const char kProgramRecord     = 'P';
-const char kRunRecord         = 'R';
+const char kEnvironmentRecord  = 'E';
+const char kMarkerRecord       = 'M';
+const char kProgramRecord      = 'P';
+const char kCacheRestoreRecord = 'C';
+const char kRunRecord          = 'R';
 
 /** Appends fixed size values and length prefixed strings to a byte buffer. */
 class Writer {
@@ -33,6 +34,10 @@ public:
     void text(const std::string& value) {
         pod<uint32_t>(static_cast<uint32_t>(value.size()));
         mBuffer.append(value);
+    }
+
+    void bytes(const void* data, size_t size) {
+        mBuffer.append(static_cast<const char*>(data), size);
     }
 
     void texts(const std::vector<std::string>& values) {
@@ -77,6 +82,17 @@ public:
         std::string value(mData + mOffset, size);
         mOffset += size;
         return value;
+    }
+
+    /** Copies `size` raw bytes; returns false and stops the reader when they are missing. */
+    bool bytes(void* target, size_t size) {
+        if (!mOk || mOffset + size > mSize) {
+            mOk = false;
+            return false;
+        }
+        memcpy(target, mData + mOffset, size);
+        mOffset += size;
+        return true;
     }
 
     std::vector<std::string> texts() {
@@ -286,7 +302,36 @@ bool ResultStore::writeProgram(const ProgramReport& report) {
     writer.pod(report.verification.kernelNamesMatch);
     writer.pod(report.verification.kernelAttributesMatch);
     writer.texts(report.verification.notes);
+
+    writer.pod<uint32_t>(static_cast<uint32_t>(report.binary.size()));
+    if (!report.binary.empty()) {
+        writer.bytes(report.binary.data(), report.binary.size());
+    }
     return writeRecord(kProgramRecord, writer.buffer());
+}
+
+bool ResultStore::writeCacheRestore(const CacheRestoreReport& restore) {
+    Writer writer;
+    writer.pod(restore.measured);
+    writer.text(restore.path);
+    writer.pod(restore.fileBytes);
+    writer.pod(restore.entriesInFile);
+    writer.pod(restore.entriesUsable);
+    writer.pod(restore.entriesRejected);
+    writer.pod<uint32_t>(static_cast<uint32_t>(restore.samples.size()));
+    for (const CacheRestoreSample& sample : restore.samples) {
+        writer.text(sample.program);
+        writer.pod(sample.createMs);
+        writer.pod(sample.buildMs);
+        writer.pod(sample.kernelsMs);
+        writer.pod(sample.releaseMs);
+        writer.pod(sample.binaryBytes);
+        writer.pod(sample.kernelCount);
+        writer.pod(sample.ok);
+        writer.text(sample.failure);
+    }
+    writer.texts(restore.notes);
+    return writeRecord(kCacheRestoreRecord, writer.buffer());
 }
 
 bool ResultStore::writeRun(const ExecutionCheck& execution, const ContentionReport& contention,
@@ -386,9 +431,42 @@ bool ResultStore::read(const std::string& path, RunOutcome& outcome, std::string
             report.verification.kernelAttributesMatch = reader.pod<CheckState>();
             report.verification.notes                 = reader.texts();
 
+            const uint32_t binarySize = reader.pod<uint32_t>();
+            if (reader.ok() && binarySize > 0) {
+                report.binary.resize(binarySize);
+                reader.bytes(report.binary.data(), binarySize);
+            }
+
             if (reader.ok()) {
                 outcome.reports.push_back(report);
                 outcome.inFlight.clear();
+            }
+        } else if (kCacheRestoreRecord == tag) {
+            CacheRestoreReport restore;
+            restore.measured        = reader.pod<bool>();
+            restore.path            = reader.text();
+            restore.fileBytes       = reader.pod<size_t>();
+            restore.entriesInFile   = reader.pod<int>();
+            restore.entriesUsable   = reader.pod<int>();
+            restore.entriesRejected = reader.pod<int>();
+
+            const uint32_t sampleCount = reader.pod<uint32_t>();
+            for (uint32_t i = 0; reader.ok() && i < sampleCount; ++i) {
+                CacheRestoreSample sample;
+                sample.program     = reader.text();
+                sample.createMs    = reader.pod<double>();
+                sample.buildMs     = reader.pod<double>();
+                sample.kernelsMs   = reader.pod<double>();
+                sample.releaseMs   = reader.pod<double>();
+                sample.binaryBytes = reader.pod<size_t>();
+                sample.kernelCount = reader.pod<int>();
+                sample.ok          = reader.pod<bool>();
+                sample.failure     = reader.text();
+                restore.samples.push_back(sample);
+            }
+            restore.notes = reader.texts();
+            if (reader.ok()) {
+                outcome.cacheRestore = restore;
             }
         } else if (kRunRecord == tag) {
             ExecutionCheck execution;

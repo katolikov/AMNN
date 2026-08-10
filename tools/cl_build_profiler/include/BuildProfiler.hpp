@@ -15,6 +15,7 @@
 
 #include "CLApi.hpp"
 #include "CLEnvironment.hpp"
+#include "MnnCache.hpp"
 #include "ProgramCatalog.hpp"
 
 namespace clprof {
@@ -104,6 +105,9 @@ struct ProgramReport {
     std::vector<KernelInfo> kernels;
     Verification verification;
 
+    /** Binary of the unsalted build, kept only when a cache file is to be written. */
+    std::vector<unsigned char> binary;
+
     std::vector<double> phaseTimings(Phase phase) const;
     std::vector<BuildSample> phaseSamples(Phase phase) const;
 };
@@ -122,6 +126,39 @@ struct ContentionReport {
     double effectiveParallelism() const;
 };
 
+/** Cost of restoring one program from an MNN cache file, as setCache would. */
+struct CacheRestoreSample {
+    std::string program;
+    double createMs    = 0.0;  ///< clCreateProgramWithBinary
+    double buildMs     = 0.0;  ///< clBuildProgram on the stored binary
+    double kernelsMs   = 0.0;  ///< clCreateKernelsInProgram, which MNN does lazily later
+    double releaseMs   = 0.0;
+    size_t binaryBytes = 0;
+    int kernelCount    = 0;
+    bool ok            = false;
+    std::string failure;
+
+    /** What OpenCLRuntime::setCache itself spends on this program. */
+    double restoreMs() const {
+        return createMs + buildMs;
+    }
+};
+
+/** What an MNN cache file is worth on this device. */
+struct CacheRestoreReport {
+    bool measured        = false;
+    std::string path;
+    size_t fileBytes     = 0;
+    int entriesInFile    = 0;
+    int entriesUsable    = 0;
+    int entriesRejected  = 0;
+    std::vector<CacheRestoreSample> samples;
+    std::vector<std::string> notes;  ///< the file verdict and every rejected entry
+
+    double totalRestoreMs() const;
+    int restored() const;
+};
+
 /** End to end check that a program built by this tool produces correct results. */
 struct ExecutionCheck {
     bool measured   = false;
@@ -137,17 +174,22 @@ struct ExecutionCheck {
     std::string failure;
 };
 
-/** Knobs that control how much work the profiler does per program. */
+/**
+ * Knobs that control how much work the profiler does per program. Everything that
+ * yields a measurement is on by default: a run with no options is meant to be the
+ * complete picture, and each switch only takes work away.
+ */
 struct ProfilerConfig {
-    int coldRepeat     = 2;
-    int warmRepeat     = 2;
-    int binaryRepeat   = 2;
-    int warmup         = 0;
-    bool salt          = true;
-    bool binaryPhase   = true;
-    bool verify        = true;
-    bool splitCompileLink = false;
-    bool verbose       = false;
+    int coldRepeat        = 3;
+    int warmRepeat        = 3;
+    int binaryRepeat      = 3;
+    int warmup            = 0;
+    bool salt             = true;
+    bool binaryPhase      = true;
+    bool verify           = true;
+    bool splitCompileLink = true;
+    bool keepBinary       = true;  ///< retain each binary so a cache file can be written
+    bool verbose          = false;
 };
 
 /**
@@ -168,6 +210,13 @@ public:
 
     /** Compiles and runs a small built in kernel and validates its output. */
     ExecutionCheck runExecutionCheck();
+
+    /**
+     * Loads every usable program of an MNN cache file the way setCache does, which is
+     * what the engine really pays on a warm start, as opposed to the binary phase that
+     * reuses a binary this process produced a moment earlier.
+     */
+    CacheRestoreReport restoreFromCache(const MnnCacheFile& cache);
 
     /** Wall time of clUnloadPlatformCompiler, negative when the entry point is missing. */
     double unloadCompiler();

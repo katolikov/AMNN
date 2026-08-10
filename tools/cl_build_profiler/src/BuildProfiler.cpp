@@ -84,6 +84,24 @@ bool Verification::anyFailed() const {
            CheckState::kFail == kernelAttributesMatch;
 }
 
+double CacheRestoreReport::totalRestoreMs() const {
+    double total = 0.0;
+    for (const CacheRestoreSample& sample : samples) {
+        if (sample.ok) {
+            total += sample.restoreMs();
+        }
+    }
+    return total;
+}
+
+int CacheRestoreReport::restored() const {
+    int count = 0;
+    for (const CacheRestoreSample& sample : samples) {
+        count += sample.ok ? 1 : 0;
+    }
+    return count;
+}
+
 double ContentionReport::effectiveParallelism() const {
     if (wallMs <= 0.0) {
         return 0.0;
@@ -457,6 +475,9 @@ ProgramReport BuildProfiler::profile(const ProgramSource& program, const std::st
     }
     report.compiled = true;
     report.kernels  = reference.kernels;
+    if (mConfig.keepBinary) {
+        report.binary = reference.binary;
+    }
 
     bool deterministic         = true;
     bool deterministicMeasured = false;
@@ -686,6 +707,84 @@ ExecutionCheck BuildProfiler::runExecutionCheck() {
     mApi.clReleaseKernel(kernel);
     mApi.clReleaseProgram(program);
     return check;
+}
+
+CacheRestoreReport BuildProfiler::restoreFromCache(const MnnCacheFile& cache) {
+    CacheRestoreReport restore;
+    restore.measured      = true;
+    restore.path          = cache.path;
+    restore.fileBytes     = cache.fileBytes;
+    restore.entriesInFile = static_cast<int>(cache.entries.size());
+    if (!cache.verdict.empty()) {
+        restore.notes.push_back(cache.verdict);
+    }
+
+    const cl_device_id device = mEnvironment.device();
+    for (const CacheEntry& entry : cache.entries) {
+        if (!entry.usable()) {
+            ++restore.entriesRejected;
+            restore.notes.push_back(entry.program + ": " + entry.rejection);
+            continue;
+        }
+        ++restore.entriesUsable;
+
+        CacheRestoreSample sample;
+        sample.program     = entry.program;
+        sample.binaryBytes = entry.binary.size();
+
+        const unsigned char* data = entry.binary.data();
+        const size_t size         = entry.binary.size();
+        cl_int status             = CL_SUCCESS;
+        cl_int binaryStatus       = CL_SUCCESS;
+
+        double start = wallMs();
+        cl_program program = mApi.clCreateProgramWithBinary(mEnvironment.context(), 1, &device, &size, &data,
+                                                            &binaryStatus, &status);
+        sample.createMs = wallMs() - start;
+        if (nullptr == program || CL_SUCCESS != status || CL_SUCCESS != binaryStatus) {
+            sample.failure =
+                formatError("clCreateProgramWithBinary", CL_SUCCESS != status ? status : binaryStatus);
+            if (nullptr != program) {
+                mApi.clReleaseProgram(program);
+            }
+            restore.samples.push_back(sample);
+            continue;
+        }
+
+        // setCache rebuilds with the option string stored in the file, not with the
+        // options this run would pick, so the same string is used here.
+        start          = wallMs();
+        status         = mApi.clBuildProgram(program, 1, &device, entry.buildInfo.c_str(), nullptr, nullptr);
+        sample.buildMs = wallMs() - start;
+        if (CL_SUCCESS != status) {
+            sample.failure = formatError("clBuildProgram", status) + ": " + readBuildLog(program);
+            mApi.clReleaseProgram(program);
+            restore.samples.push_back(sample);
+            continue;
+        }
+
+        start               = wallMs();
+        cl_uint kernelCount = 0;
+        std::vector<cl_kernel> kernels;
+        if (CL_SUCCESS == mApi.clCreateKernelsInProgram(program, 0, nullptr, &kernelCount) && kernelCount > 0) {
+            kernels.resize(kernelCount, nullptr);
+            if (CL_SUCCESS != mApi.clCreateKernelsInProgram(program, kernelCount, kernels.data(), nullptr)) {
+                kernels.clear();
+            }
+        }
+        sample.kernelsMs   = wallMs() - start;
+        sample.kernelCount = static_cast<int>(kernels.size());
+
+        start = wallMs();
+        for (cl_kernel kernel : kernels) {
+            mApi.clReleaseKernel(kernel);
+        }
+        mApi.clReleaseProgram(program);
+        sample.releaseMs = wallMs() - start;
+        sample.ok        = true;
+        restore.samples.push_back(sample);
+    }
+    return restore;
 }
 
 double BuildProfiler::unloadCompiler() {

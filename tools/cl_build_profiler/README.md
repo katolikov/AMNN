@@ -18,20 +18,32 @@ builds and runs on a device without an MNN build present.
 ./run_device.sh -s <serial>
 ```
 
-That builds for `arm64-v8a`, pushes to `/data/local/tmp/cl_build_profiler`, runs, and
-pulls the results into `./cl_profile_<timestamp>/`:
+A serial is all it needs. That builds for `arm64-v8a`, pushes to
+`/data/local/tmp/cl_build_profiler`, and measures everything in two passes: the first
+compiles every program from source and leaves an MNN cache file on the device, the
+second reads that file back **in a fresh process**, which is the warm start a real
+application gets. It ends with the number most people are after:
+
+```
+compiling every program from source :   7810.3 ms
+restoring them from the cache file  :     41.1 ms
+the MNN cache file is worth         :    190.0x, 7769.2 ms of start up time
+```
+
+Results land in `./cl_profile_<timestamp>/`:
 
 | file | contents |
 |------|----------|
-| `profile.log` | the full console report |
+| `profile.log` | the full console report of both passes |
 | `samples.csv` | one row per measured build, for spreadsheets and diffs |
 | `summary.json` | device identification plus per program statistics |
+| `mnn_cache.bin` | the cache file the first pass wrote |
 | `device_info.txt` | SoC, build fingerprint, CPU governors, hot thermal zones |
 
-Anything after `--` goes to the profiler:
+Anything after `--` replaces both passes with a single run of the profiler:
 
 ```bash
-./run_device.sh -s <serial> -- --programs 'conv_2d*' --repeat 5 --split-compile-link
+./run_device.sh -s <serial> -- --programs 'conv_2d*' --repeat 5
 ```
 
 Use `--no-build` to reuse the binary already built, `--no-push` to reuse the one on the
@@ -46,7 +58,8 @@ cmake -S tools/cl_build_profiler -B build-clprof && cmake --build build-clprof -
 
 ## What is measured
 
-For every program, in this order:
+Running the profiler with no options measures all of it; every switch only takes work
+away. For every program, in this order:
 
 | phase | what runs | what it tells you |
 |-------|-----------|-------------------|
@@ -66,15 +79,40 @@ the process burns inside `clBuildProgram` is recorded next to the wall time: whe
 two match the compiler runs in process and is CPU bound, when they diverge the time is
 spent waiting on something else.
 
-`--split-compile-link` additionally measures `clCompileProgram` and `clLinkProgram`
-separately, which splits a slow build into front end (parsing and preprocessing) and
-back end (code generation) cost.
+`clCompileProgram` and `clLinkProgram` are also measured separately, which splits a slow
+build into front end (parsing and preprocessing) and back end (code generation) cost.
+`--no-split-compile-link` skips that pass.
 
-`--jobs <n>` builds the whole set again from `n` threads and compares the wall time
-against the same work done serially, which exposes a global lock inside the driver.
+The whole set is then built again from four threads and the wall time compared against
+the same work done serially, which exposes a global lock inside the driver. `--jobs <n>`
+changes the thread count, `--jobs 1` skips the test.
 
 The run also compiles and executes a small built in kernel and checks its output, so a
 report always states whether the device could actually run what it compiled.
+
+## Warm start from an MNN cache file
+
+The `binary` phase above reuses a binary this process produced moments earlier, which is
+a lower bound rather than the real thing. `--mnn-cache <path>` measures the real thing:
+it reads a cache file in the engine's own format and restores it exactly the way
+`OpenCLRuntime::setCache` does, before anything is compiled from source.
+
+It also reports what the engine would silently discard, which is the usual reason a
+cache file exists and the first run is still slow:
+
+* no entry for this device name
+* the entry was written by a different driver version
+* a program whose md5 no longer matches the source in this build
+* a program this build does not have at all
+
+`--write-mnn-cache <path>` writes such a file from the binaries of the current run, so
+the restore path can be measured on a device without first running a model. The build
+options recorded in it are this tool's, so it is a measurement input, not a drop-in
+cache for the engine: MNN keys its compiled programs on the exact option string an
+`Execution` passes.
+
+`--cache-only` skips the source builds and does just the cache work, which is what the
+second pass of `run_device.sh` uses.
 
 ## What is verified
 

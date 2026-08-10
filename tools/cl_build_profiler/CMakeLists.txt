@@ -24,6 +24,7 @@ set(PROFILER_SOURCES
     "${CMAKE_CURRENT_LIST_DIR}/src/CLApi.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/src/CLEnvironment.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/src/Metrics.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/src/MnnCache.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/src/ProgramCatalog.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/src/Report.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/src/ResultStore.cpp"
@@ -35,6 +36,8 @@ add_executable(cl_build_profiler ${PROFILER_SOURCES} ${MNN_CL_SOURCES})
 target_include_directories(cl_build_profiler PRIVATE
     "${CMAKE_CURRENT_LIST_DIR}/include"
     "${MNN_ROOT}/3rd_party/OpenCLHeaders"
+    "${MNN_ROOT}/3rd_party/flatbuffers/include"
+    "${MNN_ROOT}/source/backend/opencl/schema/current"
     "${CL_KERNEL_DIR}"
 )
 

@@ -26,6 +26,7 @@ struct RunOutcome {
     std::vector<ProgramReport> reports;
     ExecutionCheck execution;
     ContentionReport contention;
+    CacheRestoreReport cacheRestore;
     double unloadCompilerMs = -1.0;
     long peakRssKb          = 0;
 
@@ -55,6 +56,7 @@ public:
     /** Names the program about to be built, so a crash can be attributed to it. */
     bool writeMarker(const std::string& programName);
     bool writeProgram(const ProgramReport& report);
+    bool writeCacheRestore(const CacheRestoreReport& restore);
     bool writeRun(const ExecutionCheck& execution, const ContentionReport& contention, double unloadCompilerMs,
                   long peakRssKb);
 

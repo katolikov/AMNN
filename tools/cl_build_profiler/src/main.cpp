@@ -53,12 +53,15 @@ struct Options {
     std::string replacementOptions;
     std::string csvPath;
     std::string jsonPath;
+    std::string readCachePath;
+    std::string writeCachePath;
+    bool cacheOnly            = false;
     std::string workDir       = ".";
     int precision             = 2;
     int platformIndex         = 0;
     int deviceIndex           = 0;
     cl_device_type deviceType = CL_DEVICE_TYPE_GPU;
-    int jobs                  = 1;
+    int jobs                  = 4;
     bool listOnly             = false;
     bool showKernels          = false;
     bool useReplacement       = false;
@@ -72,6 +75,10 @@ void printUsage(FILE* out, const char* executable) {
             "clBuildProgram profiler for the MNN OpenCL backend\n"
             "\n"
             "usage: %s [options]\n"
+            "\n"
+            "Run without options to measure everything: every program, cold, warm, from a\n"
+            "binary and from an MNN cache file, with the verification and the concurrency\n"
+            "test. Every option below only narrows that down.\n"
             "\n"
             "program selection\n"
             "  -p, --programs <glob>[,<glob>]  only profile programs matching these patterns\n"
@@ -87,17 +94,27 @@ void printUsage(FILE* out, const char* executable) {
             "      --no-program-defines        do not add the per program defines MNN passes\n"
             "\n"
             "measurement\n"
-            "  -r, --repeat <n>                cold builds per program (default 2)\n"
-            "      --warm-repeat <n>           repeated identical builds per program (default 2)\n"
-            "      --binary-repeat <n>         builds from the produced binary (default 2)\n"
+            "  -r, --repeat <n>                cold builds per program (default 3)\n"
+            "      --warm-repeat <n>           repeated identical builds per program (default 3)\n"
+            "      --binary-repeat <n>         builds from the produced binary (default 3)\n"
             "      --warmup <n>                discarded builds before measuring (default 0)\n"
             "      --no-salt                   do not defeat the driver compiler cache\n"
             "      --no-binary                 skip the clCreateProgramWithBinary phase\n"
             "      --no-verify                 skip the binary and kernel cross checks\n"
-            "      --split-compile-link        also measure clCompileProgram and clLinkProgram\n"
-            "      --jobs <n>                  build with n threads to expose driver locking\n"
+            "      --no-split-compile-link     skip the clCompileProgram / clLinkProgram pass\n"
+            "      --jobs <n>                  threads for the concurrency test, 1 skips it\n"
+            "                                  (default 4)\n"
             "      --no-crash-guard            do not isolate the builds in a child process\n"
             "      --work-dir <path>           where the crash guard keeps its result file\n"
+            "\n"
+            "warm start from an MNN cache file\n"
+            "      --mnn-cache <path>          restore this cache file the way setCache does and\n"
+            "                                  time it, reporting what MNN accepts and rejects\n"
+            "      --write-mnn-cache <path>    write the binaries of this run as a cache file, to\n"
+            "                                  measure the restore path without running a model\n"
+            "                                  (its build options are this tool's, so it is not a\n"
+            "                                  drop-in cache for the engine)\n"
+            "      --cache-only                only do the cache work, do not build from source\n"
             "\n"
             "device selection\n"
             "      --library <path>            load this OpenCL library instead of probing\n"
@@ -227,8 +244,16 @@ bool parseArguments(int argc, char* argv[], Options& options, std::string& messa
             options.profiler.binaryPhase = false;
         } else if (argument == "--no-verify") {
             options.profiler.verify = false;
-        } else if (argument == "--split-compile-link") {
-            options.profiler.splitCompileLink = true;
+        } else if (argument == "--no-split-compile-link") {
+            options.profiler.splitCompileLink = false;
+        } else if (argument == "--mnn-cache") {
+            if (!requireValue("--mnn-cache")) return false;
+            options.readCachePath = value;
+        } else if (argument == "--write-mnn-cache") {
+            if (!requireValue("--write-mnn-cache")) return false;
+            options.writeCachePath = value;
+        } else if (argument == "--cache-only") {
+            options.cacheOnly = true;
         } else if (argument == "--no-crash-guard") {
             options.crashGuard = false;
         } else if (argument == "--work-dir") {
@@ -380,6 +405,33 @@ int runProfiling(const Options& options, const std::vector<ProgramSource>& progr
 
     BuildProfiler profiler(api, environment, options.profiler);
     outcome.execution = profiler.runExecutionCheck();
+
+    // Done before anything is compiled from source, which is the situation an
+    // application with a populated cache file actually starts in.
+    if (!options.readCachePath.empty()) {
+        MnnCacheFile cache;
+        if (!readMnnCache(options.readCachePath, outcome.device.deviceName, outcome.device.driverVersion, cache,
+                          message)) {
+            fprintf(stderr, "error: %s\n", message.c_str());
+            return kExitFatal;
+        }
+        fprintf(stdout, "\nrestoring %zu programs from %s\n", cache.entries.size(),
+                options.readCachePath.c_str());
+        fflush(stdout);
+        outcome.cacheRestore = profiler.restoreFromCache(cache);
+        if (nullptr != store) {
+            store->writeCacheRestore(outcome.cacheRestore);
+        }
+    }
+
+    if (options.cacheOnly) {
+        outcome.unloadCompilerMs = profiler.unloadCompiler();
+        outcome.peakRssKb        = peakRssKb();
+        if (nullptr != store) {
+            store->writeRun(outcome.execution, outcome.contention, outcome.unloadCompilerMs, outcome.peakRssKb);
+        }
+        return kExitOk;
+    }
 
     fprintf(stdout, "\nbuilding %zu programs\n", programs.size());
     fflush(stdout);
@@ -541,7 +593,7 @@ int runWithCrashGuard(const Options& options, const std::vector<ProgramSource>& 
     ::remove(storePath.c_str());
 
     outcome.reports.insert(outcome.reports.end(), crashes.begin(), crashes.end());
-    if (outcome.reports.empty()) {
+    if (outcome.reports.empty() && !options.cacheOnly) {
         fprintf(stderr, "error: no program could be measured\n");
         return kExitFatal;
     }
@@ -606,21 +658,47 @@ int main(int argc, char* argv[]) {
 
     summary.execution        = outcome.execution;
     summary.contention       = outcome.contention;
+    summary.cacheRestore     = outcome.cacheRestore;
     summary.unloadCompilerMs = outcome.unloadCompilerMs;
     summary.peakRssKb        = std::max(outcome.peakRssKb, peakRssKb());
     summary.totalWallMs      = wallMs() - startWall;
 
-    report::printProgramTable(stdout, outcome.reports);
-    report::printCallBreakdown(stdout, outcome.reports);
-    report::printSplitBuild(stdout, outcome.reports);
-    if (options.profiler.verify) {
-        report::printVerification(stdout, outcome.reports);
+    report::printCacheRestore(stdout, outcome.cacheRestore, outcome.reports);
+    if (!outcome.reports.empty()) {
+        report::printProgramTable(stdout, outcome.reports);
+        report::printCallBreakdown(stdout, outcome.reports);
+        report::printSplitBuild(stdout, outcome.reports);
+        if (options.profiler.verify) {
+            report::printVerification(stdout, outcome.reports);
+        }
+        if (options.showKernels) {
+            report::printKernels(stdout, outcome.reports);
+        }
+        report::printFailures(stdout, outcome.reports);
     }
-    if (options.showKernels) {
-        report::printKernels(stdout, outcome.reports);
-    }
-    report::printFailures(stdout, outcome.reports);
     report::printSummary(stdout, outcome.reports, summary);
+
+    if (!options.writeCachePath.empty()) {
+        std::vector<CacheEntry> entries;
+        for (const ProgramReport& report : outcome.reports) {
+            if (report.binary.empty()) {
+                continue;
+            }
+            CacheEntry entry;
+            entry.program   = report.name;
+            entry.buildInfo = report.buildOptions;
+            entry.md5       = programMd5(report.name);
+            entry.binary    = report.binary;
+            entries.push_back(entry);
+        }
+        if (writeMnnCache(options.writeCachePath, outcome.device.deviceName, outcome.device.driverVersion,
+                          entries, message)) {
+            fprintf(stdout, "\n  cache written to %s (%zu programs)\n", options.writeCachePath.c_str(),
+                    entries.size());
+        } else {
+            fprintf(stderr, "error: %s\n", message.c_str());
+        }
+    }
 
     if (!options.csvPath.empty()) {
         if (report::writeCsv(options.csvPath, outcome.device, outcome.reports, message)) {
@@ -644,6 +722,9 @@ int main(int argc, char* argv[]) {
         buildFailed = buildFailed || !report.compiled;
         checkFailed = checkFailed || report.verification.anyFailed();
     }
+    for (const CacheRestoreSample& sample : outcome.cacheRestore.samples) {
+        buildFailed = buildFailed || !sample.ok;
+    }
 
     if (checkFailed) {
         fprintf(stdout, "\nRESULT: a verification check failed\n");
@@ -652,6 +733,11 @@ int main(int argc, char* argv[]) {
     if (buildFailed) {
         fprintf(stdout, "\nRESULT: every check passed, but some programs did not build\n");
         return kExitBuildFailed;
+    }
+    if (outcome.reports.empty()) {
+        fprintf(stdout, "\nRESULT: %d of %d cached programs restored\n", outcome.cacheRestore.restored(),
+                outcome.cacheRestore.entriesInFile);
+        return kExitOk;
     }
     fprintf(stdout, "\nRESULT: all %zu programs built and verified\n", outcome.reports.size());
     return kExitOk;

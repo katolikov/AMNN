@@ -249,6 +249,59 @@ void printSplitBuild(FILE* out, const std::vector<ProgramReport>& reports) {
     }
 }
 
+void printCacheRestore(FILE* out, const CacheRestoreReport& restore, const std::vector<ProgramReport>& reports) {
+    if (!restore.measured) {
+        return;
+    }
+    printSection(out, "WARM START FROM AN MNN CACHE FILE");
+    fprintf(out, "  file               : %s (%.1f KB)\n", restore.path.c_str(), restore.fileBytes / 1024.0);
+    fprintf(out, "  programs in file   : %d\n", restore.entriesInFile);
+    fprintf(out, "  accepted by MNN    : %d\n", restore.entriesUsable);
+    fprintf(out, "  rejected by MNN    : %d  (these are recompiled from source at runtime)\n",
+            restore.entriesRejected);
+
+    if (!restore.samples.empty()) {
+        fprintf(out, "\n  %-30s %8s %10s %10s %10s %7s\n", "PROGRAM", "BIN KB", "create ms", "build ms",
+                "restore ms", "KERNELS");
+        for (const CacheRestoreSample& sample : restore.samples) {
+            if (!sample.ok) {
+                fprintf(out, "  %-30s %8.1f  FAILED: %s\n", truncate(sample.program, 30).c_str(),
+                        sample.binaryBytes / 1024.0, sample.failure.c_str());
+                continue;
+            }
+            fprintf(out, "  %-30s %8.1f %10.3f %10.3f %10.3f %7d\n", truncate(sample.program, 30).c_str(),
+                    sample.binaryBytes / 1024.0, sample.createMs, sample.buildMs, sample.restoreMs(),
+                    sample.kernelCount);
+        }
+    }
+
+    // The cost the engine avoids is the cold build of exactly those programs the cache
+    // could restore, which is the only fair comparison.
+    double avoided = 0.0;
+    for (const CacheRestoreSample& sample : restore.samples) {
+        if (!sample.ok) {
+            continue;
+        }
+        for (const ProgramReport& report : reports) {
+            if (report.name == sample.program && report.compiled) {
+                avoided += summarize(report.phaseTimings(Phase::kCold)).median;
+                break;
+            }
+        }
+    }
+
+    fprintf(out, "\n  restored           : %d of %d programs in %.1f ms\n", restore.restored(),
+            restore.entriesInFile, restore.totalRestoreMs());
+    if (avoided > 0.0) {
+        fprintf(out, "  compiling them     : %.1f ms\n", avoided);
+        fprintf(out, "  the cache is worth : %.1fx, %.1f ms of start up time\n",
+                ratio(avoided, restore.totalRestoreMs()), avoided - restore.totalRestoreMs());
+    }
+    for (const std::string& note : restore.notes) {
+        fprintf(out, "    %s\n", note.c_str());
+    }
+}
+
 void printVerification(FILE* out, const std::vector<ProgramReport>& reports) {
     printSection(out, "VERIFICATION OF THE BUILT PROGRAMS");
     fprintf(out, "  round trip  : clCreateProgramWithBinary + clBuildProgram on the produced binary\n");
@@ -322,9 +375,10 @@ void printKernels(FILE* out, const std::vector<ProgramReport>& reports) {
     }
 }
 
-void printSummary(FILE* out, const std::vector<ProgramReport>& reports, const RunSummary& summary) {
-    printSection(out, "SUMMARY");
+namespace {
 
+/** The totals of the source build phases; nothing to say when no program was built. */
+void printBuildTotals(FILE* out, const std::vector<ProgramReport>& reports, const RunSummary& summary) {
     std::vector<double> coldMedians;
     double coldTotal   = 0.0;
     double warmTotal   = 0.0;
@@ -386,6 +440,28 @@ void printSummary(FILE* out, const std::vector<ProgramReport>& reports, const Ru
     }
     fprintf(out, "  slowest program            : %9.1f ms\n", acrossPrograms.max);
     fprintf(out, "  median program             : %9.1f ms\n", acrossPrograms.median);
+}
+
+}  // namespace
+
+void printSummary(FILE* out, const std::vector<ProgramReport>& reports, const RunSummary& summary) {
+    printSection(out, "SUMMARY");
+
+    if (reports.empty()) {
+        fprintf(out, "  source builds              : not run\n");
+    } else {
+        printBuildTotals(out, reports, summary);
+    }
+
+    if (summary.cacheRestore.measured) {
+        fprintf(out, "\n  MNN cache file             : %d of %d programs restored in %.1f ms\n",
+                summary.cacheRestore.restored(), summary.cacheRestore.entriesInFile,
+                summary.cacheRestore.totalRestoreMs());
+        if (summary.cacheRestore.entriesRejected > 0) {
+            fprintf(out, "    rejected                 : %d, recompiled from source at runtime\n",
+                    summary.cacheRestore.entriesRejected);
+        }
+    }
 
     if (summary.execution.measured) {
         const ExecutionCheck& check = summary.execution;

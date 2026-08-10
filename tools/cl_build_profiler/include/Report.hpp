@@ -33,6 +33,7 @@ struct RunSummary {
     bool contentionRequested = false;
     ExecutionCheck execution;
     ContentionReport contention;
+    CacheRestoreReport cacheRestore;
 };
 
 namespace report {
@@ -43,6 +44,7 @@ void printConfiguration(FILE* out, const RunSummary& summary);
 void printProgramTable(FILE* out, const std::vector<ProgramReport>& reports);
 void printCallBreakdown(FILE* out, const std::vector<ProgramReport>& reports);
 void printSplitBuild(FILE* out, const std::vector<ProgramReport>& reports);
+void printCacheRestore(FILE* out, const CacheRestoreReport& restore, const std::vector<ProgramReport>& reports);
 void printVerification(FILE* out, const std::vector<ProgramReport>& reports);
 void printFailures(FILE* out, const std::vector<ProgramReport>& reports);
 void printKernels(FILE* out, const std::vector<ProgramReport>& reports);

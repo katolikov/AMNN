@@ -29,6 +29,11 @@ usage() {
     cat <<'EOF'
 usage: run_device.sh [-s <serial>] [options] [-- <profiler arguments>]
 
+With nothing but a serial it measures everything, in two passes: the first compiles
+every program from source and leaves an MNN cache file on the device, the second
+reads that file back in a fresh process, which is the warm start a real application
+gets. Passing profiler arguments after -- replaces both passes with a single run.
+
   -s, --serial <serial>   target device, required when more than one is connected
       --abi <abi>         Android ABI to build (default arm64-v8a)
       --api <level>       Android API level to build against (default 24)
@@ -42,7 +47,7 @@ usage: run_device.sh [-s <serial>] [options] [-- <profiler arguments>]
 
 Everything after -- goes to the profiler, for example:
 
-  ./run_device.sh -s R5CY71BJJ9D -- --programs 'conv_2d*' --repeat 5 --jobs 4
+  ./run_device.sh -s R5CY71BJJ9D -- --programs 'conv_2d*' --repeat 5
 
 The profiler exit code is propagated: 0 ok, 1 fatal, 2 a program failed to build,
 3 a verification check failed.
@@ -176,6 +181,51 @@ collect_device_facts() {
     } > "${target}" 2>&1 || true
 }
 
+# Runs the profiler once, streams its output to the terminal and into profile.log, and
+# returns its exit code. adb shell reports its own status, not the command's, so the
+# real one is echoed as a trailing marker line and taken back out of the stream here.
+run_profiler() {
+    local extra_args="$1"
+    local mode="${2:-truncate}"
+    local log="${OUTPUT_DIR}/profile.log"
+
+    [[ "${mode}" == "append" ]] || : > "${log}"
+
+    set +e
+    adb_run shell "cd ${REMOTE_DIR} && ./cl_build_profiler --csv ${REMOTE_DIR}/samples.csv --json ${REMOTE_DIR}/summary.json${extra_args} 2>&1; echo EXIT_STATUS=\$?" \
+        | tr -d '\r' | tee -a "${log}" | grep -v '^EXIT_STATUS='
+    set -e
+
+    local status
+    status="$(awk -F= '/^EXIT_STATUS=/ { value = $2 } END { print value }' "${log}")"
+    [[ "${status}" =~ ^[0-9]+$ ]] || status=1
+
+    # The marker belongs to the transport, not to the report.
+    sed -i.bak '/^EXIT_STATUS=/d' "${log}" && rm -f "${log}.bak"
+    return "${status}"
+}
+
+# The headline of the two pass run: the two numbers live in different passes, so
+# neither report can state it on its own.
+print_cold_versus_warm() {
+    local log="$1"
+    local cold warm
+
+    cold="$(awk '/cold build, all programs/ { print $6; exit }' "${log}")"
+    warm="$(awk '/restored .*programs in/ { print $(NF - 1); exit }' "${log}")"
+    [[ -n "${cold}" && -n "${warm}" ]] || return 0
+
+    echo
+    awk -v cold="${cold}" -v warm="${warm}" 'BEGIN {
+        printf "compiling every program from source : %8.1f ms\n", cold
+        printf "restoring them from the cache file  : %8.1f ms\n", warm
+        if (warm > 0) {
+            printf "the MNN cache file is worth         : %8.1fx, %.1f ms of start up time\n",
+                   cold / warm, cold - warm
+        }
+    }'
+}
+
 main() {
     parse_args "$@"
     resolve_device
@@ -198,20 +248,25 @@ main() {
     mkdir -p "${OUTPUT_DIR}"
     collect_device_facts "${OUTPUT_DIR}/device_info.txt"
 
-    echo "==> running on device"
-    local remote_args=""
+    local status=0
+    local warm_status=0
     if [[ ${#PROFILER_ARGS[@]} -gt 0 ]]; then
-        remote_args="$(quote_for_shell "${PROFILER_ARGS[@]}")"
-    fi
+        echo "==> running on device"
+        run_profiler "$(quote_for_shell "${PROFILER_ARGS[@]}")" || status=$?
+    else
+        # No arguments means measure everything. The first pass compiles from source
+        # and leaves a cache file behind; the second reads it back in a fresh process,
+        # which is the warm start a real application gets.
+        echo "==> pass 1 of 2: compiling every program from source"
+        run_profiler " --write-mnn-cache '${REMOTE_DIR}/mnn_cache.bin'" || status=$?
 
-    local status
-    set +e
-    adb_run shell "cd ${REMOTE_DIR} && ./cl_build_profiler --csv ${REMOTE_DIR}/samples.csv --json ${REMOTE_DIR}/summary.json${remote_args} 2>&1; echo EXIT_STATUS=\$?" \
-        | tr -d '\r' | tee "${OUTPUT_DIR}/profile.log"
-    set -e
-    status="$(awk -F= '/^EXIT_STATUS=/ { print $2 }' "${OUTPUT_DIR}/profile.log" | tail -1)"
-    [[ "${status}" =~ ^[0-9]+$ ]] || status=1
-    sed -i.bak '/^EXIT_STATUS=/d' "${OUTPUT_DIR}/profile.log" && rm -f "${OUTPUT_DIR}/profile.log.bak"
+        echo
+        echo "==> pass 2 of 2: warm start from the cache file that pass 1 wrote"
+        run_profiler " --cache-only --mnn-cache '${REMOTE_DIR}/mnn_cache.bin'" append || warm_status=$?
+        [[ "${status}" == "0" ]] && status="${warm_status}"
+        adb_run pull "${REMOTE_DIR}/mnn_cache.bin" "${OUTPUT_DIR}/mnn_cache.bin" >/dev/null 2>&1 || true
+        print_cold_versus_warm "${OUTPUT_DIR}/profile.log"
+    fi
 
     adb_run pull "${REMOTE_DIR}/samples.csv" "${OUTPUT_DIR}/samples.csv" >/dev/null 2>&1 || true
     adb_run pull "${REMOTE_DIR}/summary.json" "${OUTPUT_DIR}/summary.json" >/dev/null 2>&1 || true
