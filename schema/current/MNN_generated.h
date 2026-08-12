@@ -1435,7 +1435,7 @@ inline const char * const *EnumNamesOpParameter() {
 }
 
 inline const char *EnumNameOpParameter(OpParameter e) {
-  if (e < OpParameter_NONE || e > OpParameter_LinearAttentionParam) return "";
+  if (e < OpParameter_NONE || e > OpParameter_ShapeParam) return "";
   const size_t index = static_cast<int>(e);
   return EnumNamesOpParameter()[index];
 }
@@ -1668,10 +1668,6 @@ template<> struct OpParameterTraits<Resize> {
   static const OpParameter enum_value = OpParameter_Resize;
 };
 
-template<> struct OpParameterTraits<ShapeParam> {
-  static const OpParameter enum_value = OpParameter_ShapeParam;
-};
-
 template<> struct OpParameterTraits<RoiParameters> {
   static const OpParameter enum_value = OpParameter_RoiParameters;
 };
@@ -1846,6 +1842,10 @@ template<> struct OpParameterTraits<StftParam> {
 
 template<> struct OpParameterTraits<LinearAttentionParam> {
   static const OpParameter enum_value = OpParameter_LinearAttentionParam;
+};
+
+template<> struct OpParameterTraits<ShapeParam> {
+  static const OpParameter enum_value = OpParameter_ShapeParam;
 };
 
 struct OpParameterUnion {
@@ -2327,14 +2327,6 @@ struct OpParameterUnion {
     return type == OpParameter_Resize ?
       reinterpret_cast<const ResizeT *>(value) : nullptr;
   }
-  ShapeParamT *AsShapeParam() {
-    return type == OpParameter_ShapeParam ?
-      reinterpret_cast<ShapeParamT *>(value) : nullptr;
-  }
-  const ShapeParamT *AsShapeParam() const {
-    return type == OpParameter_ShapeParam ?
-      reinterpret_cast<const ShapeParamT *>(value) : nullptr;
-  }
   RoiParametersT *AsRoiParameters() {
     return type == OpParameter_RoiParameters ?
       reinterpret_cast<RoiParametersT *>(value) : nullptr;
@@ -2686,6 +2678,14 @@ struct OpParameterUnion {
   const LinearAttentionParamT *AsLinearAttentionParam() const {
     return type == OpParameter_LinearAttentionParam ?
       reinterpret_cast<const LinearAttentionParamT *>(value) : nullptr;
+  }
+  ShapeParamT *AsShapeParam() {
+    return type == OpParameter_ShapeParam ?
+      reinterpret_cast<ShapeParamT *>(value) : nullptr;
+  }
+  const ShapeParamT *AsShapeParam() const {
+    return type == OpParameter_ShapeParam ?
+      reinterpret_cast<const ShapeParamT *>(value) : nullptr;
   }
 };
 
@@ -4080,9 +4080,6 @@ struct Op FLATBUFFERS_FINAL_CLASS : private flatbuffers::Table {
   const Resize *main_as_Resize() const {
     return main_type() == OpParameter_Resize ? static_cast<const Resize *>(main()) : nullptr;
   }
-  const ShapeParam *main_as_ShapeParam() const {
-    return main_type() == OpParameter_ShapeParam ? static_cast<const ShapeParam *>(main()) : nullptr;
-  }
   const RoiParameters *main_as_RoiParameters() const {
     return main_type() == OpParameter_RoiParameters ? static_cast<const RoiParameters *>(main()) : nullptr;
   }
@@ -4214,6 +4211,9 @@ struct Op FLATBUFFERS_FINAL_CLASS : private flatbuffers::Table {
   }
   const LinearAttentionParam *main_as_LinearAttentionParam() const {
     return main_type() == OpParameter_LinearAttentionParam ? static_cast<const LinearAttentionParam *>(main()) : nullptr;
+  }
+  const ShapeParam *main_as_ShapeParam() const {
+    return main_type() == OpParameter_ShapeParam ? static_cast<const ShapeParam *>(main()) : nullptr;
   }
   const flatbuffers::String *name() const {
     return GetPointer<const flatbuffers::String *>(10);
@@ -4476,10 +4476,6 @@ template<> inline const Resize *Op::main_as<Resize>() const {
   return main_as_Resize();
 }
 
-template<> inline const ShapeParam *Op::main_as<ShapeParam>() const {
-  return main_as_ShapeParam();
-}
-
 template<> inline const RoiParameters *Op::main_as<RoiParameters>() const {
   return main_as_RoiParameters();
 }
@@ -4654,6 +4650,10 @@ template<> inline const StftParam *Op::main_as<StftParam>() const {
 
 template<> inline const LinearAttentionParam *Op::main_as<LinearAttentionParam>() const {
   return main_as_LinearAttentionParam();
+}
+
+template<> inline const ShapeParam *Op::main_as<ShapeParam>() const {
+  return main_as_ShapeParam();
 }
 
 struct OpBuilder {
@@ -6319,10 +6319,6 @@ inline bool VerifyOpParameter(flatbuffers::Verifier &verifier, const void *obj, 
       auto ptr = reinterpret_cast<const Resize *>(obj);
       return verifier.VerifyTable(ptr);
     }
-    case OpParameter_ShapeParam: {
-      auto ptr = reinterpret_cast<const ShapeParam *>(obj);
-      return verifier.VerifyTable(ptr);
-    }
     case OpParameter_RoiParameters: {
       auto ptr = reinterpret_cast<const RoiParameters *>(obj);
       return verifier.VerifyTable(ptr);
@@ -6497,6 +6493,10 @@ inline bool VerifyOpParameter(flatbuffers::Verifier &verifier, const void *obj, 
     }
     case OpParameter_LinearAttentionParam: {
       auto ptr = reinterpret_cast<const LinearAttentionParam *>(obj);
+      return verifier.VerifyTable(ptr);
+    }
+    case OpParameter_ShapeParam: {
+      auto ptr = reinterpret_cast<const ShapeParam *>(obj);
       return verifier.VerifyTable(ptr);
     }
     default: return false;
@@ -6741,10 +6741,6 @@ inline void *OpParameterUnion::UnPack(const void *obj, OpParameter type, const f
       auto ptr = reinterpret_cast<const Resize *>(obj);
       return ptr->UnPack(resolver);
     }
-    case OpParameter_ShapeParam: {
-      auto ptr = reinterpret_cast<const ShapeParam *>(obj);
-      return ptr->UnPack(resolver);
-    }
     case OpParameter_RoiParameters: {
       auto ptr = reinterpret_cast<const RoiParameters *>(obj);
       return ptr->UnPack(resolver);
@@ -6919,6 +6915,10 @@ inline void *OpParameterUnion::UnPack(const void *obj, OpParameter type, const f
     }
     case OpParameter_LinearAttentionParam: {
       auto ptr = reinterpret_cast<const LinearAttentionParam *>(obj);
+      return ptr->UnPack(resolver);
+    }
+    case OpParameter_ShapeParam: {
+      auto ptr = reinterpret_cast<const ShapeParam *>(obj);
       return ptr->UnPack(resolver);
     }
     default: return nullptr;
@@ -7151,10 +7151,6 @@ inline flatbuffers::Offset<void> OpParameterUnion::Pack(flatbuffers::FlatBufferB
       auto ptr = reinterpret_cast<const ResizeT *>(value);
       return CreateResize(_fbb, ptr, _rehasher).Union();
     }
-    case OpParameter_ShapeParam: {
-      auto ptr = reinterpret_cast<const ShapeParamT *>(value);
-      return CreateShapeParam(_fbb, ptr, _rehasher).Union();
-    }
     case OpParameter_RoiParameters: {
       auto ptr = reinterpret_cast<const RoiParametersT *>(value);
       return CreateRoiParameters(_fbb, ptr, _rehasher).Union();
@@ -7330,6 +7326,10 @@ inline flatbuffers::Offset<void> OpParameterUnion::Pack(flatbuffers::FlatBufferB
     case OpParameter_LinearAttentionParam: {
       auto ptr = reinterpret_cast<const LinearAttentionParamT *>(value);
       return CreateLinearAttentionParam(_fbb, ptr, _rehasher).Union();
+    }
+    case OpParameter_ShapeParam: {
+      auto ptr = reinterpret_cast<const ShapeParamT *>(value);
+      return CreateShapeParam(_fbb, ptr, _rehasher).Union();
     }
     default: return 0;
   }
@@ -7561,10 +7561,6 @@ inline OpParameterUnion::OpParameterUnion(const OpParameterUnion &u) FLATBUFFERS
       value = new ResizeT(*reinterpret_cast<ResizeT *>(u.value));
       break;
     }
-    case OpParameter_ShapeParam: {
-      value = new ShapeParamT(*reinterpret_cast<ShapeParamT *>(u.value));
-      break;
-    }
     case OpParameter_RoiParameters: {
       value = new RoiParametersT(*reinterpret_cast<RoiParametersT *>(u.value));
       break;
@@ -7739,6 +7735,10 @@ inline OpParameterUnion::OpParameterUnion(const OpParameterUnion &u) FLATBUFFERS
     }
     case OpParameter_LinearAttentionParam: {
       value = new LinearAttentionParamT(*reinterpret_cast<LinearAttentionParamT *>(u.value));
+      break;
+    }
+    case OpParameter_ShapeParam: {
+      value = new ShapeParamT(*reinterpret_cast<ShapeParamT *>(u.value));
       break;
     }
     default:
@@ -8028,11 +8028,6 @@ inline void OpParameterUnion::Reset() {
       delete ptr;
       break;
     }
-    case OpParameter_ShapeParam: {
-      auto ptr = reinterpret_cast<ShapeParamT *>(value);
-      delete ptr;
-      break;
-    }
     case OpParameter_RoiParameters: {
       auto ptr = reinterpret_cast<RoiParametersT *>(value);
       delete ptr;
@@ -8250,6 +8245,11 @@ inline void OpParameterUnion::Reset() {
     }
     case OpParameter_LinearAttentionParam: {
       auto ptr = reinterpret_cast<LinearAttentionParamT *>(value);
+      delete ptr;
+      break;
+    }
+    case OpParameter_ShapeParam: {
+      auto ptr = reinterpret_cast<ShapeParamT *>(value);
       delete ptr;
       break;
     }

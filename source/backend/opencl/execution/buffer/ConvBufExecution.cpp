@@ -8,6 +8,7 @@
 
 #ifndef MNN_OPENCL_BUFFER_CLOSED
 
+#include <cstdlib>
 #include "ConvBufExecution.hpp"
 #include "ConvBufWinograd.hpp"
 #include "ConvSubgroupBufExecution.hpp"
@@ -106,9 +107,19 @@ ConvBufCommonExecution::ConvBufCommonExecution(const Op *op, Backend *backend, b
         openclBackend->getOpenCLRuntime()->commandQueue().enqueueUnmapMemObject(biasBuffer, biasPtrCL);
     }
 
+    const float *slopeDataPtr = nullptr;
     if(isExtra){
         const PRelu* preluParam = flatbuffers::GetRoot<PRelu>(op->main_as_Extra()->attr()->GetAs<Attribute>(1)->tensor()->uint8s()->data());
-        const float *slopeDataPtr = preluParam->slope()->data();
+        slopeDataPtr = preluParam->slope()->data();
+    } else if(conv2dParams->common()->leakyReluSlope() != nullptr &&
+              conv2dParams->common()->leakyReluSlope()->size() >= (size_t)biasSize){
+        // Fused per-channel PReLU carried directly on the conv (MergePReluToConvolution /
+        // Convolution2DCommon.leakyReluSlope). Reuses the same mPrelu/mSlope path as the
+        // internal ExtraConvolution2DPrelu op; covers every non-winograd buffer conv.
+        slopeDataPtr = conv2dParams->common()->leakyReluSlope()->data();
+    }
+    if(slopeDataPtr != nullptr){
+        mResource->mPrelu = true;
         mResource->mSlope.reset(Tensor::createDevice<float>({1, 1, 1, ROUND_UP(biasSize, 32)}));
         if (!(backend->onAcquireBuffer(mResource->mSlope.get(), Backend::STATIC))) {
             mConvComValid = false;
@@ -351,6 +362,21 @@ ErrorCode ConvBufExecution::onResize(const std::vector<Tensor *> &inputs, const 
 #ifdef LOG_VERBOSE
     MNN_PRINT("Start ConvExecution onResize !\n");
 #endif
+    if(nullptr != getenv("MNN_SUBGROUP_PROBE")){
+        static bool probed = false;
+        if(!probed){
+            probed = true;
+            auto rt = mOpenCLBackend->getOpenCLRuntime();
+            MNN_PRINT("[SGPROBE] building broadcast kernel...\n");
+            { std::set<std::string> bo; bo.emplace("-DSUBGROUP_PROBE_BCAST");
+              auto k = rt->buildKernel("conv_2d_buf", "subgroup_probe_bcast", bo, mOpenCLBackend->getPrecision());
+              MNN_PRINT("[SGPROBE] broadcast build: %s\n", (k.get()!=nullptr && k->get().get()!=nullptr) ? "OK" : "FAIL"); }
+            MNN_PRINT("[SGPROBE] building shuffle kernel...\n");
+            { std::set<std::string> bo; bo.emplace("-DSUBGROUP_PROBE_SHUFFLE");
+              auto k = rt->buildKernel("conv_2d_buf", "subgroup_probe_shuffle", bo, mOpenCLBackend->getPrecision());
+              MNN_PRINT("[SGPROBE] shuffle build: %s\n", (k.get()!=nullptr && k->get().get()!=nullptr) ? "OK" : "FAIL"); }
+        }
+    }
     mKernel.resize(1);
     auto input  = inputs[0];
     auto output = outputs[0];
@@ -637,6 +663,106 @@ ErrorCode ConvBufExecution::onResize(const std::vector<Tensor *> &inputs, const 
             MNN_CHECK_CL_SUCCESS(ret, "setArg Conv1x1Buf");
         }
     } else {
+        int TILE_W_LDS = 16, TILE_H_LDS = 4;
+        { const char* _t = getenv("MNN_LDS_TILE"); if(_t){ std::string _s(_t); auto _x=_s.find('x'); if(_x!=std::string::npos){ TILE_W_LDS=atoi(_s.substr(0,_x).c_str()); TILE_H_LDS=atoi(_s.substr(_x+1).c_str()); } } }
+        bool useLDS = (nullptr != getenv("MNN_CONV_LDS"))
+            && mResource->mKernelHeight == 3 && mResource->mKernelWidth == 3
+            && mResource->mStrides[0] == 1 && mResource->mStrides[1] == 1
+            && mResource->mDilations[0] == 1 && mResource->mDilations[1] == 1
+            && mPaddings[0] == 1 && mPaddings[1] == 1
+            && (width % TILE_W_LDS == 0) && (height % TILE_H_LDS == 0);
+        bool useIm2col = (nullptr != getenv("MNN_CONV_IM2COL"))
+            && mResource->mKernelHeight == 3 && mResource->mKernelWidth == 3
+            && mResource->mStrides[0] == 1 && mResource->mStrides[1] == 1
+            && mResource->mDilations[0] == 1 && mResource->mDilations[1] == 1
+            && mPaddings[0] == 1 && mPaddings[1] == 1
+            && (outChannel == inputChannels * 9);
+        bool useFused2 = (nullptr != getenv("MNN_CONV_FUSED2"))
+            && mResource->mKernelHeight == 3 && mResource->mKernelWidth == 3
+            && mResource->mStrides[0] == 1 && mResource->mStrides[1] == 1
+            && mResource->mDilations[0] == 1 && mResource->mDilations[1] == 1
+            && mPaddings[0] == 1 && mPaddings[1] == 1
+            && (inputChannels == outChannel)
+            && (width % 6 == 0) && (height % 6 == 0);
+        if (useFused2) {
+            int inShape[2] = {inputHeight, inputWidth};
+            int cblk = UP_DIV(outChannel, 4);
+            std::set<std::string> buildOption = mResource->mBuildOptions;
+            buildOption.emplace("-DC_BLK=" + std::to_string(cblk));
+            mKernel.resize(1);
+            mKernel[0] = mOpenCLBackend->getOpenCLRuntime()->buildKernel("conv_2d_buf", "conv_2d_3x3s1_fused2", buildOption, mOpenCLBackend->getPrecision());
+            mGlobalWorkSize = {(uint32_t)width, (uint32_t)(batch * height)};
+            mLocalWorkSize  = {6, 6};
+            uint32_t idx = 0; cl_int ret = CL_SUCCESS;
+            ret |= mKernel[0]->get().setArg(idx++, mGlobalWorkSize[0]);
+            ret |= mKernel[0]->get().setArg(idx++, mGlobalWorkSize[1]);
+            ret |= mKernel[0]->get().setArg(idx++, openCLBuffer(input));
+            ret |= mKernel[0]->get().setArg(idx++, openCLBuffer(mResource->mFilter.get()));
+            ret |= mKernel[0]->get().setArg(idx++, openCLBuffer(mResource->mBias.get()));
+            ret |= mKernel[0]->get().setArg(idx++, openCLBuffer(output));
+            ret |= mKernel[0]->get().setArg(idx++, sizeof(inShape), inShape);
+            ret |= mKernel[0]->get().setArg(idx++, cblk);
+            ret |= mKernel[0]->get().setArg(idx++, batch);
+            MNN_CHECK_CL_SUCCESS(ret, "setArg fused2");
+        } else if (useIm2col) {
+            int inShape[2] = {inputHeight, inputWidth};
+            std::set<std::string> buildOption = mResource->mBuildOptions;
+            mKernel.resize(1);
+            mKernel[0] = mOpenCLBackend->getOpenCLRuntime()->buildKernel("conv_2d_buf", "im2col_3x3s1", buildOption, mOpenCLBackend->getPrecision());
+            mGlobalWorkSize = {(uint32_t)(UP_DIV(outChannel, 4) * width), (uint32_t)(batch * height)};
+            mLocalWorkSize  = {16, 4};
+            uint32_t idx = 0; cl_int ret = CL_SUCCESS;
+            ret |= mKernel[0]->get().setArg(idx++, mGlobalWorkSize[0]);
+            ret |= mKernel[0]->get().setArg(idx++, mGlobalWorkSize[1]);
+            ret |= mKernel[0]->get().setArg(idx++, openCLBuffer(input));
+            ret |= mKernel[0]->get().setArg(idx++, openCLBuffer(output));
+            ret |= mKernel[0]->get().setArg(idx++, sizeof(inShape), inShape);
+            ret |= mKernel[0]->get().setArg(idx++, inputChannelBlocks);
+            ret |= mKernel[0]->get().setArg(idx++, batch);
+            ret |= mKernel[0]->get().setArg(idx++, width);
+            MNN_CHECK_CL_SUCCESS(ret, "setArg im2col");
+        } else if (useLDS) {
+            int inputImageShape[2]  = {inputHeight, inputWidth};
+            int outputImageShape[2] = {height, width};
+            int kernelShape[2]      = {3, 3};
+            int strideShape[2]      = {1, 1};
+            int paddingShape[2]     = {mPaddings[0], mPaddings[1]};
+            int dilationShape[2]    = {1, 1};
+            int outChannelBlocks    = UP_DIV(outChannel, 4);
+            std::set<std::string> buildOption = mResource->mBuildOptions;
+            buildOption.emplace("-DTILE_W=" + std::to_string(TILE_W_LDS));
+            buildOption.emplace("-DTILE_H=" + std::to_string(TILE_H_LDS));
+            mKernel.resize(1);
+            mKernel[0] = mOpenCLBackend->getOpenCLRuntime()->buildKernel("conv_2d_buf", "conv_2d_3x3s1_lds", buildOption, mOpenCLBackend->getPrecision());
+            mGlobalWorkSize = {(uint32_t)(outChannelBlocks * width), (uint32_t)(batch * height)};
+            mLocalWorkSize  = {(uint32_t)TILE_W_LDS, (uint32_t)TILE_H_LDS};
+            uint32_t idx = 0;
+            cl_int ret = CL_SUCCESS;
+            ret |= mKernel[0]->get().setArg(idx++, mGlobalWorkSize[0]);
+            ret |= mKernel[0]->get().setArg(idx++, mGlobalWorkSize[1]);
+            ret |= mKernel[0]->get().setArg(idx++, openCLBuffer(input));
+            ret |= mKernel[0]->get().setArg(idx++, openCLBuffer(mResource->mFilter.get()));
+            ret |= mKernel[0]->get().setArg(idx++, openCLBuffer(mResource->mBias.get()));
+            ret |= mKernel[0]->get().setArg(idx++, openCLBuffer(output));
+            ret |= mKernel[0]->get().setArg(idx++, sizeof(inputImageShape), inputImageShape);
+            ret |= mKernel[0]->get().setArg(idx++, inputChannels);
+            ret |= mKernel[0]->get().setArg(idx++, inputChannelBlocks);
+            ret |= mKernel[0]->get().setArg(idx++, batch);
+            ret |= mKernel[0]->get().setArg(idx++, sizeof(outputImageShape), outputImageShape);
+            ret |= mKernel[0]->get().setArg(idx++, sizeof(kernelShape), kernelShape);
+            ret |= mKernel[0]->get().setArg(idx++, sizeof(strideShape), strideShape);
+            ret |= mKernel[0]->get().setArg(idx++, sizeof(paddingShape), paddingShape);
+            ret |= mKernel[0]->get().setArg(idx++, sizeof(dilationShape), dilationShape);
+            ret |= mKernel[0]->get().setArg(idx++, UP_DIV(width, 1));
+            ret |= mKernel[0]->get().setArg(idx++, outChannelBlocks);
+            ret |= mKernel[0]->get().setArg(idx++, UP_DIV(height, 1));
+            int outChannelBase = 0;
+            ret |= mKernel[0]->get().setArg(idx++, outChannelBase);
+            if (mResource->mPrelu) {
+                ret |= mKernel[0]->get().setArg(idx++, openCLBuffer(mResource->mSlope.get()));
+            }
+            MNN_CHECK_CL_SUCCESS(ret, "setArg ConvBuf LDS");
+        } else {
         int inputImageShape[2]  = {inputHeight, inputWidth};
         int outputImageShape[2] = {height, width};
         int kernelShape[2]      = {mResource->mKernelHeight, mResource->mKernelWidth};
@@ -645,11 +771,25 @@ ErrorCode ConvBufExecution::onResize(const std::vector<Tensor *> &inputs, const 
         int dilationShape[2]    = {mResource->mDilations[0], mResource->mDilations[1]};
 
         // {"conv_2d_c4h1w2", "conv_2d_c4h1w1", "conv_2d_c8h1w1", "conv_2d_c4h1w4", "conv_2d_c8h2w1", "conv_2d_c4h4w1"};
-        const int total_kernel = 7;
-        std::string kernelName[total_kernel] = {"conv_2d_c4h1w1", "conv_2d_c4h1w2", "conv_2d_c4h4w1",  "conv_2d_c4h1w4", "conv_2d_c8h2w1", "conv_2d_c8h4w1", "conv_2d_c8h1w4"};
-        int itemC[total_kernel] = {4, 4, 4, 4, 8, 8, 8};
-        int itemH[total_kernel] = {1, 1, 4, 1, 2, 4, 1};
-        int itemW[total_kernel] = {1, 2, 1, 4, 1, 1, 4};
+        std::vector<std::string> kernelName = {"conv_2d_c4h1w1", "conv_2d_c4h1w2", "conv_2d_c4h4w1",  "conv_2d_c4h1w4", "conv_2d_c8h2w1", "conv_2d_c8h4w1", "conv_2d_c8h1w4"};
+        std::vector<int> itemC = {4, 4, 4, 4, 8, 8, 8};
+        std::vector<int> itemH = {1, 1, 4, 1, 2, 4, 1};
+        std::vector<int> itemW = {1, 2, 1, 4, 1, 1, 4};
+        if(nullptr != getenv("MNN_CONV_SPEC")){
+            kernelName.push_back("conv_2d_c8h8w1"); itemC.push_back(8); itemH.push_back(8); itemW.push_back(1);
+            kernelName.push_back("conv_2d_c8h4w1_pa"); itemC.push_back(8); itemH.push_back(4); itemW.push_back(1);
+        }
+        // MNN_CONV_FORCE=<kernelName>: restrict the candidate set to one kernel (clean per-kernel measurement)
+        const char* forceKnl = getenv("MNN_CONV_FORCE");
+        if(forceKnl != nullptr){
+            for(int i = 0; i < (int)kernelName.size(); ++i){
+                if(kernelName[i] == std::string(forceKnl)){
+                    kernelName = {kernelName[i]}; itemC = {itemC[i]}; itemH = {itemH[i]}; itemW = {itemW[i]};
+                    break;
+                }
+            }
+        }
+        const int total_kernel = (int)kernelName.size();
 
         int actual_kernel = total_kernel;
         int outChannelBlocks = UP_DIV(outChannel, 4);
@@ -669,12 +809,15 @@ ErrorCode ConvBufExecution::onResize(const std::vector<Tensor *> &inputs, const 
 
         mKernel.resize(conv_block_num);
         
-        std::shared_ptr<KernelWrap> kernel[total_kernel];
-        std::vector<uint32_t> globalWorkSize[total_kernel];
-        std::vector<uint32_t> localWorkSize[total_kernel];
+        std::vector<std::shared_ptr<KernelWrap>> kernel(total_kernel);
+        std::vector<std::vector<uint32_t>> globalWorkSize(total_kernel);
+        std::vector<std::vector<uint32_t>> localWorkSize(total_kernel);
         std::pair<int, int> min_cost(INT_MAX, 0);//(min_time, min_index)
         for(int knl_idx = 0; knl_idx < actual_kernel; knl_idx++) {
             std::set<std::string> buildOption = mResource->mBuildOptions;
+            if(nullptr != getenv("MNN_CONV_SPEC")){
+                buildOption.emplace("-DCONV_SPEC_UNROLL");
+            }
             if(outputShape.at(3) % itemC[knl_idx] != 0){
                 buildOption.emplace("-DCHANNEL_BOUNDARY_PROTECT");
             }
@@ -724,9 +867,15 @@ ErrorCode ConvBufExecution::onResize(const std::vector<Tensor *> &inputs, const 
             }
         }
         int min_index  = min_cost.second;
+        if(nullptr != getenv("MNN_CONV_SPEC")){
+            MNN_PRINT("[CONV_SPEC] ci%d co%d %dx%d k%dx%d -> winner=%s (%d us)\n", inputChannels, outChannel, height, width, kernelShape[0], kernelShape[1], kernelName[min_index].c_str(), min_cost.first);
+        }
         mGlobalWorkSize = {globalWorkSize[min_index][0], globalWorkSize[min_index][1]};
 
         std::set<std::string> buildOption = mResource->mBuildOptions;
+        if(nullptr != getenv("MNN_CONV_SPEC")){
+            buildOption.emplace("-DCONV_SPEC_UNROLL");
+        }
         if(outputShape.at(3) % itemC[min_index] != 0){
             buildOption.emplace("-DCHANNEL_BOUNDARY_PROTECT");
         }
@@ -764,6 +913,7 @@ ErrorCode ConvBufExecution::onResize(const std::vector<Tensor *> &inputs, const 
                 ret |= mKernel[kernel_idx]->get().setArg(idx++, openCLBuffer(mResource->mSlope.get()));
             }
             MNN_CHECK_CL_SUCCESS(ret, "setArg ConvBuf");
+        }
         }
     }
     if (inputs.size() > 1) {
@@ -947,7 +1097,7 @@ public:
         }
 #endif
 
-        if (ConvBufWinograd::valid(conv2D->common(), inputs[0], outputs[0], static_cast<OpenCLBackend *>(backend)->getOpenCLRuntime()->getGpuType() == INTEL)) {
+        if (nullptr == getenv("MNN_NO_WINOGRAD") && ConvBufWinograd::valid(conv2D->common(), inputs[0], outputs[0], static_cast<OpenCLBackend *>(backend)->getOpenCLRuntime()->getGpuType() == INTEL)) {
 #ifdef MNN_SUPPORT_INTEL_SUBGROUP
             if(static_cast<OpenCLBackend *>(backend)->getOpenCLRuntime()->isSupportedIntelSubgroup()){
                 std::vector<int> inputShape = tensorShapeFormat(input);

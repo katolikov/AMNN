@@ -24,6 +24,11 @@ table Convolution2DCommon {
     pads:[int];
     outPads:[int];
     hasOutputShape:bool = false;
+    // Optional fused per-channel PReLU (LeakyReLU) slopes, length = outputCount.
+    // Empty => no PReLU fusion. Populated by the MergePReluToConvolution post-pass
+    // (opt-in via env MNN_FUSE_CONV_PRELU). Backends that do not read this MUST NOT
+    // have the pass enabled, or output will be wrong (see PostConverter.cpp).
+    leakyReluSlope:[float];
 }
 
 table Convolution3DCommon {

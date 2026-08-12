@@ -203,7 +203,31 @@ ConvBufWinograd::ConvBufWinograd(const MNN::Op* op, Backend* backend) : CommonEx
             }
             queue.enqueueUnmapMemObject(bias_buffer, bias_ptr);
         }
-        
+
+        // Optional fused per-channel PReLU slopes (mirrors the bias buffer layout).
+        auto slopeVec = mResource->mCommon->leakyReluSlope();
+        mResource->mHasPRelu = (slopeVec != nullptr && slopeVec->size() >= (size_t)mCo);
+        if (mResource->mHasPRelu) {
+            mResource->mSlope.reset(Tensor::createDevice<float>({1, 1, 1, (int)ALIGN_UP4(mCo)}));
+            mOpenCLBackend->onAcquireBuffer(mResource->mSlope.get(), Backend::STATIC);
+            if(mOpenCLBackend->getRuntime()->hint().useCachedMmap <= 1){
+                cl::Buffer &slope_buffer = *(cl::Buffer *)mResource->mSlope->buffer().device;
+                auto slope_ptr = queue.enqueueMapBuffer(slope_buffer, CL_TRUE, CL_MAP_WRITE, 0, buffer_size, nullptr, nullptr, &ret_code);
+                if(slope_ptr == nullptr || ret_code) {
+                    MNN_ERROR("clBuffer map error!\n");
+                }
+                ::memset(slope_ptr, 0, buffer_size);
+                if(mOpenCLBackend->getPrecision() != BackendConfig::Precision_High) {
+                    for(int i=0; i<mCo; i++) {
+                        ((half_float::half *)slope_ptr)[i] = (half_float::half)slopeVec->data()[i];
+                    }
+                } else {
+                    ::memcpy(slope_ptr, slopeVec->data(), mCo*sizeof(float));
+                }
+                queue.enqueueUnmapMemObject(slope_buffer, slope_ptr);
+            }
+        }
+
         int unit       = UNIT;
         int kernelSize = kx;
         int alpha       = unit + kernelSize - 1;
@@ -539,6 +563,9 @@ ErrorCode ConvBufWinograd::onEncode(const std::vector<Tensor*>& inputs, const st
                 if (mResource->mCommon->relu6()) {
                     buildOptions.emplace("-DRELU6");
                 }
+                if (mResource->mHasPRelu) {
+                    buildOptions.emplace("-DPRELU");
+                }
                 mUnits[b * loop_num + loop_num-1].kernel = runTime->buildKernel("winogradTransform_buf", "winoTransDstBuf" + formatStr, buildOptions, mOpenCLBackend->getPrecision());
             }
         }
@@ -668,6 +695,9 @@ ErrorCode ConvBufWinograd::onEncode(const std::vector<Tensor*>& inputs, const st
                 ret |= mUnits[kernel_idx].kernel->get().setArg(index++, gws_D[1]);
                 ret |= mUnits[kernel_idx].kernel->get().setArg(index++, openCLBuffer(mDest.get()));
                 ret |= mUnits[kernel_idx].kernel->get().setArg(index++, openCLBuffer(mResource->mBias.get()));
+                if (mResource->mHasPRelu) {
+                    ret |= mUnits[kernel_idx].kernel->get().setArg(index++, openCLBuffer(mResource->mSlope.get()));
+                }
                 ret |= mUnits[kernel_idx].kernel->get().setArg(index++, openCLBuffer(output));
                 ret |= mUnits[kernel_idx].kernel->get().setArg(index++, wCount);
                 ret |= mUnits[kernel_idx].kernel->get().setArg(index++, hCount);

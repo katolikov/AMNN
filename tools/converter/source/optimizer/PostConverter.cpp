@@ -357,6 +357,11 @@ std::unique_ptr<MNN::NetT> optimizeNetImpl(std::unique_ptr<MNN::NetT>& originNet
         "MergeReluToBinaryOp",
 
     };
+    // Opt-in fusion of per-channel PReLU into convs (OpenCL buffer fp16).
+    // Off by default because not all backends read Convolution2DCommon.leakyReluSlope.
+    if (nullptr != getenv("MNN_FUSE_CONV_PRELU")) {
+        afterProgramConvert.emplace_back("MergePReluToConvolution");
+    }
     if (ctx->is_training) {
         std::vector<std::string>::iterator iter = afterProgramConvert.begin();
         while (iter != afterProgramConvert.end()) {

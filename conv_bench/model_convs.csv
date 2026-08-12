@@ -1,0 +1,56 @@
+# MNN conv-specialization — fill ONE ROW PER CONV, in EXECUTION ORDER.
+#
+# Fixed for every conv (so they are NOT columns): kernel = 3x3, group = 1,
+# dilation = 1, batch = 1. Only what varies per conv is below.
+#
+# Column meanings:
+#   idx        execution order, starting at 1
+#   label      your own name for the conv (optional) e.g. "stem", "blockB_conv3"
+#   cin        input channels
+#   cout       output channels
+#   H          INPUT height to this conv (rows)   -- output H is derived from stride
+#   W          INPUT width  to this conv (cols)   -- output W is derived from stride
+#   stride     1 or 2
+#   pad        zero-padding on each side (3x3 "same" is usually 1; "valid" is 0)
+#   has_prelu  1 if this conv is immediately followed by per-channel PReLU, else 0
+#   input_from idx of the conv whose OUTPUT feeds this conv's input.
+#              Use "input" for the model's raw input (the Y-plane stem).
+#              If the input is a residual-add or concat of two sources, list both,
+#              e.g. "5+8"  (this is what lets me find fusable consecutive runs
+#              and place the 2 blocks of 6 no-PReLU convs).
+#   notes      anything else: residual add, concat, this output is also consumed
+#              later by conv N, branch point, network output, etc.
+#
+# The idx=1 row below is the known Y-plane stem, pre-filled as an example —
+# correct it if wrong, then continue. Add as many rows as needed.
+idx,label,cin,cout,H,W,stride,pad,has_prelu,input_from,notes
+1,stem,1,8,576,768,2,1,1,input,Y-plane single-channel input
+2,,,,,,,,,,
+3,,,,,,,,,,
+4,,,,,,,,,,
+5,,,,,,,,,,
+6,,,,,,,,,,
+7,,,,,,,,,,
+8,,,,,,,,,,
+9,,,,,,,,,,
+10,,,,,,,,,,
+11,,,,,,,,,,
+12,,,,,,,,,,
+13,,,,,,,,,,
+14,,,,,,,,,,
+15,,,,,,,,,,
+16,,,,,,,,,,
+17,,,,,,,,,,
+18,,,,,,,,,,
+19,,,,,,,,,,
+20,,,,,,,,,,
+21,,,,,,,,,,
+22,,,,,,,,,,
+23,,,,,,,,,,
+24,,,,,,,,,,
+25,,,,,,,,,,
+26,,,,,,,,,,
+27,,,,,,,,,,
+28,,,,,,,,,,
+29,,,,,,,,,,
+30,,,,,,,,,,

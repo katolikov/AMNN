@@ -22,6 +22,8 @@ struct ConvBufWinoResource {
     bool mUseSubgroup{false};
     std::shared_ptr<Tensor> mWeight;
     std::shared_ptr<Tensor> mBias;
+    std::shared_ptr<Tensor> mSlope;   // fused per-channel PReLU slopes (empty => none)
+    bool mHasPRelu{false};
     int mAlignN;
     int mAlignK;
 };

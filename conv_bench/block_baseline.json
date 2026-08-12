@@ -1,0 +1,27 @@
+{
+  "Block1": {
+    "name": "Block1",
+    "total_kernel_us_med": 1405,
+    "per_kernel_us": {
+      "Raster0": 143,
+      "Raster1": 329,
+      "ConvBuf2D-ori-b1ci18hi288wi384co16ho144wo192kh3kw3-total:71.663616*10^6": 148,
+      "ConvBuf2D-ori-b1ci16hi144wi192co32ho72wo96kh3kw3-total:31.850496*10^6": 66,
+      "ConvBuf2D-ori-b1ci32hi72wi96co32ho72wo96kh3kw3-total:63.700992*10^6": 719,
+      "ConvBuf2D-ori-b1ci32hi72wi96co32ho72wo96khWARN:": 121
+    },
+    "total_macs": 485720064
+  },
+  "Block2": {
+    "name": "Block2",
+    "total_kernel_us_med": 1054,
+    "per_kernel_us": {
+      "Raster0": 74,
+      "Raster1": 154,
+      "ConvBuf2D-ori-b1ci34hi144wi192co32ho72wo96kh3kw3-total:67.682304*10^6": 139,
+      "ConvBuf2D-ori-b1ci32hi72wi96co48ho36wo48kh3kw3-total:23.887872*10^6": 80,
+      "ConvBuf2D-ori-b1ci48hi36wi48co48ho36wo48kh3kw3-total:35.831808*10^6": 607
+    },
+    "total_macs": 306561024
+  }
+}

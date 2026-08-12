@@ -202,6 +202,22 @@ OpenCLRuntime::OpenCLRuntime(int platformSize, int platformId, int deviceId, voi
             context_properties.push_back(0x1000);
             #endif
             std::string deviceextensions = mFirstGPUDevicePtr.get()->getInfo<CL_DEVICE_EXTENSIONS>();
+            if(nullptr != getenv("MNN_DUMP_CL_EXT")){
+                auto& _d = *(mFirstGPUDevicePtr.get());
+                MNN_PRINT("[HWINFO] name=%s\n", _d.getInfo<CL_DEVICE_NAME>().c_str());
+                MNN_PRINT("[HWINFO] vendor=%s\n", _d.getInfo<CL_DEVICE_VENDOR>().c_str());
+                MNN_PRINT("[HWINFO] device_version=%s\n", _d.getInfo<CL_DEVICE_VERSION>().c_str());
+                MNN_PRINT("[HWINFO] driver_version=%s\n", _d.getInfo<CL_DRIVER_VERSION>().c_str());
+                MNN_PRINT("[HWINFO] max_compute_units=%u\n", (unsigned)_d.getInfo<CL_DEVICE_MAX_COMPUTE_UNITS>());
+                MNN_PRINT("[HWINFO] max_clock_mhz=%u\n", (unsigned)_d.getInfo<CL_DEVICE_MAX_CLOCK_FREQUENCY>());
+                MNN_PRINT("[HWINFO] max_work_group_size=%zu\n", (size_t)_d.getInfo<CL_DEVICE_MAX_WORK_GROUP_SIZE>());
+                MNN_PRINT("[HWINFO] local_mem_bytes=%llu\n", (unsigned long long)_d.getInfo<CL_DEVICE_LOCAL_MEM_SIZE>());
+                MNN_PRINT("[HWINFO] global_mem_bytes=%llu\n", (unsigned long long)_d.getInfo<CL_DEVICE_GLOBAL_MEM_SIZE>());
+                MNN_PRINT("[HWINFO] pref_vec_half=%u native_vec_half=%u\n", (unsigned)_d.getInfo<CL_DEVICE_PREFERRED_VECTOR_WIDTH_HALF>(), (unsigned)_d.getInfo<CL_DEVICE_NATIVE_VECTOR_WIDTH_HALF>());
+                MNN_PRINT("[HWINFO] pref_vec_float=%u\n", (unsigned)_d.getInfo<CL_DEVICE_PREFERRED_VECTOR_WIDTH_FLOAT>());
+                MNN_PRINT("[CL_EXT] %s\n", deviceextensions.c_str());
+                MNN_PRINT("[CL_EXT] has_subgroup_shuffle=%d\n", (int)(deviceextensions.find("cl_khr_subgroup_shuffle")!=std::string::npos));
+            }
 #ifdef MNN_USE_LIB_WRAPPER
             mIsSupportAHD = (getDeviceSupportsExtension(*(mFirstGPUDevicePtr.get()), "cl_arm_import_memory_android_hardware_buffer")
                  && mGpuType == MALI && OpenCLSymbolsOperator::getOpenclSymbolsPtr()->getFuncAddress(platforms[platformId](), "clImportMemoryARM"))
