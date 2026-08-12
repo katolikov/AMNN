@@ -5,14 +5,46 @@ import argparse, json, os, re, subprocess, sys, statistics
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-CONVERT = REPO / "build_host" / "MNNConvert"
-BUILD = REPO / "build_android_profile"
-MODULE = BUILD / "ModuleBasic.out"
-LIBS = [
-    BUILD / "OFF/arm64-v8a/libMNN.so",
-    BUILD / "express/OFF/arm64-v8a/libMNN_Express.so",
-    BUILD / "source/backend/opencl/OFF/arm64-v8a/libMNN_CL.so",
-]
+
+
+def _first(paths):
+    for p in paths:
+        if p.exists():
+            return p
+    return None
+
+
+def _glob1(root, name):
+    """Shallowest match for `name` under root (build layouts differ: flat vs MNN_SEP_BUILD's
+    OFF/<abi>/ subdirs), so never hardcode the sub-path."""
+    if not root or not root.exists():
+        return None
+    hits = sorted(root.glob(f"**/{name}"), key=lambda p: len(p.parts))
+    return hits[0] if hits else None
+
+
+def discover():
+    """Locate MNNConvert / the android build, tolerating different cmake layouts.
+    Override with env MNN_BENCH_CONVERT and MNN_BENCH_ANDROID_BUILD."""
+    cv = os.environ.get("MNN_BENCH_CONVERT")
+    convert = Path(cv) if cv else _first(
+        [REPO / "build_host" / "MNNConvert", REPO / "build_verify" / "MNNConvert",
+         REPO / "build" / "MNNConvert"] + sorted(REPO.glob("build*/MNNConvert")))
+    ab = os.environ.get("MNN_BENCH_ANDROID_BUILD")
+    roots = [Path(ab)] if ab else [REPO / "build_android_profile", REPO / "build_android"]
+    build = module = None
+    libs = []
+    for r in roots:
+        m = _glob1(r, "ModuleBasic.out")
+        if m:
+            found = [_glob1(r, n) for n in ("libMNN.so", "libMNN_Express.so", "libMNN_CL.so")]
+            if all(found):
+                build, module, libs = r, m, found
+                break
+    return convert, (build or roots[0]), module, libs
+
+
+CONVERT, BUILD, MODULE, LIBS = discover()
 DEV = "/data/local/tmp/mnnopt"
 LOCAL = REPO / "conv_bench" / "work"
 
