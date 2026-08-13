@@ -1590,6 +1590,321 @@ void conv_2d_c8h2w1(GLOBAL_SIZE_2_DIMS
 #endif
 }
 
+// conv_2d_c4h8w1 (env MNN_CONV_SPEC): best weight-load amortization PER REGISTER in the set.
+// The c8h1w1/c4h1w1 measurements showed the kernel is bound by WEIGHT loads (4 weight float4 per
+// input float4), which only h/w-blocking amortizes -- and h-blocking keeps the w-coalescing that
+// w-blocking destroys. c8h8w1 reached amort 8 but paid 16 accumulators and lost on occupancy;
+// this reaches the same amort 8 with only 8 accumulators (one oc-block, 8 rows) = the same
+// register class as the c8h4w1 winner at double its amortization.
+__kernel
+void conv_2d_c4h8w1(GLOBAL_SIZE_2_DIMS
+                      __global const FLOAT *input,
+                      __global const FLOAT *weight,
+                      __global const FLOAT *bias,
+                      __global FLOAT *output,
+                      __private const int2 in_hw,
+                      __private const int inChannel,
+                      __private const int in_c_blocks,
+                      __private const int batch,
+                      __private const int2 out_hw,
+                      __private const int2 filter_hw,
+                      __private const int2 stride_hw,
+                      __private const int2 pad_hw,
+                      __private const int2 dilate_hw,
+                      __private const int out_w_blocks,
+                      __private const int out_c_blocks,
+                      __private const int out_h_blocks,
+                      __private const int out_c_base_index
+                      #ifdef PRELU
+                      ,__global const FLOAT *slope_ptr
+                      #endif
+) {
+    const int out_c_w_idx = get_global_id(0); //c/4 w
+    const int out_b_h_idx  = get_global_id(1); //b h
+
+    DEAL_NON_UNIFORM_DIM2(out_c_w_idx, out_b_h_idx);
+
+    const int out_c_idx = out_c_w_idx / out_w_blocks + out_c_base_index;
+    if(out_c_idx >= out_c_blocks) return;
+    const int out_w_idx = out_c_w_idx % out_w_blocks;
+    const int out_b_idx = out_b_h_idx / out_h_blocks;//equal to in_b_idx
+    const int out_h_idx = (out_b_h_idx % out_h_blocks) << 3;
+
+    COMPUTE_FLOAT4 out0 = CONVERT_COMPUTE_FLOAT4(vload4(out_c_idx, bias));
+    COMPUTE_FLOAT4 out1 = out0;
+    COMPUTE_FLOAT4 out2 = out0;
+    COMPUTE_FLOAT4 out3 = out0;
+    COMPUTE_FLOAT4 out4 = out0;
+    COMPUTE_FLOAT4 out5 = out0;
+    COMPUTE_FLOAT4 out6 = out0;
+    COMPUTE_FLOAT4 out7 = out0;
+
+    const int in_w_idx_base = mad24(out_w_idx, stride_hw.y, -pad_hw.y);
+    const int in_h0_idx_base = mad24(out_h_idx, stride_hw.x, -pad_hw.x);
+
+    const int kw_start = select(0, (-in_w_idx_base + dilate_hw.y - 1) / dilate_hw.y, in_w_idx_base < 0);
+    const int in_w_idx_start = mad24(kw_start, dilate_hw.y, in_w_idx_base);
+    const int in_w_idx_end = min(mad24(filter_hw.y, dilate_hw.y, in_w_idx_base), in_hw.y);
+
+    const int weight_oc_offset = out_c_blocks * filter_hw.x * filter_hw.y * 4;
+    const int in_hw_size = in_hw.x * in_hw.y;
+    const int row_stride = stride_hw.x * in_hw.y;
+    for(ushort in_c_idx = 0; in_c_idx < in_c_blocks; in_c_idx++) {
+        const int inp_offset_base = (out_b_idx + in_c_idx*batch) * in_hw.x * in_hw.y * 4;
+
+        for(int iy = 0; iy < filter_hw.x; iy++) {
+            int weight_offset = ((((4*in_c_idx+0)* out_c_blocks + out_c_idx) *filter_hw.x + iy)*filter_hw.y + kw_start) * 4;
+            const int in_h0_idx = (iy * dilate_hw.x + in_h0_idx_base) * in_hw.y;
+
+            for(int fw = in_w_idx_start; fw < in_w_idx_end; fw += dilate_hw.y) {
+                const int ib = in_h0_idx + fw;
+                COMPUTE_FLOAT4 weight0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+weight_offset));
+                COMPUTE_FLOAT4 weight1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+weight_offset+weight_oc_offset));
+                COMPUTE_FLOAT4 weight2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+weight_offset+weight_oc_offset*2));
+                COMPUTE_FLOAT4 weight3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+weight_offset+weight_oc_offset*3));
+
+                int hidx = ib;
+                COMPUTE_FLOAT4 inr = (hidx < 0 || hidx >= in_hw_size) ? (COMPUTE_FLOAT4)0 : CONVERT_COMPUTE_FLOAT4(vload4(hidx, input+inp_offset_base));
+                out0 = mad(inr.x, weight0, out0);
+                out0 = mad(inr.y, weight1, out0);
+                out0 = mad(inr.z, weight2, out0);
+                out0 = mad(inr.w, weight3, out0);
+
+                hidx += row_stride;
+                inr = (hidx < 0 || hidx >= in_hw_size) ? (COMPUTE_FLOAT4)0 : CONVERT_COMPUTE_FLOAT4(vload4(hidx, input+inp_offset_base));
+                out1 = mad(inr.x, weight0, out1);
+                out1 = mad(inr.y, weight1, out1);
+                out1 = mad(inr.z, weight2, out1);
+                out1 = mad(inr.w, weight3, out1);
+
+                hidx += row_stride;
+                inr = (hidx < 0 || hidx >= in_hw_size) ? (COMPUTE_FLOAT4)0 : CONVERT_COMPUTE_FLOAT4(vload4(hidx, input+inp_offset_base));
+                out2 = mad(inr.x, weight0, out2);
+                out2 = mad(inr.y, weight1, out2);
+                out2 = mad(inr.z, weight2, out2);
+                out2 = mad(inr.w, weight3, out2);
+
+                hidx += row_stride;
+                inr = (hidx < 0 || hidx >= in_hw_size) ? (COMPUTE_FLOAT4)0 : CONVERT_COMPUTE_FLOAT4(vload4(hidx, input+inp_offset_base));
+                out3 = mad(inr.x, weight0, out3);
+                out3 = mad(inr.y, weight1, out3);
+                out3 = mad(inr.z, weight2, out3);
+                out3 = mad(inr.w, weight3, out3);
+
+                hidx += row_stride;
+                inr = (hidx < 0 || hidx >= in_hw_size) ? (COMPUTE_FLOAT4)0 : CONVERT_COMPUTE_FLOAT4(vload4(hidx, input+inp_offset_base));
+                out4 = mad(inr.x, weight0, out4);
+                out4 = mad(inr.y, weight1, out4);
+                out4 = mad(inr.z, weight2, out4);
+                out4 = mad(inr.w, weight3, out4);
+
+                hidx += row_stride;
+                inr = (hidx < 0 || hidx >= in_hw_size) ? (COMPUTE_FLOAT4)0 : CONVERT_COMPUTE_FLOAT4(vload4(hidx, input+inp_offset_base));
+                out5 = mad(inr.x, weight0, out5);
+                out5 = mad(inr.y, weight1, out5);
+                out5 = mad(inr.z, weight2, out5);
+                out5 = mad(inr.w, weight3, out5);
+
+                hidx += row_stride;
+                inr = (hidx < 0 || hidx >= in_hw_size) ? (COMPUTE_FLOAT4)0 : CONVERT_COMPUTE_FLOAT4(vload4(hidx, input+inp_offset_base));
+                out6 = mad(inr.x, weight0, out6);
+                out6 = mad(inr.y, weight1, out6);
+                out6 = mad(inr.z, weight2, out6);
+                out6 = mad(inr.w, weight3, out6);
+
+                hidx += row_stride;
+                inr = (hidx < 0 || hidx >= in_hw_size) ? (COMPUTE_FLOAT4)0 : CONVERT_COMPUTE_FLOAT4(vload4(hidx, input+inp_offset_base));
+                out7 = mad(inr.x, weight0, out7);
+                out7 = mad(inr.y, weight1, out7);
+                out7 = mad(inr.z, weight2, out7);
+                out7 = mad(inr.w, weight3, out7);
+
+                weight_offset += 4;
+            }
+        }
+    }
+#ifdef RELU
+    out0 = fmax(out0, (COMPUTE_FLOAT4)0);
+    out1 = fmax(out1, (COMPUTE_FLOAT4)0);
+    out2 = fmax(out2, (COMPUTE_FLOAT4)0);
+    out3 = fmax(out3, (COMPUTE_FLOAT4)0);
+    out4 = fmax(out4, (COMPUTE_FLOAT4)0);
+    out5 = fmax(out5, (COMPUTE_FLOAT4)0);
+    out6 = fmax(out6, (COMPUTE_FLOAT4)0);
+    out7 = fmax(out7, (COMPUTE_FLOAT4)0);
+#endif
+
+#ifdef RELU6
+    out0 = clamp(out0, (COMPUTE_FLOAT4)0, (COMPUTE_FLOAT4)6);
+    out1 = clamp(out1, (COMPUTE_FLOAT4)0, (COMPUTE_FLOAT4)6);
+    out2 = clamp(out2, (COMPUTE_FLOAT4)0, (COMPUTE_FLOAT4)6);
+    out3 = clamp(out3, (COMPUTE_FLOAT4)0, (COMPUTE_FLOAT4)6);
+    out4 = clamp(out4, (COMPUTE_FLOAT4)0, (COMPUTE_FLOAT4)6);
+    out5 = clamp(out5, (COMPUTE_FLOAT4)0, (COMPUTE_FLOAT4)6);
+    out6 = clamp(out6, (COMPUTE_FLOAT4)0, (COMPUTE_FLOAT4)6);
+    out7 = clamp(out7, (COMPUTE_FLOAT4)0, (COMPUTE_FLOAT4)6);
+#endif
+
+#ifdef PRELU
+    COMPUTE_FLOAT4 slope_in = CONVERT_COMPUTE_FLOAT4(vload4(out_c_idx, slope_ptr));
+    out0 = select(out0 * slope_in, out0, out0 >= 0);
+    out1 = select(out1 * slope_in, out1, out1 >= 0);
+    out2 = select(out2 * slope_in, out2, out2 >= 0);
+    out3 = select(out3 * slope_in, out3, out3 >= 0);
+    out4 = select(out4 * slope_in, out4, out4 >= 0);
+    out5 = select(out5 * slope_in, out5, out5 >= 0);
+    out6 = select(out6 * slope_in, out6, out6 >= 0);
+    out7 = select(out7 * slope_in, out7, out7 >= 0);
+#endif
+
+    const int out_offset = (((out_b_idx + out_c_idx*batch)*out_hw.x + out_h_idx)*out_hw.y + out_w_idx)*4;
+#ifdef BLOCK_LEAVE
+    const int remain = out_hw.x - out_h_idx;
+    if(remain > 0) vstore4(CONVERT_FLOAT4(out0), 0, output+out_offset);
+    if(remain > 1) vstore4(CONVERT_FLOAT4(out1), out_hw.y, output+out_offset);
+    if(remain > 2) vstore4(CONVERT_FLOAT4(out2), 2 * out_hw.y, output+out_offset);
+    if(remain > 3) vstore4(CONVERT_FLOAT4(out3), 3 * out_hw.y, output+out_offset);
+    if(remain > 4) vstore4(CONVERT_FLOAT4(out4), 4 * out_hw.y, output+out_offset);
+    if(remain > 5) vstore4(CONVERT_FLOAT4(out5), 5 * out_hw.y, output+out_offset);
+    if(remain > 6) vstore4(CONVERT_FLOAT4(out6), 6 * out_hw.y, output+out_offset);
+    if(remain > 7) vstore4(CONVERT_FLOAT4(out7), 7 * out_hw.y, output+out_offset);
+#else
+    vstore4(CONVERT_FLOAT4(out0), 0, output+out_offset);
+    vstore4(CONVERT_FLOAT4(out1), out_hw.y, output+out_offset);
+    vstore4(CONVERT_FLOAT4(out2), 2 * out_hw.y, output+out_offset);
+    vstore4(CONVERT_FLOAT4(out3), 3 * out_hw.y, output+out_offset);
+    vstore4(CONVERT_FLOAT4(out4), 4 * out_hw.y, output+out_offset);
+    vstore4(CONVERT_FLOAT4(out5), 5 * out_hw.y, output+out_offset);
+    vstore4(CONVERT_FLOAT4(out6), 6 * out_hw.y, output+out_offset);
+    vstore4(CONVERT_FLOAT4(out7), 7 * out_hw.y, output+out_offset);
+#endif
+}
+
+// conv_2d_c8h1w1 (env MNN_CONV_SPEC): the naive-but-max-parallel point that was missing from the
+// candidate set. 2 accumulators (same register class as c4h1w2 / lowest of the c8 family) but the
+// HIGHEST thread count of any 2-acc variant, and the best input-load-per-output ratio: each input
+// float4 is loaded once and reused across BOTH output channel blocks with zero halo growth
+// (4.5 loads/out-float4 vs 9 for c4h1w1 and 6 for c4h1w2). Reduction order matches conv_2d_c8h2w1.
+__kernel
+void conv_2d_c8h1w1(GLOBAL_SIZE_2_DIMS
+                      __global const FLOAT *input,
+                      __global const FLOAT *weight,
+                      __global const FLOAT *bias,
+                      __global FLOAT *output,
+                      __private const int2 in_hw,
+                      __private const int inChannel,
+                      __private const int in_c_blocks,
+                      __private const int batch,
+                      __private const int2 out_hw,
+                      __private const int2 filter_hw,
+                      __private const int2 stride_hw,
+                      __private const int2 pad_hw,
+                      __private const int2 dilate_hw,
+                      __private const int out_w_blocks,
+                      __private const int out_c_blocks,
+                      __private const int out_h_blocks,
+                      __private const int out_c_base_index
+                      #ifdef PRELU
+                      ,__global const FLOAT *slope_ptr
+                      #endif
+) {
+    const int out_c_w_idx = get_global_id(0); //c/8 w
+    const int out_b_h_idx  = get_global_id(1); //b h
+
+    DEAL_NON_UNIFORM_DIM2(out_c_w_idx, out_b_h_idx);
+
+    const int out_c_idx_0 = (out_c_w_idx / out_w_blocks + out_c_base_index) << 1;
+    if(out_c_idx_0 >= out_c_blocks) return;
+    const int out_c_idx_1 = out_c_idx_0 + 1;
+    const int out_w_idx = out_c_w_idx % out_w_blocks;
+    const int out_b_idx = out_b_h_idx / out_h_blocks;//equal to in_b_idx
+    const int out_h_idx = out_b_h_idx % out_h_blocks;
+
+    COMPUTE_FLOAT4 out0 = CONVERT_COMPUTE_FLOAT4(vload4(out_c_idx_0, bias));
+    #ifdef CHANNEL_BOUNDARY_PROTECT
+    COMPUTE_FLOAT4 out1 = out_c_idx_1 >= out_c_blocks ? (COMPUTE_FLOAT4)0 : CONVERT_COMPUTE_FLOAT4(vload4(out_c_idx_1, bias));
+    #else
+    COMPUTE_FLOAT4 out1 = CONVERT_COMPUTE_FLOAT4(vload4(out_c_idx_1, bias));
+    #endif
+
+    const int in_w_idx_base = mad24(out_w_idx, stride_hw.y, -pad_hw.y);
+    const int in_h_idx_base = mad24(out_h_idx, stride_hw.x, -pad_hw.x);
+
+    const int kw_start = select(0, (-in_w_idx_base + dilate_hw.y - 1) / dilate_hw.y, in_w_idx_base < 0);
+    const int in_w_idx_start = mad24(kw_start, dilate_hw.y, in_w_idx_base);
+    const int in_w_idx_end = min(mad24(filter_hw.y, dilate_hw.y, in_w_idx_base), in_hw.y);
+
+    const int weight_oc_offset = filter_hw.x * filter_hw.y * 4;
+    const int weight_ic_offset = out_c_blocks * weight_oc_offset;
+    const int in_hw_size = in_hw.x * in_hw.y;
+    // weight: [ic/4, oc, 4], loop: ic/4
+    for(ushort in_c_idx = 0; in_c_idx < in_c_blocks; in_c_idx++) {
+        const int inp_offset_base = (out_b_idx + in_c_idx*batch) * in_hw.x * in_hw.y * 4;
+
+        for(int iy = 0; iy < filter_hw.x; iy++) {
+            int weight_offset = ((((4*in_c_idx+0)* out_c_blocks + out_c_idx_0) *filter_hw.x + iy)*filter_hw.y + kw_start) * 4;
+            const int in_h_idx = (iy * dilate_hw.x + in_h_idx_base) * in_hw.y;
+
+            for(int fw = in_w_idx_start; fw < in_w_idx_end; fw += dilate_hw.y) {
+                COMPUTE_FLOAT4 in0 = (in_h_idx < 0 || in_h_idx >= in_hw_size) ? (COMPUTE_FLOAT4)0 : CONVERT_COMPUTE_FLOAT4(vload4(in_h_idx + fw, input+inp_offset_base));
+                COMPUTE_FLOAT4 weight0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+weight_offset));
+                COMPUTE_FLOAT4 weight1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+weight_offset+weight_ic_offset));
+                COMPUTE_FLOAT4 weight2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+weight_offset+weight_ic_offset*2));
+                COMPUTE_FLOAT4 weight3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+weight_offset+weight_ic_offset*3));
+
+                out0 = mad(in0.x, weight0, out0);
+                out0 = mad(in0.y, weight1, out0);
+                out0 = mad(in0.z, weight2, out0);
+                out0 = mad(in0.w, weight3, out0);
+
+                #ifdef CHANNEL_BOUNDARY_PROTECT
+                weight0 = out_c_idx_1 >= out_c_blocks ? (COMPUTE_FLOAT4)0 : CONVERT_COMPUTE_FLOAT4(vload4(0, weight+weight_offset+weight_oc_offset));
+                weight1 = out_c_idx_1 >= out_c_blocks ? (COMPUTE_FLOAT4)0 : CONVERT_COMPUTE_FLOAT4(vload4(0, weight+weight_offset+weight_oc_offset+weight_ic_offset));
+                weight2 = out_c_idx_1 >= out_c_blocks ? (COMPUTE_FLOAT4)0 : CONVERT_COMPUTE_FLOAT4(vload4(0, weight+weight_offset+weight_oc_offset+weight_ic_offset*2));
+                weight3 = out_c_idx_1 >= out_c_blocks ? (COMPUTE_FLOAT4)0 : CONVERT_COMPUTE_FLOAT4(vload4(0, weight+weight_offset+weight_oc_offset+weight_ic_offset*3));
+                #else
+                weight0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+weight_offset+weight_oc_offset));
+                weight1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+weight_offset+weight_oc_offset+weight_ic_offset));
+                weight2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+weight_offset+weight_oc_offset+weight_ic_offset*2));
+                weight3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+weight_offset+weight_oc_offset+weight_ic_offset*3));
+                #endif
+                out1 = mad(in0.x, weight0, out1);
+                out1 = mad(in0.y, weight1, out1);
+                out1 = mad(in0.z, weight2, out1);
+                out1 = mad(in0.w, weight3, out1);
+
+                weight_offset += 4;
+            }
+        }
+    }
+#ifdef RELU
+    out0 = fmax(out0, (COMPUTE_FLOAT4)0);
+    out1 = fmax(out1, (COMPUTE_FLOAT4)0);
+#endif
+
+#ifdef RELU6
+    out0 = clamp(out0, (COMPUTE_FLOAT4)0, (COMPUTE_FLOAT4)6);
+    out1 = clamp(out1, (COMPUTE_FLOAT4)0, (COMPUTE_FLOAT4)6);
+#endif
+
+#ifdef PRELU
+    COMPUTE_FLOAT4 slope_in0 = CONVERT_COMPUTE_FLOAT4(vload4(out_c_idx_0, slope_ptr));
+    COMPUTE_FLOAT4 slope_in1 = CONVERT_COMPUTE_FLOAT4(vload4(out_c_idx_1, slope_ptr));
+    out0 = select(out0 * slope_in0, out0, out0 >= 0);
+    out1 = select(out1 * slope_in1, out1, out1 >= 0);
+#endif
+
+    int out_offset = (((out_b_idx + out_c_idx_0*batch)*out_hw.x + out_h_idx)*out_hw.y + out_w_idx)*4;
+    vstore4(CONVERT_FLOAT4(out0), 0, output+out_offset);
+#ifdef CHANNEL_BOUNDARY_PROTECT
+    if(out_c_idx_1 >= out_c_blocks){
+        return;
+    }
+#endif
+    out_offset = (((out_b_idx + out_c_idx_1*batch)*out_hw.x + out_h_idx)*out_hw.y + out_w_idx)*4;
+    vstore4(CONVERT_FLOAT4(out1), 0, output+out_offset);
+}
+
 __kernel
 void conv_2d_c8h1w4(GLOBAL_SIZE_2_DIMS
                       __global const FLOAT *input,

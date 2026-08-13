@@ -455,6 +455,88 @@ An earlier note called implicit GEMM "~80us = real win". That was too optimistic
   (2) cooperative matrix (hardware reduce, sidesteps software occupancy); (3) a GPU with more CUs.
   These are the levers for the Vulkan session / newer device.
 
+### §H.16 — Blocking space now EXHAUSTIVELY bracketed: c8h1w1 + c4h8w1 both FALSIFIED
+Question raised: "was a naive vectorized conv using the device's max thread count ever tried?" —
+yes, that IS `conv_2d_c4h1w1` (1 output float4/thread, no blocking, max threads): 211.8us vs the
+tuner's 119.7 at 32->32 (+77%), 131.3 vs 101.3 at 48->48 (+30%). Raw thread count is not a lever —
+the 32->32 launch is already ~55k work-items on 8 CUs (~100x oversubscribed); occupancy is capped by
+registers/CU, not by work-items launched. Two blocking points were nonetheless still missing from the
+candidate set, so both were built (correct: cosine 1.000000 vs stock, incl. the BLOCK_LEAVE path at
+36 rows) and force-measured (median of 3, 6-deep sustained chain):
+- `conv_2d_c8h1w1` (2 acc, 8 oc x 1 pixel — highest thread count of any 2-acc variant, input float4
+  loaded once and reused across both oc-blocks, zero halo growth): 204.5us @32 (+71% vs c8h4w1),
+  146.3us @48 (+44% vs c4h1w2, and 12% WORSE than naive c4h1w1).
+- `conv_2d_c4h8w1` (8 acc, 1 oc x 8 rows — same register class as the c8h4w1 winner at DOUBLE its
+  weight-load amortization): 194.3us @32 (+62%), 213.0us @48 (+83%). Worse even than c8h8w1, which
+  reaches the same amortization with 2x the registers.
+**The "kernel is weight-load-bound" hypothesis that motivated c4h8w1 is FALSIFIED.** c4h8w1 and
+c8h4w1 have identical accumulator count (8), identical thread count (6912 @32->32) and identical
+total loads per inner iteration (12) — 194.3 vs 119.7us. Partial explanation: c4h8w1 doubles the
+PER-LANE input loads (8/iter vs 4) to save WAVE-UNIFORM weight loads (4 vs 8), and uniform loads are
+near-free (all lanes hit one address). But that model does not fit c8h1w1, which halves per-lane
+input traffic vs c4h1w1 and gains only 3%. No counting model (input loads, weight loads, total
+loads, accumulators, thread count, amortization) fits all ten measured points.
+⇒ The blocking space is now bracketed on EVERY axis: accumulators 1->16, amortization 1x->8x, both
+h- and w-direction, both oc-widths. The tuner's pick (c8h4w1 @32, c4h1w2 @48) is the optimum and is
+not reachable by reasoning about load counts. Both kernels kept as documented negatives behind
+MNN_CONV_SPEC (default off) + MNN_CONV_FORCE. Repro: `conv_bench/weight_amort_test.py` (full 10-point
+sweep), `conv_bench/c8h1w1_test.py` (focused + correctness gate).
+
+### §H.17 — Autotuner-fairness audit (closes the "did the tuner change the test?" question)
+Read of `ConvBufExecution.cpp` + `OpenCLRunningUtils.cpp::localWS2DDefault`:
+- With `MNN_CONV_FORCE=<name>` the candidate list is truncated to length 1, so `min_cost` selects
+  that kernel unconditionally — the tuner CANNOT have swapped in a different kernel.
+- Every forced variant still gets its own full LWS search: `localWS2DDefault(...)` runs per
+  candidate at tune level **Wide** (harness passes gpuMode 68 = MNN_GPU_MEMORY_BUFFER | WIDE),
+  which sweeps lws[0], lws[1] over powers of two up to gws / maxWorkItemSizes / maxWorkGroupSize
+  and times each with a real enqueue. No divisibility requirement (GWS is ROUND_UP'd), so odd GWS
+  like c4h8w1's (768, 9) is not excluded — it gets lws[1] in {1,2,4,8}.
+- The LWS cache key is `(kernelName, gws)` and every measurement used a FRESH per-variant cache
+  file, so no tuned LWS leaked between variants or between repetitions.
+- Residual caveat (unchanged): LWS selection uses a single-shot timing per candidate, so a variant
+  can land on a slightly suboptimal LWS from run-to-run noise — a few-percent effect, not the
+  30-80% gaps measured. The one real exception remains the LDS kernel (fixed hand-picked LWS),
+  which was separately swept over 11 tiles in §H.9.
+- Empirical check: the 2026-08-13 re-run reproduced every previously measured variant to within
+  ±1% (c4h1w1 211.7 vs 211.8, c4h1w2 207.0 vs 207.5, c8h4w1 119.3 vs 120.3, 48-core likewise).
+⇒ The variant measurements are tuner-fair.
+
+### §H.18 — Clock-regime review (INT/MIF max + GPU low) + a FAILED measurement proxy
+**Cannot be measured on this device: no root.** `/sys/class/devfreq/23400000.sgpu/{min,max}_freq`
+is read-only to shell (`Permission denied`); the MIF and INT domains exist
+(`17000010.devfreq_mif`, `17000020.devfreq_int`) and are equally unwritable.
+**FAILED proxy (do not repeat):** `conv_bench/clock_regime_test.py` pre-warms the tuner cache,
+idles 6 s to let the sgpu governor park, then re-runs cached (no tuning burst) while polling
+`cur_freq`, hoping the first inferences execute low-clock and ramp. Measured cold/hot ratios were
+1.01-1.06x across six variants with an IDENTICAL ranking — the governor ramps to 980 MHz during
+session creation / the first inference, so no low-clock execution is ever observed. The proxy
+yields no signal; a rooted device (or a Samsung engineering build) pinning min_freq=max_freq is
+required.
+**Analytical review.** The regime flips the bottleneck. 32->32@72x96 is 127.4 MFLOP/conv; at
+119.7us that is **1.06 TFLOP/s = ~16% of the ~6.5 TF fp16 peak at 980 MHz**. Scale the clock:
+461 MHz peak = 3.06 TF (the SAME throughput would need 35% of peak); 226 MHz peak = 1.50 TF (would
+need **71% of peak**). So below roughly 400-500 MHz the conv stops being memory-latency-bound and
+becomes ALU/issue-bound — and MIF/INT at max pushes the crossover HIGHER still. Every §H verdict
+was reached in the latency-bound regime, so the ones whose mechanism was occupancy or memory
+traffic are the ones that move:
+| strategy | verdict @980MHz | predicted @GPU-low + MIF/INT-max | why |
+|---|---|---|---|
+| PReLU fusion | -8/9% BANKED | **holds** | removes a whole kernel (cycles AND traffic); regime-independent |
+| Winograd F(2,3) | contraindicated K<=128 | **FLIP CANDIDATE #1 — re-test** | the ONLY lever that cuts real MACs (2.25x), paid in memory passes. Verdict was "transforms cost more than the MACs saved" — true only when MACs are free and memory is the wall. Both halves invert here |
+| im2col + GEMM | +15% (falsified) | **FLIP CANDIDATE #2 — re-test** | im2col is a pure memory pass (MIF-max makes it cheaper) and the GEMM does the same FLOPs at higher ALU efficiency (0.90 vs 0.70 TF) — exactly what matters when ALU-bound. Only 15% behind at 980 |
+| bigger tiles (c8h8w1 +27%, c4h8w1 +62%) | falsified | **penalty shrinks; re-test** | both lost on occupancy / per-lane loads; at low clock latency hiding is easier and instruction efficiency dominates. Optimum shifts toward LARGER tiles |
+| cross-stream concurrency | 1.34x, lever #2 | **DEGRADES toward 1.0** | the spare capacity IS the memory stalls; at ~71% ALU occupancy there is little left to overlap |
+| cut CPU/submission overhead (~50% of wall) | live lever | **DEGRADES in relative value** | GPU time grows ~4x while CPU cost is fixed -> overhead share falls from ~50% to ~20% |
+| LDS tiling | falsified (+0.7/+9.2%) | still negative, less so | saves traffic that is now abundant; costs barriers/occupancy that now matter less |
+| space2depth on heads | falsified (+12-17%) | **worse** | buys occupancy by inflating dense FLOPs 1.78x — the exact wrong trade when FLOPs are scarce |
+| widen channels at equal MACs (model) | up to 2.5x | **shrinks** | the win was escaping occupancy starvation, which is less punishing at low clock. At GPU-low the model lever inverts to FEWER MACs (separable/pruning), not wider layers |
+| hardware-friendly shapes (Cout mult of 16/32) | live | **more important** | wasted lanes = wasted FLOPs, and FLOPs are now the scarce resource |
+| custom Vulkan conv (+3.5%/+45%) | top substrate lever | **holds or improves** | its wins are width blocking, half accumulators, NC4HW4 stores, wave32/64 — all instruction-efficiency, which pays more when ALU-bound |
+⇒ Headline: at GPU-low the two biggest *falsified* strategies (Winograd, im2col+GEMM) are the two
+most likely to flip positive, and the two biggest *live* non-kernel levers (concurrency, CPU
+overhead) are the ones that decay. Re-testing needs a rooted device; env switches already exist
+(`MNN_NO_WINOGRAD`, `MNN_CONV_IM2COL`, `MNN_CONV_SPEC`+`MNN_CONV_FORCE`).
+
 ### §H.7 — FINAL VERDICT (Session A restricted-set specialization)
 Levers tried on the real Block1/Block2: PReLU fusion = BANKED (-8/9% per block, shippable, no new
 code). Falsified on-device with numbers: NC4HW4-input theory, cross-layer fusion (<2%), LDS tiling

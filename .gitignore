@@ -399,3 +399,4 @@ apps/iOS/MNNLLMChat/MNNLLMiOS/LocalModel/Qwen2.5-Omni-3B-MNN
 
 # oneday scoder
 .oneday/
+build_host/

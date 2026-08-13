@@ -25,20 +25,39 @@ CORES = [(32, 72, 96), (48, 36, 48)]        # homogeneous cores of the real bloc
 CC = (32, 24, 48)                            # correctness shape: %16/%4 (LDS) and %6/%6 (fused2) ok
 VARIANTS = ["conv_2d_c4h1w1", "conv_2d_c4h1w2", "conv_2d_c4h4w1", "conv_2d_c4h1w4",
             "conv_2d_c8h2w1", "conv_2d_c8h4w1", "conv_2d_c8h1w4", "conv_2d_c8h8w1",
-            "conv_2d_c8h4w1_pa"]
-SPEC_ONLY = ["conv_2d_c8h8w1", "conv_2d_c8h4w1_pa"]
+            "conv_2d_c8h4w1_pa", "conv_2d_c8h1w1", "conv_2d_c4h8w1"]
+SPEC_ONLY = ["conv_2d_c8h8w1", "conv_2d_c8h4w1_pa", "conv_2d_c8h1w1", "conv_2d_c4h8w1"]
 LDS_TILES = ["16x4", "48x4", "16x12", "8x4", "24x4", "16x2"]
 
 
+def find_strip():
+    """llvm-strip that can handle arm64 ELF. The host `strip` on macOS CANNOT, and silently
+    leaves the libs unstripped (135 MB instead of 6 MB, re-pushed to the device every run)."""
+    ndk = os.environ.get("ANDROID_NDK") or os.environ.get("ANDROID_NDK_HOME") or ""
+    cands = []
+    if ndk:
+        cands += list(Path(ndk).glob("toolchains/llvm/prebuilt/*/bin/llvm-strip"))
+    for root in (Path.home() / "Library/Android/sdk/ndk", Path.home() / "Android/Sdk/ndk"):
+        cands += sorted(root.glob("*/toolchains/llvm/prebuilt/*/bin/llvm-strip"), reverse=True)
+    for c in cands:
+        if c.exists():
+            return str(c)
+    return shutil.which("llvm-strip")
+
+
+STRIP = None
+
+
 def strip_to(src: Path, dst: Path):
-    """Copy, stripping symbols if a strip tool is available (cuts bundle size a lot)."""
+    """Copy, stripping symbols (cuts each .so by ~20x -> much faster adb push)."""
+    global STRIP
+    if STRIP is None:
+        STRIP = find_strip() or ""
+        if not STRIP:
+            print("   (no llvm-strip found — libs stay unstripped, pushes will be slow)")
     shutil.copy2(src, dst)
-    for tool in ("llvm-strip", "strip"):
-        if shutil.which(tool):
-            r = subprocess.run(f"{tool} -S -x \"{dst}\"", shell=True, capture_output=True)
-            if r.returncode == 0:
-                return
-    # stripping is optional; unstripped just means a bigger bundle
+    if STRIP:
+        subprocess.run(f"\"{STRIP}\" -S -x \"{dst}\"", shell=True, capture_output=True)
 
 
 def conv3x3(x, W, b):
@@ -121,43 +140,65 @@ def main():
     print(f"   correctness cc {C}@{H}x{W} + conv^2 reference")
 
     (OUT / "manifest.json").write_text(json.dumps(man, indent=2))
-    shutil.copy2(REPO / "conv_bench" / "bundle_run_report.py", OUT / "run_report.py")
-    os.chmod(OUT / "run_report.py", 0o755)
+    # run_report is required; the clock-pinning driver is optional (a repo that pins clocks with
+    # its own tooling simply does not carry it).
+    for src, dst, required in (("bundle_run_report.py", "run_report.py", True),
+                               ("bundle_run_suite.py", "run_suite.py", False),
+                               ("bundle_clocks.py", "clocks.py", False)):
+        s = REPO / "conv_bench" / src
+        if not s.exists():
+            if required:
+                raise SystemExit(f"missing required file: {s}")
+            continue
+        shutil.copy2(s, OUT / dst)
+        os.chmod(OUT / dst, 0o755)
 
     (OUT / "README.md").write_text(f"""# Conv-strategy probe — self-contained bundle
 
-Measures every convolution strategy we have implemented against **one Android device** and writes a
-markdown report. Finds the **best configuration on that device**.
+Sets the clocks on one Android device, runs every convolution strategy we have implemented, and
+writes a report that tells you **which one is fastest on that device**.
 
 ## Requirements
 * `python3` (standard library only — no numpy, no onnx)
 * `adb` on PATH, device connected and authorized (`adb devices` shows it)
 * Nothing else. Models are pre-converted; the arm64 MNN libs are in `bin/`.
 
-## Use
-```bash
-python3 run_report.py --list                      # show attached devices
-python3 run_report.py --serial <SERIAL> -o report.md
-python3 run_report.py --serial <SERIAL> --quick    # ~4 min instead of ~10
-```
-Then send back `report.md` (plus the clock you pinned, if any).
+## Use — one command
 
-## GPU clock
-The script does **not** change the clock — pin it yourself first if you want a specific one, e.g.
-(needs root):
 ```bash
-adb -s <SERIAL> shell 'su -c "echo 980000 > /sys/kernel/gpu/gpu_min_clock"'
-adb -s <SERIAL> shell 'su -c "echo 980000 > /sys/kernel/gpu/gpu_max_clock"'
+python3 run_suite.py --list                  # show attached devices, copy the serial
+python3 run_suite.py <ADB-SERIAL>            # pin all clocks to max, run everything (~10 min)
+python3 run_suite.py <ADB-SERIAL> --quick    # ~4 min
 ```
-Without root those nodes are not writable (they are `system`-owned); the script instead uses a
-long sustained run, which drives the governor to its top rail, and it **samples
-`/sys/kernel/gpu/gpu_clock` under load** so §2 of the report records the clock every number was
-taken at. The clock changes the compute/memory balance, so it can change which strategy wins —
-if you re-pin, re-run.
+
+Pick the clocks you want to measure at:
+
+```bash
+# slow GPU, fast memory — the case where the ranking is expected to change
+python3 run_suite.py <ADB-SERIAL> --gpu min --mif max --int max
+
+# repeat the whole suite at several GPU clocks and compare
+python3 run_suite.py <ADB-SERIAL> --gpu-sweep 980,600,300
+```
+
+Clock specs: `max`, `min`, a number in MHz (snapped to the nearest supported step), or `none` to
+leave that domain alone. Defaults are `--gpu max --mif max --int max`.
+
+**Pinning needs root.** On a production build (`adb root` refused, no `su`) nothing can be pinned;
+the suite still runs, records the clock the governor actually used, and says so at the top of the
+report. A `--gpu min` request on such a device does NOT take effect — use a rooted or
+engineering-build phone for low-clock numbers.
+
+## Output
+* `suite_<serial>.md` — **read this one**. Plain-English verdict first, then the clocks the numbers
+  were taken at, every strategy per shape, and (with `--gpu-sweep`) whether the winner changes with
+  the clock.
+* `detail_gpu<spec>.md` — the full 12-section report at each clock point.
+* `.json` next to each — every raw number, for plotting or diffing between devices.
 
 ## What it measures
 1. Hardware (compute units, clock, LDS, vector widths, `subgroup_shuffle`)
-2. GPU clock under load (validates the timings)
+2. GPU clock under load, start and end (validates the timings / detects throttling)
 3. Subgroup broadcast/shuffle compile test
 4. All {len(VARIANTS)} kernel strategies + LDS vs **MNN's own default** → picks the winner
 5. LDS tile/workgroup sweep
@@ -170,6 +211,8 @@ if you re-pin, re-run.
 
 ## Notes
 * Everything runs in `/data/local/tmp/convprobe` on the device.
+* `run_report.py` is the single-clock runner; `run_suite.py` drives it and handles clocks. You can
+  still call `run_report.py --serial <SERIAL>` directly if you pinned the clocks yourself.
 * The custom strategies exist only in the bundled `libMNN_CL.so` (built from branch
   `opencl-conv-specialize`). A stock MNN build has none of them — use `conv_probe_source.patch`
   (shipped alongside this bundle) if you want to land these changes in your own MNN tree.

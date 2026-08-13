@@ -1,8 +1,34 @@
 # How to test the convolutions on a device (from this branch)
 
 This branch contains **all the source and scripts** — it does **not** contain binaries. Anything
-compiled (`.so`, `MNNConvert`, `ModuleBasic.out`) has to be built on the machine you run from.
-Pick one of the two paths below.
+compiled (`.so`, `MNNConvert`, `ModuleBasic.out`) is built on the machine you run from.
+
+## The short version
+
+```bash
+python3 conv_bench/run_all.py            # everything: build -> push -> measure -> report
+python3 conv_bench/run_all.py --quick    # ~10 min instead of ~25
+```
+
+That single command does the whole chain:
+
+1. **preflight** — adb + device, python `numpy`/`onnx`, NDK, cmake. Checked *before* the build,
+   and it names exactly what is missing.
+2. **host build** — `MNNConvert` (converts the test models).
+3. **android build** — `libMNN` / `libMNN_CL` / `libMNN_Express` / `ModuleBasic.out`. It refuses
+   to continue if the build tree has `MNN_GPU_TIME_PROFILE=OFF`, because every timing would be 0.
+4. **models** — generates and converts every test model + correctness reference.
+5. **push + measure** — stages the stripped libs on the device and runs every strategy.
+6. **report** — `conv_bench/report_<serial>.md` plus a `.json` of every raw number.
+
+Useful flags: `-s <SERIAL>` (pick the device), `--skip-build` (reuse what is built),
+`--rebuild` (fresh configure + build), `--cooldown N` (GPU idle seconds between heavy sections).
+
+**Clocks are not touched.** Pin them with your own tooling first if you want a specific one; the
+report samples the clock under load, records it, and re-checks it at the end so a throttled run is
+marked as such instead of quietly producing wrong comparisons.
+
+The sections below are the manual equivalent, if you want to drive the steps yourself.
 
 ---
 
@@ -72,10 +98,23 @@ sections, and an end-of-run clock re-check that marks the report VALID or THROTT
 ---
 
 ## What gets measured
-Hardware caps (compute units, clocks, LDS, `subgroup_shuffle`), clock stability, subgroup
-compile-test, every conv strategy (`c4h1w1…c8h1w4`, `c8h8w1`, `c8h4w1_pa`, LDS + tile sweep)
-against MNN's own default, im2col+GEMM with the implicit-GEMM headroom, the fused 2-layer
-megakernel, the real model blocks ± PReLU fusion, concurrency, and a correctness gate per kernel.
+
+Every strategy in the tree — if it has an env switch or a kernel, it is exercised:
+
+| # | section | covers |
+|---|---|---|
+| 1 | hardware | compute units, clocks, LDS, vector widths, extensions (`MNN_DUMP_CL_EXT`) |
+| 2 | clock under load | validates every timing that follows |
+| 3 | subgroup | broadcast + shuffle compile test (`MNN_SUBGROUP_PROBE`) |
+| 4 | **11 direct kernels** + LDS vs MNN's own default | `c4h1w1 c4h1w2 c4h1w4 c4h4w1 c4h8w1 c8h1w1 c8h1w4 c8h2w1 c8h4w1 c8h4w1_pa c8h8w1` (`MNN_CONV_FORCE`, `MNN_CONV_SPEC`), `conv_2d_3x3s1_lds` (`MNN_CONV_LDS`) — interleaved so throttling cannot bias the ranking |
+| 5 | LDS tile sweep | `MNN_LDS_TILE` |
+| 6 | im2col + GEMM | `MNN_CONV_IM2COL`, plus the implicit-GEMM headroom |
+| 7 | Winograd | which path MNN actually chose (ori/wino/1x1/gemm) and A/B with `MNN_NO_WINOGRAD` |
+| 8 | fused 2-layer megakernel | `MNN_CONV_FUSED2` |
+| 9 | real model blocks | ± PReLU fusion (deployment numbers) |
+| 10 | concurrency | two independent streams |
+| 11 | correctness | every custom kernel vs the stock path — a failing kernel is flagged so its timing is not trusted |
+| 12–13 | recommendations + end-of-run clock re-check | marks the report VALID or THROTTLED |
 
 Send the produced `report.md` back for analysis (mention the device and the clock you pinned).
 Background and prior results: `conv_bench/OPTIMIZATION_HANDOFF.md`, `FINDINGS.md` §H.

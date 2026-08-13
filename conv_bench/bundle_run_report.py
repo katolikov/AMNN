@@ -22,6 +22,12 @@ HERE = Path(__file__).resolve().parent
 BIN, MODELS, REFD = HERE / "bin", HERE / "models", HERE / "ref"
 DEV = "/data/local/tmp/convprobe"
 R = []
+D = {}   # machine-readable results, written next to the report as .json
+
+
+def reset():
+    """Allow a driver script (run_suite.py) to call main() more than once."""
+    R.clear(); D.clear()
 
 
 def say(s=""):
@@ -69,6 +75,19 @@ def run_model(d, model, shape, loops, env="", cache="p.bin", pull=False, timeout
 def conv_us(out, depth=1):
     c = [int(t) for t in re.findall(r"conv time = (\d+) us", out)][3:]
     return (statistics.median(c) / depth) if c else 0.0
+
+
+def conv_paths(out):
+    """Which conv implementation MNN actually ran, from the profiler summary line.
+    -> {'ori': us, 'wino': us, '1x1': us, 'gemm1': us, 'gemm2': us, 'other': us} (medians)."""
+    keys = ("gemm2", "gemm1", "1x1", "ori", "wino", "other")
+    acc = {k: [] for k in keys}
+    for m in re.finditer(r"conv time = \d+ us \(gemm2:(\d+) us, gemm1:(\d+) us, 1x1:(\d+) us, "
+                         r"ori:(\d+) us, wino: (\d+) us, other: (\d+) us\)", out):
+        for k, v in zip(keys, m.groups()):
+            acc[k].append(int(v))
+    return {k: (statistics.median(v[3:]) if len(v) > 3 else (statistics.median(v) if v else 0))
+            for k, v in acc.items()}
 
 
 def total_us(out):
@@ -141,7 +160,7 @@ def interleaved(fns, reps):
 
 
 # --------------------------------------------------------------- sections
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--serial", "-s", help="adb serial (see --list)")
     ap.add_argument("--list", action="store_true", help="list attached devices and exit")
@@ -151,7 +170,7 @@ def main():
                     help="seconds of GPU idle between heavy sections (default 20, 5 with --quick); "
                          "this device throttles under prolonged load, so do not set 0 unless you "
                          "have pinned the clock")
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
 
     devs = list_devices()
     if a.list:
@@ -201,6 +220,7 @@ def main():
               "max_work_group_size", "pref_vec_half", "native_vec_half", "driver_version"):
         if k in hw: say(f"- **{k}**: `{hw[k]}`")
     say(f"- **subgroup_shuffle**: `{shuffle}`")
+    D["hw"] = dict(hw); D["hw"]["subgroup_shuffle"] = shuffle
     if exts: say(f"\n<details><summary>CL extensions</summary>\n\n```\n{exts}\n```\n</details>\n")
 
     # ---- 2. clock at the START (re-checked at the end; see §12)
@@ -214,10 +234,11 @@ def main():
         say(f"- min/max clock settings: `{d.shell('cat /sys/kernel/gpu/gpu_min_clock').strip()}` / "
             f"`{d.shell('cat /sys/kernel/gpu/gpu_max_clock').strip()}`")
         say(f"- freq table: `{tbl}`")
+        D["clock_start"] = {"max_mhz": mx, "min_mhz": mn, "pinned_samples": pin, "n": len(s)}
         say(f"\n> This device **throttles under prolonged load** (observed dropping from 980 to "
             "~400-550 MHz after minutes of continuous GPU work). Mitigations used here: every A/B\n"
             "> comparison is **interleaved** (arms alternate, so drift hits both equally) and there are\n"
-            "> **cooldown pauses** between heavy sections. §12 re-measures the clock at the end — if it\n"
+            "> **cooldown pauses** between heavy sections. §13 re-measures the clock at the end — if it\n"
             "> dropped, sections are not comparable across time and should be re-run individually.\n")
     else:
         say("- could not read `/sys/kernel/gpu/gpu_clock` (timings unvalidated)\n")
@@ -245,14 +266,20 @@ def main():
     allrows = {}
     for c in cores:
         m, shp, dep = c["model"], c["shape"], c["depth"]
-        row = {"MNN default": med(lambda i: conv_us(run_model(d, m, shp, 120, cache=f"st{c['key']}{i}.bin")[0], dep), reps)}
+        # INTERLEAVED (a,b,c,...,a,b,c,...) not arm-by-arm: this device throttles, and measuring
+        # 13 arms sequentially would systematically penalise whichever runs last.
+        fns = {"MNN default": lambda i: conv_us(
+            run_model(d, m, shp, 120, cache=f"st{c['key']}{i}.bin")[0], dep)}
         for v in variants:
             env = ("MNN_CONV_SPEC=1 " if v in spec_only else "") + f"MNN_CONV_FORCE={v}"
-            row[v] = med(lambda i, e=env, v=v: conv_us(
-                run_model(d, m, shp, 120, env=e, cache=f"f{c['key']}{v[-5:]}{i}.bin")[0], dep), reps)
-        row["LDS"] = med(lambda i: conv_us(run_model(d, m, shp, 120, env="MNN_CONV_LDS=1",
-                                                     cache=f"l{c['key']}{i}.bin")[0], dep), reps)
+            fns[v] = (lambda i, e=env, v=v: conv_us(
+                run_model(d, m, shp, 120, env=e, cache=f"f{c['key']}{v[-5:]}{i}.bin")[0], dep))
+        fns["LDS"] = lambda i: conv_us(
+            run_model(d, m, shp, 120, env="MNN_CONV_LDS=1", cache=f"l{c['key']}{i}.bin")[0], dep)
+        cooldown(d, cool_s)
+        row = interleaved(fns, reps)
         allrows[c["key"]] = row
+        D.setdefault("variants", {})[c["key"]] = dict(row)
         say(f"| {c['label']} | " + " | ".join(f"{row[k]:.1f}" if row.get(k) else "-"
                                               for k in ["MNN default"] + variants + ["LDS"]) + " |")
     say("")
@@ -262,6 +289,7 @@ def main():
         if not cand: continue
         best = min(cand, key=lambda k: cand[k])
         summary[c["key"]] = (base, best, cand[best])
+        D.setdefault("winner", {})[c["key"]] = {"default_us": base, "best": best, "best_us": cand[best], "label": c["label"]}
         verdict = f"**{pct(cand[best], base)} vs MNN default**" if cand[best] < base else \
                   f"(MNN default already best; closest custom {best} {pct(cand[best], base)})"
         say(f"- **{c['label']}** → default `{base:.1f}µs`, best strategy **`{best}` `{cand[best]:.1f}µs`** {verdict}")
@@ -298,14 +326,44 @@ def main():
                        cache=f"dr{c['key']}{i}.bin")[0], c["depth"]),
         }, reps)
         im, gm, base = r["im2col"], r["gemm"], r["default"]
+        D.setdefault("im2col", {})[c["key"]] = {"im2col_us": im, "gemm_us": gm, "default_us": base}
         say(f"| {c['label']} | {im:.0f} | {gm:.0f} | {im+gm:.0f} | {base:.0f} | "
             f"{'faster' if im+gm < base else 'slower'} {pct(im+gm, base)} | **{pct(gm, base)}** |")
     say("\n> Last column is the lever: if the **GEMM reduce alone beats the default**, an *implicit*\n"
         "> GEMM (gather columns in registers, never materialize im2col) is worth building — and is\n"
         "> straightforward if `sub_group_shuffle` is available (§3).\n")
 
-    # ---- 7. fused megakernel
-    say("## 7. Fused 2-layer megakernel\n")
+    # ---- 7. Winograd: is it even selected, and does disabling it help?
+    say("## 7. Winograd vs direct\n")
+    say("| shape | path MNN chose | default | Winograd OFF | verdict |")
+    say("|---|---|---|---|---|")
+    for c in cores:
+        cooldown(d, cool_s)
+        m, shp, dep = c["model"], c["shape"], c["depth"]
+        o_def, _ = run_model(d, m, shp, 120, cache=f"wg{c['key']}p.bin")
+        paths = conv_paths(o_def)
+        chose = max(paths, key=lambda k: paths[k]) if any(paths.values()) else "?"
+        r = interleaved({
+            "on": lambda i, m=m, shp=shp, c=c: conv_us(
+                run_model(d, m, shp, 120, cache=f"wa{c['key']}{i}.bin")[0], dep),
+            "off": lambda i, m=m, shp=shp, c=c: conv_us(
+                run_model(d, m, shp, 120, env="MNN_NO_WINOGRAD=1",
+                          cache=f"wb{c['key']}{i}.bin")[0], dep),
+        }, reps)
+        on, off = r["on"], r["off"]
+        D.setdefault("winograd", {})[c["key"]] = {"path": chose, "default_us": on, "no_wino_us": off}
+        if chose != "wino":
+            verdict = f"Winograd NOT used here (MNN picked `{chose}`) — switch is a no-op"
+        else:
+            verdict = (f"Winograd wins {pct(off, on)} if disabled" if off > on
+                       else f"**disabling Winograd is {pct(off, on)} FASTER**")
+        say(f"| {c['label']} | `{chose}` | {on:.0f} | {off:.0f} | {verdict} |")
+    say("\n> Winograd trades multiply-adds for extra transform passes. It is contraindicated at a\n"
+        "> high GPU clock for these small-channel shapes, but is the top candidate to flip when the\n"
+        "> GPU clock is LOW and memory is fast (arithmetic becomes the scarce resource).\n")
+
+    # ---- 8. fused megakernel
+    say("## 8. Fused 2-layer megakernel\n")
     say("| shape | fused (2 layers) | 2x single conv | verdict |")
     say("|---|---|---|---|")
     for c in cores:
@@ -317,11 +375,12 @@ def main():
                      env="MNN_CONV_FUSED2=1", cache=f"f2{c['key']}{i}.bin")[0]),
         }, reps)
         one, fu = r["one"], r["fused"]
+        D.setdefault("fused2", {})[c["key"]] = {"fused_us": fu, "two_single_us": 2*one}
         say(f"| {c['label']} | {fu:.0f} | {2*one:.0f} | {'FASTER' if fu < 2*one else 'SLOWER'} {pct(fu, 2*one)} |")
     say("")
 
     # ---- 8. real blocks
-    say("## 8. Real model blocks (deployment numbers)\n")
+    say("## 9. Real model blocks (deployment numbers)\n")
     say("| block | plain | PReLU-fused | saving |")
     say("|---|---|---|---|")
     for b in man["blocks"]:
@@ -334,11 +393,12 @@ def main():
         }, 2 if a.quick else 3)
         t0, t1 = r["plain"], r["fused"]
         warn = "" if t1 < t0 * 0.995 else "  ⚠️ no saving — is PReLU fusion supported by this libMNN_CL?"
+        D.setdefault("blocks", {})[b["key"]] = {"plain_us": t0, "prelu_fused_us": t1}
         say(f"| {b['key']} | {t0:.0f} | {t1:.0f} | **{pct(t1, t0)}**{warn} |")
     say("")
 
     # ---- 9. concurrency
-    say("## 9. Concurrency (2 independent streams)\n")
+    say("## 10. Concurrency (2 independent streams)\n")
     MIN = re.compile(r"min= ([\d.]+) ms")
     m0, shp0 = cores[0]["model"], cores[0]["shape"]
     def solo():
@@ -356,6 +416,7 @@ def main():
     rc = interleaved({"solo": lambda i: solo(), "duo": lambda i: duo()}, reps)
     s1, s2 = rc["solo"], rc["duo"]
     if s1 and s2:
+        D["concurrency"] = {"solo_ms": s1, "duo_ms": s2, "ratio": s2/s1}
         say(f"- solo **{s1:.2f} ms**, both-done **{s2:.2f} ms** → **{s2/s1:.2f}x**")
         say(f"- {'SPARE CAPACITY — running independent branches concurrently should pay off' if s2 < 1.6*s1 else 'SATURATED — concurrency will not help'}")
         say("- (wall-clock incl. CPU/submission overhead; treat as a signal)\n")
@@ -363,17 +424,21 @@ def main():
         say("- probe failed\n")
 
     # ---- 10. correctness
-    say("## 10. Correctness (custom kernels vs MNN default output)\n")
+    say("## 11. Correctness (custom kernels vs MNN default output)\n")
     cc = man["correctness"]
     d.push(REFD / "cc_input.txt", f"{DEV}/tdir/input.txt")
     _, base_out = run_model(d, cc["model"], cc["shape"], 1, cache="k0.bin", pull=True)
     say("| kernel | cosine | verdict |")
     say("|---|---|---|")
-    for label, env in [("c8h8w1", "MNN_CONV_SPEC=1 MNN_CONV_FORCE=conv_2d_c8h8w1"),
-                       ("c8h4w1_pa", "MNN_CONV_SPEC=1 MNN_CONV_FORCE=conv_2d_c8h4w1_pa"),
-                       ("LDS", "MNN_CONV_LDS=1")]:
-        _, v = run_model(d, cc["model"], cc["shape"], 1, env=env, cache="k1.bin", pull=True)
+    gates = [("LDS", "MNN_CONV_LDS=1")] + [
+        (v.replace("conv_2d_", ""), f"MNN_CONV_SPEC=1 MNN_CONV_FORCE={v}") for v in sorted(spec_only)]
+    # NB: one cache file PER GATE. Reusing ONE autotune cache file across different forced kernels
+    # makes some runs emit no output at all (empty pull -> cosine nan -> a correct kernel is
+    # reported as FAIL). Always give each forced kernel its own cache file.
+    for gi, (label, env) in enumerate(gates):
+        _, v = run_model(d, cc["model"], cc["shape"], 1, env=env, cache=f"k1_{gi}.bin", pull=True)
         c = cosine(base_out, v)
+        D.setdefault("correctness", {})[label] = c
         say(f"| {label} | {c:.6f} | {'PASS' if c > 0.99 else 'FAIL — do not trust its timing'} |")
     ref2 = [float(x) for x in (REFD / "fused2_ref.txt").read_text().split()]
     _, v = run_model(d, cc["model"], cc["shape"], 1, env="MNN_CONV_FUSED2=1", cache="k2.bin", pull=True)
@@ -383,7 +448,7 @@ def main():
     say("")
 
     # ---- 11. what to do on this device
-    say("## 11. Recommendations for THIS device\n")
+    say("## 12. Recommendations for THIS device\n")
     recs = []
     for c in cores:
         if c["key"] in summary:
@@ -403,14 +468,15 @@ def main():
         recs.append(f"📈 **{cu} compute units** — more occupancy headroom than the 8-CU reference; "
                     "wider/deeper tiles (c8h8w1) and fusion deserve a re-test here, they lost on "
                     "occupancy before.")
-    recs.append("⚙️ **PReLU fusion** (§8) is free and applies to every conv — keep it on.")
+    recs.append("⚙️ **PReLU fusion** (§9) is free and applies to every conv — keep it on.")
     for r in recs: say(f"- {r}")
 
     # ---- 12. clock re-check: did the device throttle over the run?
-    say("\n## 12. GPU clock at END of run (thermal validity check)\n")
+    say("\n## 13. GPU clock at END of run (thermal validity check)\n")
     cooldown(d, cool_s)
     s2c, _ = sample_clock(d, cores[0]["model"], cores[0]["shape"])
     clk_end = max(s2c) if s2c else 0
+    D["clock_end_mhz"] = clk_end; D["clock_start_mhz"] = clk_start
     say(f"- start of run: **{clk_start} MHz**  →  end of run: **{clk_end} MHz**"
         + (f" (samples {s2c})" if s2c else ""))
     if clk_start and clk_end:
@@ -426,7 +492,9 @@ def main():
         "device model + the clock you pinned for analysis._")
 
     out_path.write_text("\n".join(R))
-    print(f"\n=== wrote {out_path} ===")
+    out_path.with_suffix(".json").write_text(json.dumps(D, indent=2))
+    print(f"\n=== wrote {out_path} (+ .json) ===")
+    return out_path, dict(D)
 
 
 if __name__ == "__main__":

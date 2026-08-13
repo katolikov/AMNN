@@ -39,8 +39,8 @@ REPS = 1 if QUICK else 3
 CORES = [(32, 72, 96), (48, 36, 48)]          # (C, H, W) homogeneous cores of Block1 / Block2
 VARIANTS = ["conv_2d_c4h1w1", "conv_2d_c4h1w2", "conv_2d_c4h4w1", "conv_2d_c4h1w4",
             "conv_2d_c8h2w1", "conv_2d_c8h4w1", "conv_2d_c8h1w4", "conv_2d_c8h8w1",
-            "conv_2d_c8h4w1_pa"]
-SPEC_ONLY = {"conv_2d_c8h8w1", "conv_2d_c8h4w1_pa"}   # need MNN_CONV_SPEC to be in the candidate list
+            "conv_2d_c8h4w1_pa", "conv_2d_c8h1w1", "conv_2d_c4h8w1"]
+SPEC_ONLY = {"conv_2d_c8h8w1", "conv_2d_c8h4w1_pa", "conv_2d_c8h1w1", "conv_2d_c4h8w1"}   # need MNN_CONV_SPEC to be in the candidate list
 LDS_TILES = ["16x4", "48x4", "16x12"] if QUICK else ["16x4", "8x4", "24x4", "48x4", "16x2", "16x12"]
 
 # ---- Xclipse 960 reference (measured; see FINDINGS §H) ----
@@ -436,51 +436,8 @@ def sec_flags(hw, shuffle, variants):
     say("")
 
 
-def preflight():
-    """Fail loudly (with the fix) instead of producing a report full of zeros."""
-    from bench import CONVERT, BUILD, MODULE, LIBS
-    bad = []
-    if not CONVERT or not Path(CONVERT).exists():
-        bad.append("MNNConvert not found. Build the host converter:\n"
-                   "      mkdir -p build_host && cd build_host && cmake .. "
-                   "-DMNN_BUILD_CONVERTER=ON -DCMAKE_BUILD_TYPE=Release && make -j8\n"
-                   "      (or set MNN_BENCH_CONVERT=/path/to/MNNConvert)")
-    if not MODULE or len(LIBS) < 3:
-        bad.append("Android build not found (need ModuleBasic.out + libMNN/libMNN_Express/"
-                   "libMNN_CL .so). Build it:\n"
-                   "      mkdir -p build_android_profile && cd build_android_profile && cmake .. \\\n"
-                   "        -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake \\\n"
-                   "        -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-21 "
-                   "-DCMAKE_BUILD_TYPE=Release \\\n"
-                   "        -DMNN_OPENCL=ON -DMNN_ARM82=ON -DMNN_GPU_TIME_PROFILE=ON "
-                   "-DMNN_BUILD_TOOLS=ON -DMNN_SEP_BUILD=ON && make -j8\n"
-                   "      (or set MNN_BENCH_ANDROID_BUILD=/path/to/that/build/dir)")
-    else:
-        cache = Path(BUILD) / "CMakeCache.txt"
-        if cache.exists() and "MNN_GPU_TIME_PROFILE:BOOL=ON" not in cache.read_text():
-            bad.append("The android build has MNN_GPU_TIME_PROFILE=OFF -> no per-kernel GPU times,\n"
-                       "      so EVERY timing would come out 0. Reconfigure that build dir with\n"
-                       "      -DMNN_GPU_TIME_PROFILE=ON and rebuild.")
-    for mod in ("numpy", "onnx"):
-        try:
-            __import__(mod)
-        except ImportError:
-            bad.append(f"python module `{mod}` missing:  pip3 install {mod}")
-    if bad:
-        print("\n!!! preflight failed - fix these first:\n")
-        for i, b in enumerate(bad, 1):
-            print(f"  {i}. {b}\n")
-        print("No-build alternative: build the portable bundle on a machine that HAS the builds\n"
-              "  python3 conv_bench/make_bundle.py\n"
-              "then copy conv_probe_bundle.tar.gz here, untar, and run\n"
-              "  python3 run_report.py --serial <SERIAL> -o report.md\n")
-        sys.exit(1)
-    print(f"preflight OK\n  convert = {CONVERT}\n  module  = {MODULE}")
-
-
 def main():
     pick_serial()
-    preflight()
     out_path = Path(sys.argv[sys.argv.index("-o") + 1]) if "-o" in sys.argv else \
         REPO / "conv_bench" / f"device_report_{SERIAL}.md"
     say(f"# Conv optimization — device report")

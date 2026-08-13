@@ -16,7 +16,8 @@ from onnx import helper, TensorProto, numpy_helper
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "conv_bench"))
 import bench
-from c0_ceiling import per_kernel
+# c0_ceiling is imported lazily inside run_block(): make_bundle only needs
+# load_blocks()/build_onnx(), and a top-level import made that a hard dependency.
 
 CSV = REPO / "conv_bench" / "model_convs_updated.csv"
 LOCAL = REPO / "conv_bench" / "work"
@@ -97,6 +98,7 @@ def run_block(name, convs, fuse_prelu=False):
     out = bench.run_on_device(str(mnn_p), "input", [1, c0["cin"], c0["H"], c0["W"]], "output",
                               loops=120, gpu_mode=68, prec_mem_mask=2,
                               tuning_cache=f"{tag}.cache")
+    from c0_ceiling import per_kernel
     pk, nwin = per_kernel(out)
     tots = [int(t) for t in re.findall(r"total kernel time = (\d+)  us", out)]
     tot_med = sorted(tots[3:])[len(tots[3:]) // 2] if len(tots) > 3 else (tots[-1] if tots else 0)

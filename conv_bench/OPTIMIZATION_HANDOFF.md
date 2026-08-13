@@ -67,6 +67,9 @@ machine to fill.
 | 5 | space2depth on stride-2 heads | **+12–17% slower** | s2d 4×'s Cin (16–34 already past the crossover) → ~1.78× more dense FLOPs + extra rasters. Only wins for Cin≤4 (a true C=1 stem) |
 | 6 | Larger blocking `c8h8w1` (16 accumulators) | **+48.7% slower** | 2× registers → fewer resident waves → worse latency hiding. Generalizes to any 16-acc tile |
 | 7 | Partial accumulators `c8h4w1_pa` (break FMA chain for ILP) | **+29.1% slower** | ILP *worked* (beat c8h8w1 by ~20 pts) but the +registers occupancy cost still dominated. Also targets FMA latency, not the actual memory latency |
+| 8 | Naive max-thread kernel (`c4h1w1`: 1 out float4/thread, no blocking) | **+77% / +30%** | thread count is not the lever — the launch is already ~100× oversubscribed on 8 CUs; occupancy is capped by registers/CU |
+| 9 | `c8h1w1` (2 acc, max threads of any 2-acc variant, input reused across both oc-blocks) | **+71% / +44%** | halving per-lane input loads bought ~nothing (3% @32, −12% @48); the redundant loads are already L2/L1-served (same mechanism as the LDS null result) |
+| 10 | `c4h8w1` (8 acc, 8× weight amortization at the winner's register count) | **+62% / +83%** | falsifies "weight-load-bound": same accs, same threads, same total loads/iter as `c8h4w1`, 194 vs 120 µs. It trades cheap WAVE-UNIFORM weight loads for expensive PER-LANE input loads. Blocking space now bracketed on every axis |
 | — | Subgroup halo-share (shuffle) | **toolchain-blocked** | device has `cl_khr_subgroups` (broadcast/reduce) but ANGLE's **Clspv has NO `sub_group_shuffle`** (`has_subgroup_shuffle=0`). Neighbor-sharing needs shuffle |
 
 **Unifying pattern:** occupancy is the binding constraint on an 8-CU GPU. *Every* kernel idea that
@@ -150,6 +153,24 @@ Vulkan caps (separate query): subgroup size 64, maxWG 1024, LDS 64KB, fp16 yes, 
   fixed hand-picked LWS (16×4)**, not the tuner's search → a per-variant **LWS sweep** (esp. for LDS,
   and a HEAVY vs WIDE exhaustive search generally) is the one untested refinement. Unlikely to flip
   the big regressions (+48.7%, +29%), could matter for near-ties.
+
+## Run everything on another machine + device (portable bundle)
+
+`conv_bench/conv_probe_bundle/` (also shipped as `conv_probe_bundle.tar.gz`, ~37 MB) needs only
+**python3 + adb** on the host — no MNN repo, no MNNConvert, no numpy. One command:
+
+```bash
+python3 run_suite.py <ADB-SERIAL>                      # pin all clocks to max, full suite (~10 min)
+python3 run_suite.py <ADB-SERIAL> --gpu min --mif max --int max   # the low-GPU-clock regime (§H.18)
+python3 run_suite.py <ADB-SERIAL> --gpu-sweep 980,600,300         # is the winner clock-dependent?
+```
+
+`run_suite.py` discovers the GPU / MIF / INT devfreq domains, pins them (needs root — it says so
+plainly when it can't), runs the whole 12-section probe at each clock point, restores the clocks,
+and writes **`suite_<serial>.md`**: a plain-English verdict first, then the clocks the numbers were
+taken at, every strategy per shape, and a cross-clock table showing whether the best kernel changes.
+`run_report.py` is the single-clock runner underneath (call it directly if you pin clocks yourself).
+Every raw number is also written as JSON for diffing between devices.
 
 ## Reproduce / re-test everything
 

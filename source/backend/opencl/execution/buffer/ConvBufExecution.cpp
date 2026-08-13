@@ -778,6 +778,8 @@ ErrorCode ConvBufExecution::onResize(const std::vector<Tensor *> &inputs, const 
         if(nullptr != getenv("MNN_CONV_SPEC")){
             kernelName.push_back("conv_2d_c8h8w1"); itemC.push_back(8); itemH.push_back(8); itemW.push_back(1);
             kernelName.push_back("conv_2d_c8h4w1_pa"); itemC.push_back(8); itemH.push_back(4); itemW.push_back(1);
+            kernelName.push_back("conv_2d_c8h1w1"); itemC.push_back(8); itemH.push_back(1); itemW.push_back(1);
+            kernelName.push_back("conv_2d_c4h8w1"); itemC.push_back(4); itemH.push_back(8); itemW.push_back(1);
         }
         // MNN_CONV_FORCE=<kernelName>: restrict the candidate set to one kernel (clean per-kernel measurement)
         const char* forceKnl = getenv("MNN_CONV_FORCE");
