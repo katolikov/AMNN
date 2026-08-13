@@ -184,7 +184,8 @@ public:
     bool setCache(std::pair<const void*, size_t> cache);
 private:
     bool loadProgram(const std::string &programName, cl::Program *program);
-    bool buildProgram(const std::string &buildOptionsStr, cl::Program *program);
+    bool buildProgram(const std::string &buildOptionsStr, cl::Program *program,
+                      const std::string &programName = "");
     bool getDeviceSupportsExtension(const cl::Device &device, const char *extensionName);
 
 private:

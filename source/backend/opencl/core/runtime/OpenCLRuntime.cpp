@@ -481,15 +481,21 @@ bool OpenCLRuntime::loadProgram(const std::string &programName, cl::Program *pro
     }
 }
 
-bool OpenCLRuntime::buildProgram(const std::string &buildOptionsStr, cl::Program *program) {
+bool OpenCLRuntime::buildProgram(const std::string &buildOptionsStr, cl::Program *program,
+                                 const std::string &programName) {
     AUTOTIME;
     cl_int ret = program->build({*mFirstGPUDevicePtr}, buildOptionsStr.c_str());
     if (ret != CL_SUCCESS) {
+        // Name the program and the exact build options: MNN has dozens of .cl files and they are
+        // built per option-set, so a bare build log is not enough to find the offending source
+        // on an unfamiliar device/driver.
+        MNN_PRINT("Build program FAILED: program=\"%s\" options=\"%s\" err=%d\n",
+                  programName.empty() ? "(unknown)" : programName.c_str(),
+                  buildOptionsStr.c_str(), ret);
         if (program->getBuildInfo<CL_PROGRAM_BUILD_STATUS>(*mFirstGPUDevicePtr) == CL_BUILD_ERROR) {
             std::string buildLog = program->getBuildInfo<CL_PROGRAM_BUILD_LOG>(*mFirstGPUDevicePtr);
             MNN_PRINT("Program build log: %s \n", buildLog.c_str());
         }
-        MNN_PRINT("Build program failed, err:%d ! \n", ret);
         return false;
     }
     return true;
@@ -650,7 +656,7 @@ std::shared_ptr<KernelWrap> OpenCLRuntime::buildKernelWithCache(const std::strin
         program = buildProgramInter->second.program;
     } else {
         this->loadProgram(programName, &program);
-        auto status = this->buildProgram(buildOptionsStr, &program);
+        auto status = this->buildProgram(buildOptionsStr, &program, programName);
         if (!status) {
             FUNC_PRINT_ALL(programName.c_str(), s);
             return nullptr;
@@ -709,7 +715,7 @@ std::shared_ptr<KernelWrap> OpenCLRuntime::buildKernelFromSource(const std::stri
     cl::Program::Sources sources;
     sources.push_back(source);
     cl::Program program = cl::Program(context(), sources);
-    auto status = this->buildProgram(buildOptionsStr, &program);
+    auto status = this->buildProgram(buildOptionsStr, &program, kernelName);
     if (!status) {
         FUNC_PRINT_ALL(kernelName.c_str(), s);
     }
