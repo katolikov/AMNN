@@ -600,6 +600,45 @@ model rather than synthetic sweeps. Practical reading: **no kernel work on the 3
 can approach what changing their shape to 96 channels at equal MACs would deliver.**
 Run was thermally VALID (980 MHz start and end, 0% drift).
 
+### §H.20 — CEILING RECALIBRATION: the practical limit is ~3.0 TFLOP/s, not 6.5
+Every prior conclusion in §H was framed against an assumed ~6.5 TF fp16 peak, which made these
+convs look like "15% of peak, enormous headroom". That framing was wrong. Measured ceiling sweep
+(MNN's own conv, 3x3 s1, fp16 buffer, 200 loops, median of 3):
+| shape | MFLOP | time | TFLOP/s | % of observed ceiling |
+|---|---|---|---|---|
+| 64->64@36x48 | 127.4 | 42.0us | **3.03** | 100% |
+| 128->128@18x24 | 127.4 | 42.0us | **3.03** | 100% |
+| 192->192@12x16 | 127.4 | 46.0us | 2.77 | 91% |
+| 96->96@18x24 | 71.7 | 30.0us | 2.39 | 79% |
+| 256->256@9x12 | 127.4 | 57.0us | 2.24 | 74% |
+| 384->384@6x8 | 127.4 | 87.0us | 1.46 | 48% |
+| **32->32@72x96** | 127.4 | 119.2us | **1.07** | **35%** |
+| **48->48@36x48** | 71.7 | 101.5us | **0.71** | **23%** |
+Two different shapes land on exactly 3.03 TF, which reads as a real hardware/compiler limit. Cross-
+check: 8 CU x 64 lanes x 2 flop x 2 (packed fp16) x 0.98GHz = 2.0 TF, and we EXCEED that, so packed
+fp16 (v_pk_fma_f16) is definitely being emitted and the device is better described as ~4 TF peak
+with MNN reaching ~76% of it.
+**Consequences:** (1) the model's cores run at 23-35% of what this GPU actually delivers, so the
+maximum available from ANY kernel change is ~3x, not ~6x; (2) 96->96@18x24 at 79% of ceiling is
+nearly done, which is exactly why all 13 implementations tie at 30.0us there; (3) every kernel
+strategy failing by <=11% is consistent with the cores being occupancy-starved rather than
+badly implemented.
+
+**The sharpest actionable result: widening channels makes the conv faster in ABSOLUTE terms even
+while doing more work.**
+| conv | MACs | time |
+|---|---|---|
+| 48->48@36x48 | 35.8M | 101.5us |
+| 64->64@36x48 (same spatial, +78% MACs) | 63.7M | **42.0us** |
+| 96->96@18x24 (identical MACs to the 48 case) | 35.8M | **30.0us** |
+1.78x the arithmetic in 0.41x the time (4.3x efficiency), and at equal MACs 3.4x faster. Corroborated
+externally: performance-aware channel pruning on embedded GPUs reports 2x SLOWDOWNS from removing
+12% of channels and 3-10x speedups when channel counts match what the library/hardware prefers
+(arXiv 2002.08697) - i.e. these cliffs are a known, general mobile-GPU effect, not an MNN quirk.
+Also relevant for batch=1 mobile inference: HNTMP / ILP-M Conv reports 2.3x over direct convolution
+and 14.6x over im2col on mobile GPUs (arXiv 1909.02765) - the one published algorithm aimed at
+exactly this regime, and the only remaining unexplored algorithmic lead.
+
 ### §H.7 — FINAL VERDICT (Session A restricted-set specialization)
 Levers tried on the real Block1/Block2: PReLU fusion = BANKED (-8/9% per block, shippable, no new
 code). Falsified on-device with numbers: NC4HW4-input theory, cross-layer fusion (<2%), LDS tiling
