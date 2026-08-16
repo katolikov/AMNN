@@ -960,7 +960,19 @@ bool OpenCLRuntime::setCache(std::pair<const void*, size_t> cache) {
             }
             
             // Load Program
-            if (nullptr != backendinfo->programs()) {
+            //
+            // MNN_CL_NO_PROGRAM_CACHE=1 skips cached program BINARIES entirely and forces every
+            // kernel to be compiled from source at runtime. Cached binaries are driver-specific
+            // (on ANGLE they are SPIR-V); a cache written by another device, driver version or
+            // build can fail validation on load ("SPV validation error" from clspv). The MD5 +
+            // driverVersion guards below catch most of that, but not a driver that reports the
+            // same version string with a different compiler.
+            static const bool sNoProgramCache = (nullptr != getenv("MNN_CL_NO_PROGRAM_CACHE"));
+            if (sNoProgramCache && nullptr != backendinfo->programs()) {
+                MNN_PRINT("[OpenCL] MNN_CL_NO_PROGRAM_CACHE=1: ignoring %d cached program binaries, "
+                          "compiling all kernels from source\n", (int)backendinfo->programs()->size());
+            }
+            if (nullptr != backendinfo->programs() && !sNoProgramCache) {
                 if(backendinfo->driverVersion() == nullptr || backendinfo->driverVersion()->str() != mDriverInfo){
                     res = false;
                     continue;
@@ -998,9 +1010,13 @@ bool OpenCLRuntime::setCache(std::pair<const void*, size_t> cache) {
                         continue;
                     }
                     auto pro = cl::Program(programRaw);
-                    auto res = buildProgram(buildinfo, &pro);
-                    if (!res) {
-                        MNN_ERROR("Can't build %s - %s load program\n", program.c_str(), buildinfo.c_str());
+                    // NB: this used to declare its own `res`, shadowing the cache-validity flag —
+                    // so a cached program that failed to build left the cache marked VALID.
+                    auto buildOk = buildProgram(buildinfo, &pro, program);
+                    if (!buildOk) {
+                        MNN_ERROR("Can't build %s - %s load program (cached binary rejected; "
+                                  "falling back to compiling from source)\n",
+                                  program.c_str(), buildinfo.c_str());
                         res = false;
                         continue;
                     }
