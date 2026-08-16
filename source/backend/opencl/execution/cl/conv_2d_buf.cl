@@ -2237,6 +2237,122 @@ void conv_2d_3x3s1_lds(GLOBAL_SIZE_2_DIMS
 // c8h8w1: register-blocked 3x3 variant, 8 output channels x 8 rows/thread = 16 accumulators
 // (2x the tile height of c8h4w1). More work-in-flight + more input-row reuse; tests whether the
 // autotuner's 8-accumulator optimum is the true optimum. Same NC4HW4 index math as c8h4w1.
+
+// ---------------------------------------------------------------------------------------------
+// conv_2d_3x3s2_lds — LDS-staged 3x3 STRIDE-2 conv (env MNN_CONV_LDS on a stride-2 conv).
+//
+// Why this exists when the stride-1 LDS kernel was falsified: at stride 1 neighbouring threads
+// read neighbouring input pixels, so global access is already fully coalesced and LDS bought
+// nothing (the reuse was L2-served). At STRIDE 2 neighbouring threads read pixels TWO apart, so
+// every cache line is only half used and the request count per useful byte doubles. Staging a
+// CONTIGUOUS input tile in LDS restores full coalescing — a problem that only exists at stride 2.
+//
+// One workgroup = TILE_W x TILE_H outputs for one output channel-block; the (2*TILE_W+1) x
+// (2*TILE_H+1) input patch is loaded once per input channel-block. Reduction order matches
+// conv_2d_c4h1w1. Requires 3x3, stride 2, dilation 1, pad 1, out_w%TILE_W==0, out_h%TILE_H==0.
+#define LDS2_W (2 * TILE_W + 1)
+#define LDS2_H (2 * TILE_H + 1)
+__kernel __attribute__((reqd_work_group_size(TILE_W, TILE_H, 1)))
+void conv_2d_3x3s2_lds(GLOBAL_SIZE_2_DIMS
+                      __global const FLOAT *input,
+                      __global const FLOAT *weight,
+                      __global const FLOAT *bias,
+                      __global FLOAT *output,
+                      __private const int2 in_hw,
+                      __private const int inChannel,
+                      __private const int in_c_blocks,
+                      __private const int batch,
+                      __private const int2 out_hw,
+                      __private const int2 filter_hw,
+                      __private const int2 stride_hw,
+                      __private const int2 pad_hw,
+                      __private const int2 dilate_hw,
+                      __private const int out_w_blocks,
+                      __private const int out_c_blocks,
+                      __private const int out_h_blocks,
+                      __private const int out_c_base_index
+                      #ifdef PRELU
+                      ,__global const FLOAT *slope_ptr
+                      #endif
+) {
+    __local COMPUTE_FLOAT4 lds[LDS2_H * LDS2_W];
+
+    const int gx = get_global_id(0);
+    const int gy = get_global_id(1);
+    const int lx = get_local_id(0);
+    const int ly = get_local_id(1);
+
+    const int out_w = out_hw.y;
+    const int out_h = out_hw.x;
+    const int in_w  = in_hw.y;
+    const int in_h  = in_hw.x;
+
+    const int out_c_idx = gx / out_w;
+    const int out_x     = gx % out_w;
+    const int out_b_idx = gy / out_h;
+    const int out_y     = gy % out_h;
+
+    // input origin of this workgroup's halo (stride 2)
+    const int in_base_x = 2 * (out_x - lx) - pad_hw.y;
+    const int in_base_y = 2 * (out_y - ly) - pad_hw.x;
+
+    COMPUTE_FLOAT4 acc = CONVERT_COMPUTE_FLOAT4(vload4(out_c_idx, bias));
+
+    const int weight_oc_offset = out_c_blocks * 9 * 4;
+    const int lid        = ly * TILE_W + lx;
+    const int nthreads   = TILE_W * TILE_H;
+    const int tile_elems = LDS2_W * LDS2_H;
+
+    for (int ic = 0; ic < in_c_blocks; ic++) {
+        // cooperative, CONTIGUOUS load -> full cache-line utilisation (the whole point)
+        for (int e = lid; e < tile_elems; e += nthreads) {
+            const int ty = e / LDS2_W;
+            const int tx = e % LDS2_W;
+            const int iy = in_base_y + ty;
+            const int ix = in_base_x + tx;
+            COMPUTE_FLOAT4 v = (COMPUTE_FLOAT4)0;
+            if (iy >= 0 && iy < in_h && ix >= 0 && ix < in_w) {
+                const int inp_offset = (((ic * batch + out_b_idx) * in_h + iy) * in_w + ix) * 4;
+                v = CONVERT_COMPUTE_FLOAT4(vload4(0, input + inp_offset));
+            }
+            lds[e] = v;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        const int w_base = (((4 * ic) * out_c_blocks + out_c_idx) * 9) * 4;
+        for (int kh = 0; kh < 3; kh++) {
+            for (int kw = 0; kw < 3; kw++) {
+                COMPUTE_FLOAT4 in0 = lds[(2 * ly + kh) * LDS2_W + (2 * lx + kw)];
+                const int w_off = w_base + (kh * 3 + kw) * 4;
+                COMPUTE_FLOAT4 w0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight + w_off));
+                COMPUTE_FLOAT4 w1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight + w_off + weight_oc_offset));
+                COMPUTE_FLOAT4 w2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight + w_off + weight_oc_offset * 2));
+                COMPUTE_FLOAT4 w3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight + w_off + weight_oc_offset * 3));
+                acc = mad(in0.x, w0, acc);
+                acc = mad(in0.y, w1, acc);
+                acc = mad(in0.z, w2, acc);
+                acc = mad(in0.w, w3, acc);
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+#ifdef RELU
+    acc = fmax(acc, (COMPUTE_FLOAT4)0);
+#endif
+#ifdef RELU6
+    acc = clamp(acc, (COMPUTE_FLOAT4)0, (COMPUTE_FLOAT4)6);
+#endif
+#ifdef PRELU
+    {
+        COMPUTE_FLOAT4 slope_in = CONVERT_COMPUTE_FLOAT4(vload4(out_c_idx, slope_ptr));
+        acc = select(acc * slope_in, acc, acc >= 0);
+    }
+#endif
+    const int out_offset = (((out_b_idx + out_c_idx * batch) * out_h + out_y) * out_w + out_x) * 4;
+    vstore4(CONVERT_FLOAT4(acc), 0, output + out_offset);
+}
+
 __kernel
 void conv_2d_c8h8w1(GLOBAL_SIZE_2_DIMS
                       __global const FLOAT *input,

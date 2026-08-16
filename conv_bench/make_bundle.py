@@ -21,7 +21,19 @@ from bench import convert, LIBS, MODULE
 from block_fixture import load_blocks, build_onnx
 
 OUT = REPO / "conv_bench" / "conv_probe_bundle"
-CORES = [(32, 72, 96), (48, 36, 48)]        # homogeneous cores of the real blocks
+CORES = [(32, 72, 96), (48, 36, 48), (96, 18, 24)]   # homogeneous 6-deep stride-1 cores
+
+# Stride-2 "head" pairs: two 3x3 s2 convs that halve the spatial size twice. Each conv has a
+# different shape, so these are reported PER CONV (matched by the shape tag MNN puts in the
+# kernel name), not as one averaged number.
+HEADS = [
+    ("head18", [dict(cin=18, cout=16, H=288, W=384, stride=2, pad=1, prelu=1),
+                dict(cin=16, cout=32, H=144, W=192, stride=2, pad=1, prelu=1)]),
+    ("head34", [dict(cin=34, cout=32, H=144, W=192, stride=2, pad=1, prelu=1),
+                dict(cin=32, cout=48, H=72,  W=96,  stride=2, pad=1, prelu=1)]),
+    ("head64", [dict(cin=64, cout=64, H=72,  W=96,  stride=2, pad=1, prelu=1),
+                dict(cin=64, cout=96, H=36,  W=48,  stride=2, pad=1, prelu=1)]),
+]
 CC = (32, 24, 48)                            # correctness shape: %16/%4 (LDS) and %6/%6 (fused2) ok
 VARIANTS = ["conv_2d_c4h1w1", "conv_2d_c4h1w2", "conv_2d_c4h4w1", "conv_2d_c4h1w4",
             "conv_2d_c8h2w1", "conv_2d_c8h4w1", "conv_2d_c8h1w4", "conv_2d_c8h8w1",
@@ -85,7 +97,7 @@ def main():
         print(f"   {f.name}  {(OUT/'bin'/f.name).stat().st_size/1e6:.1f} MB")
 
     man = {"variants": VARIANTS, "spec_only": SPEC_ONLY, "lds_tiles": LDS_TILES,
-           "cores": [], "blocks": [], "correctness": {}}
+           "cores": [], "heads": [], "blocks": [], "correctness": {}}
 
     # ---------- core models ----------
     print("== models ==")
@@ -110,6 +122,22 @@ def main():
             "im2col_model": f"ic_{C}.mnn",
             "gemm_model": f"gp_{C}.mnn", "gemm_shape": [1, C * 9, H, W]})
         print(f"   core {key}")
+
+    # ---------- stride-2 head pairs ----------
+    for key, convs in HEADS:
+        p_onnx = tmp / f"{key}.onnx"
+        build_onnx(str(p_onnx), convs)
+        convert(str(p_onnx), str(OUT / "models" / f"{key}.mnn"), fp16=False, fuse_prelu=True)
+        c0 = convs[0]
+        man["heads"].append({
+            "key": key,
+            "label": " -> ".join(f"{c['cin']}->{c['cout']}@{c['H']}x{c['W']} s{c['stride']}"
+                                 for c in convs),
+            "model": f"{key}.mnn", "shape": [1, c0["cin"], c0["H"], c0["W"]],
+            "convs": [{"label": f"{c['cin']}->{c['cout']}@{c['H']}x{c['W']} s{c['stride']}",
+                       # MNN encodes the shape in the kernel name: ...b1ci18hi288wi384co16...
+                       "tag": f"ci{c['cin']}hi{c['H']}wi{c['W']}co{c['cout']}"} for c in convs]})
+        print(f"   head {key}: {man['heads'][-1]['label']}")
 
     # ---------- real blocks ----------
     try:

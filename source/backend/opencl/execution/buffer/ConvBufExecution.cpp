@@ -665,9 +665,15 @@ ErrorCode ConvBufExecution::onResize(const std::vector<Tensor *> &inputs, const 
     } else {
         int TILE_W_LDS = 16, TILE_H_LDS = 4;
         { const char* _t = getenv("MNN_LDS_TILE"); if(_t){ std::string _s(_t); auto _x=_s.find('x'); if(_x!=std::string::npos){ TILE_W_LDS=atoi(_s.substr(0,_x).c_str()); TILE_H_LDS=atoi(_s.substr(_x+1).c_str()); } } }
+        // LDS staging is available for stride 1 AND stride 2. They are different kernels: at
+        // stride 2 neighbouring threads read input pixels two apart, so global loads only use
+        // half of each cache line -- staging a contiguous tile in LDS fixes a coalescing problem
+        // that simply does not exist at stride 1 (which is why the stride-1 variant lost).
+        const int ldsStride = mResource->mStrides[0];
         bool useLDS = (nullptr != getenv("MNN_CONV_LDS"))
             && mResource->mKernelHeight == 3 && mResource->mKernelWidth == 3
-            && mResource->mStrides[0] == 1 && mResource->mStrides[1] == 1
+            && (ldsStride == 1 || ldsStride == 2)
+            && mResource->mStrides[0] == mResource->mStrides[1]
             && mResource->mDilations[0] == 1 && mResource->mDilations[1] == 1
             && mPaddings[0] == 1 && mPaddings[1] == 1
             && (width % TILE_W_LDS == 0) && (height % TILE_H_LDS == 0);
@@ -733,7 +739,7 @@ ErrorCode ConvBufExecution::onResize(const std::vector<Tensor *> &inputs, const 
             buildOption.emplace("-DTILE_W=" + std::to_string(TILE_W_LDS));
             buildOption.emplace("-DTILE_H=" + std::to_string(TILE_H_LDS));
             mKernel.resize(1);
-            mKernel[0] = mOpenCLBackend->getOpenCLRuntime()->buildKernel("conv_2d_buf", "conv_2d_3x3s1_lds", buildOption, mOpenCLBackend->getPrecision());
+            mKernel[0] = mOpenCLBackend->getOpenCLRuntime()->buildKernel("conv_2d_buf", ldsStride == 2 ? "conv_2d_3x3s2_lds" : "conv_2d_3x3s1_lds", buildOption, mOpenCLBackend->getPrecision());
             mGlobalWorkSize = {(uint32_t)(outChannelBlocks * width), (uint32_t)(batch * height)};
             mLocalWorkSize  = {(uint32_t)TILE_W_LDS, (uint32_t)TILE_H_LDS};
             uint32_t idx = 0;

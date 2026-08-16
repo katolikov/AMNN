@@ -90,6 +90,23 @@ def conv_paths(out):
             for k, v in acc.items()}
 
 
+def per_conv_us(out, tags):
+    """Median GPU time for EACH conv in a heterogeneous chain.
+
+    MNN names every conv kernel with its shape, e.g.
+        kernel time = 155 us ConvBuf2D-ori-b1ci18hi288wi384co16ho144wo192kh3kw3-total:...
+    so a "ci18hi288wi384co16" tag identifies one conv unambiguously. Averaging a 2-conv head
+    the way conv_us() does would mix two different shapes into one meaningless number.
+    """
+    acc = {t: [] for t in tags}
+    for m in re.finditer(r"kernel time = (\d+)\s+us (ConvBuf2D-\S+)", out):
+        us, name = int(m.group(1)), m.group(2)
+        for t in tags:
+            if t in name:
+                acc[t].append(us); break
+    return {t: (statistics.median(v[3:]) if len(v) > 3 else 0.0) for t, v in acc.items()}
+
+
 def total_us(out):
     t = [int(x) for x in re.findall(r"total kernel time = (\d+)  us", out)][3:]
     return statistics.median(t) if t else 0.0
@@ -238,7 +255,7 @@ def main(argv=None):
         say(f"\n> This device **throttles under prolonged load** (observed dropping from 980 to "
             "~400-550 MHz after minutes of continuous GPU work). Mitigations used here: every A/B\n"
             "> comparison is **interleaved** (arms alternate, so drift hits both equally) and there are\n"
-            "> **cooldown pauses** between heavy sections. §13 re-measures the clock at the end — if it\n"
+            "> **cooldown pauses** between heavy sections. §14 re-measures the clock at the end — if it\n"
             "> dropped, sections are not comparable across time and should be re-run individually.\n")
     else:
         say("- could not read `/sys/kernel/gpu/gpu_clock` (timings unvalidated)\n")
@@ -295,8 +312,51 @@ def main(argv=None):
         say(f"- **{c['label']}** → default `{base:.1f}µs`, best strategy **`{best}` `{cand[best]:.1f}µs`** {verdict}")
     say("")
 
-    # ---- 5. LDS tiles
-    say("## 5. LDS tile sweep\n")
+    # ---- 5. stride-2 head pairs (per conv)
+    say("## 5. Stride-2 head pairs (per-conv µs, lower is better)\n")
+    heads = man.get("heads", [])
+    if not heads:
+        say("_(no head blocks in this bundle)_\n")
+    else:
+        say("> These are 3x3 **stride-2** convs. The LDS, im2col and fused2 kernels are stride-1\n"
+            "> only, so they cannot run here — only the direct variants apply. Each conv in the\n"
+            "> pair is reported separately (they have different shapes).\n")
+        head_vars = ["MNN default"] + variants
+        for h in heads:
+            say(f"\n**{h['label']}**\n")
+            tags = [c["tag"] for c in h["convs"]]
+            fns = {"MNN default": lambda i, h=h: per_conv_us(
+                run_model(d, h["model"], h["shape"], 60, cache=f"h{h['key']}{i}.bin")[0], tags)}
+            for v in variants:
+                env = ("MNN_CONV_SPEC=1 " if v in spec_only else "") + f"MNN_CONV_FORCE={v}"
+                fns[v] = (lambda i, e=env, v=v, h=h: per_conv_us(
+                    run_model(d, h["model"], h["shape"], 60, env=e,
+                              cache=f"h{h['key']}{v[-5:]}{i}.bin")[0], tags))
+            # interleaved by hand: interleaved() medians floats, these are dicts
+            acc = {k: {t: [] for t in tags} for k in fns}
+            for i in range(reps):
+                for k, f in fns.items():
+                    r = f(i)
+                    for t in tags:
+                        if r.get(t): acc[k][t].append(r[t])
+            row = {k: {t: (statistics.median(v) if v else 0.0) for t, v in d2.items()}
+                   for k, d2 in acc.items()}
+            say("| conv | " + " | ".join(k.replace("conv_2d_", "") for k in head_vars) + " | best |")
+            say("|" + "---|" * (len(head_vars) + 2))
+            for c in h["convs"]:
+                t = c["tag"]
+                cand = {k: row[k][t] for k in head_vars if row[k][t]}
+                best = min(cand, key=lambda k: cand[k]) if cand else "-"
+                say(f"| {c['label']} | " +
+                    " | ".join(f"{row[k][t]:.0f}" if row[k][t] else "-" for k in head_vars) +
+                    f" | **{best.replace('conv_2d_','')}** |")
+            D.setdefault("heads", {})[h["key"]] = {
+                "label": h["label"],
+                "convs": {c["label"]: {k: row[k][c["tag"]] for k in head_vars} for c in h["convs"]}}
+        say("")
+
+    # ---- 6. LDS tiles
+    say("## 6. LDS tile sweep\n")
     say("| shape | " + " | ".join(tiles) + " | best LDS | vs MNN default |")
     say("|" + "---|" * (len(tiles) + 3))
     for c in cores:
@@ -311,7 +371,7 @@ def main(argv=None):
     say("")
 
     # ---- 6. im2col + GEMM
-    say("## 6. im2col + GEMM (and implicit-GEMM headroom)\n")
+    say("## 7. im2col + GEMM (and implicit-GEMM headroom)\n")
     say("| shape | im2col | GEMM | total | MNN default | explicit verdict | **GEMM vs default** |")
     say("|---|---|---|---|---|---|---|")
     for c in cores:
@@ -334,7 +394,7 @@ def main(argv=None):
         "> straightforward if `sub_group_shuffle` is available (§3).\n")
 
     # ---- 7. Winograd: is it even selected, and does disabling it help?
-    say("## 7. Winograd vs direct\n")
+    say("## 8. Winograd vs direct\n")
     say("| shape | path MNN chose | default | Winograd OFF | verdict |")
     say("|---|---|---|---|---|")
     for c in cores:
@@ -363,7 +423,7 @@ def main(argv=None):
         "> GPU clock is LOW and memory is fast (arithmetic becomes the scarce resource).\n")
 
     # ---- 8. fused megakernel
-    say("## 8. Fused 2-layer megakernel\n")
+    say("## 9. Fused 2-layer megakernel\n")
     say("| shape | fused (2 layers) | 2x single conv | verdict |")
     say("|---|---|---|---|")
     for c in cores:
@@ -380,7 +440,7 @@ def main(argv=None):
     say("")
 
     # ---- 8. real blocks
-    say("## 9. Real model blocks (deployment numbers)\n")
+    say("## 10. Real model blocks (deployment numbers)\n")
     say("| block | plain | PReLU-fused | saving |")
     say("|---|---|---|---|")
     for b in man["blocks"]:
@@ -398,7 +458,7 @@ def main(argv=None):
     say("")
 
     # ---- 9. concurrency
-    say("## 10. Concurrency (2 independent streams)\n")
+    say("## 11. Concurrency (2 independent streams)\n")
     MIN = re.compile(r"min= ([\d.]+) ms")
     m0, shp0 = cores[0]["model"], cores[0]["shape"]
     def solo():
@@ -424,7 +484,7 @@ def main(argv=None):
         say("- probe failed\n")
 
     # ---- 10. correctness
-    say("## 11. Correctness (custom kernels vs MNN default output)\n")
+    say("## 12. Correctness (custom kernels vs MNN default output)\n")
     cc = man["correctness"]
     d.push(REFD / "cc_input.txt", f"{DEV}/tdir/input.txt")
     _, base_out = run_model(d, cc["model"], cc["shape"], 1, cache="k0.bin", pull=True)
@@ -448,7 +508,7 @@ def main(argv=None):
     say("")
 
     # ---- 11. what to do on this device
-    say("## 12. Recommendations for THIS device\n")
+    say("## 13. Recommendations for THIS device\n")
     recs = []
     for c in cores:
         if c["key"] in summary:
@@ -468,11 +528,11 @@ def main(argv=None):
         recs.append(f"📈 **{cu} compute units** — more occupancy headroom than the 8-CU reference; "
                     "wider/deeper tiles (c8h8w1) and fusion deserve a re-test here, they lost on "
                     "occupancy before.")
-    recs.append("⚙️ **PReLU fusion** (§9) is free and applies to every conv — keep it on.")
+    recs.append("⚙️ **PReLU fusion** (§10) is free and applies to every conv — keep it on.")
     for r in recs: say(f"- {r}")
 
     # ---- 12. clock re-check: did the device throttle over the run?
-    say("\n## 13. GPU clock at END of run (thermal validity check)\n")
+    say("\n## 14. GPU clock at END of run (thermal validity check)\n")
     cooldown(d, cool_s)
     s2c, _ = sample_clock(d, cores[0]["model"], cores[0]["shape"])
     clk_end = max(s2c) if s2c else 0

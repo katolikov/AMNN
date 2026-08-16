@@ -537,6 +537,51 @@ most likely to flip positive, and the two biggest *live* non-kernel levers (conc
 overhead) are the ones that decay. Re-testing needs a rooted device; env switches already exist
 (`MNN_NO_WINOGRAD`, `MNN_CONV_IM2COL`, `MNN_CONV_SPEC`+`MNN_CONV_FORCE`).
 
+### §H.19 — Stride-2 head pairs: variant sweep + dedicated stride-2 LDS kernel (FALSIFIED)
+New benchmark cases (bundle `heads`): three 2-conv stride-2 pairs, each conv reported SEPARATELY
+by matching the shape tag MNN puts in the kernel name (averaging two different shapes would be
+meaningless). Plus a new 6-deep stride-1 core 96->96@18x24.
+Full 11-variant sweep, per conv (us, Xclipse 960, quick mode):
+| conv | MNN default | c8h4w1 | c8h4w1_pa | c4h1w1 | c4h1w2 | c4h1w4 |
+|---|---|---|---|---|---|---|
+| 18->16@288x384 s2 | 149 | 148 | 148 | 333 | 439 | 712 |
+| 16->32@144x192 s2 | 66 | 66 | 72 | 141 | 178 | 214 |
+| 34->32@144x192 s2 | 139 | 139 | 151 | 305 | 434 | 475 |
+| 32->48@72x96 s2 | 80 | 80 | 71 | 106 | 104 | 110 |
+| 64->64@72x96 s2 | 160 | 160 | 157 | 283 | 269 | 248 |
+| 64->96@36x48 s2 | 103 | 126 | 108 | 109 | 103 | 165 |
+**Finding 1 — w-blocking COLLAPSES at stride 2** (c4h1w4 = 4.8x the default on the first conv; at
+stride 1 the same kernel was only ~2x off). Mechanism: with stride 2 a w-blocked thread covers
+output cols x..x+3, i.e. input cols 2x-1..2x+7, so the wave's reads become strided with real gaps.
+h-blocking does not do this (threads still cover consecutive output columns) and ties the default.
+**Finding 2 — nothing beats MNN's own pick by more than ~11%** (c8h4w1_pa: 80->71, 160->157). The
+direct-blocking space is saturated for stride 2 exactly as it is for stride 1.
+
+**Dedicated stride-2 LDS kernel (`conv_2d_3x3s2_lds`, MNN_CONV_LDS on a stride-2 conv): BUILT,
+CORRECT, FALSIFIED.** Hypothesis: the stride-1 LDS null result does not transfer, because at
+stride 2 neighbouring threads read pixels two apart, so each cache line should be half wasted --
+a coalescing defect that cooperative contiguous staging would fix. Correct (cosine 1.000000, max
+abs diff 0.0 vs the stock path on a [1,32,32,64] s2 fixture) and confirmed to actually run
+(41us -> 61us on that fixture, so not a silent fallback). Measured on the real heads:
+| conv | default | LDS 16x4 | LDS 32x4 | LDS 16x8 | LDS 8x4 |
+|---|---|---|---|---|---|
+| 18->16@288x384 s2 | 148 | 318 | 316 | 316 | 366 |
+| 16->32@144x192 s2 | 66 | 134 | 132 | 133 | 156 |
+| 34->32@144x192 s2 | 139 | 289 | 463 | 643 | 638 |
+| 32->48@72x96 s2 | 80 | 123 | 129 | 178 | 258 |
+2.0-2.5x SLOWER wherever it runs, across every tile tried. The one cell that looked competitive
+(64->64@72x96: LDS 32x4 360 vs default 398) was an artefact twice over: the device was thermally
+drifted (that conv is 160us cooled, not 398), AND out_w=48 is not a multiple of TILE_W=32 so the
+LDS path silently fell back -- a cooled INTERLEAVED re-run gives default 160 / "LDS" 160, +0%,
+i.e. the same kernel measured twice.
+**The hypothesis was WRONG, and the reason is instructive:** at stride 2 with 3x3/pad 1, thread x
+reads input pixels 2x-1,2x,2x+1 and thread x+1 reads 2x+1,2x+2,2x+3 -- the union across the wave
+still covers EVERY input pixel contiguously. The cache lines are fully consumed, just by different
+(thread, tap) pairs. There is no cache-line waste to recover, so LDS only adds barriers and
+occupancy cost, exactly as at stride 1. The real coalescing loss at stride 2 comes from
+W-BLOCKING (Finding 1), not from stride 2 itself.
+Kept as a documented negative behind MNN_CONV_LDS (default off), same as the stride-1 variant.
+
 ### §H.7 — FINAL VERDICT (Session A restricted-set specialization)
 Levers tried on the real Block1/Block2: PReLU fusion = BANKED (-8/9% per block, shippable, no new
 code). Falsified on-device with numbers: NC4HW4-input theory, cross-layer fusion (<2%), LDS tiling
