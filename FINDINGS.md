@@ -639,37 +639,43 @@ Also relevant for batch=1 mobile inference: HNTMP / ILP-M Conv reports 2.3x over
 and 14.6x over im2col on mobile GPUs (arXiv 1909.02765) - the one published algorithm aimed at
 exactly this regime, and the only remaining unexplored algorithmic lead.
 
-### §H.21 — ILP-M / HNTMP (arXiv 1909.02765) evaluated; 2-D register tile measured
-Investigated the one published algorithm aimed at our exact regime (batch=1 mobile-GPU conv).
-**What it is:** ILP-M ("Instruction-Level Parallelism Maximizing"), a.k.a. HNTMP. It maps a thread
-to ONE output channel plus a 2-D spatial register tile `out_reg[wy][wx]`, iterating over space,
-so each loaded filter coefficient is reused across the whole tile with NO barriers. Reported
-14.6x over im2col, 2.30x over direct convolution on Mali-G76.
-**Why most of it does not transfer:**
-- Its core mechanism is barrier-free filter reuse. MNN's direct conv_2d_c* kernels already have
-  NO barriers (only the LDS and fused2 variants do), so that win is already banked.
-- Its benchmarks are ResNet conv2-conv5: 64-512 channels at 7x7-56x56. The paper explicitly does
-  not cover 16-48 channels or large spatial. Its home regime (256@14x14) is where we already
-  measure 2.24-3.03 TFLOP/s = 74-100% of this device's ceiling (§H.20) -- nothing to win there.
-- The one genuinely transferable idea: every MNN variant blocks in h OR w, never BOTH. The 2-D
-  register tile geometry was untested.
-**Built and measured `conv_2d_c4h4w2`** (4 out-channels x 4 rows x 2 cols = 8 accumulators, the
-same register class as the c8h4w1 winner, stride-1 only, MNN_CONV_SPEC). Correct: cosine 0.999996.
-Interleaved, median of 3:
-| core | MNN default | c8h4w1 | c4h4w1 | c4h4w2 (2-D) |
+### §H.21 — ILP-M / HNTMP evaluated; the 2-D register tile WINS on the main core
+Investigated the one published algorithm aimed at our regime (batch=1 mobile-GPU conv).
+**What it is:** ILP-M ("Instruction-Level Parallelism Maximizing"), a.k.a. HNTMP (arXiv 1909.02765).
+A thread owns ONE output channel plus a 2-D spatial register tile `out_reg[wy][wx]`, so each loaded
+filter coefficient is reused across the whole tile with NO barriers. Reported 14.6x over im2col and
+2.30x over direct conv on Mali-G76.
+**Most of it does not transfer:** its core mechanism is barrier-free filter reuse, and MNN's direct
+conv_2d_c* kernels are already barrier-free (only LDS/fused2 use barriers). Its benchmarks are
+ResNet conv2-conv5 (64-512 ch at 7x7-56x56); the paper does not cover 16-48 ch or large spatial, and
+its home regime is where this device already runs at 74-100% of ceiling (§H.20).
+**What DOES transfer:** every MNN variant blocks in h OR w, never BOTH. The 2-D register tile
+geometry was untested. Built `conv_2d_c4h4w2` = 4 out-channels x 4 rows x 2 cols = 8 accumulators
+(the c8h4w1 winner's register class), stride-1 only, env MNN_CONV_SPEC.
+
+**Implementation matters enormously here — the first attempt was a false negative.** A version that
+streamed input rows and dispatched accumulators through a dynamic `for(orow=max(0,r-2); orow<=min(3,r))`
+loop with an if/else chain plus ternary column selects measured **308us** (2.6x slower) and looked
+like a clean falsification. Fully unrolling it -- every input row, output row and tap expanded
+statically, no dynamic accumulator indexing, no selects -- gives **109us on the same shape**. The
+unrolling was worth **2.8x**; the dynamic version was almost certainly spilling accumulators to
+scratch. Lesson: for register-tiled kernels, never judge a geometry from an implementation that
+indexes accumulators dynamically.
+
+**Measured (unrolled, interleaved, cooled; correctness cosine 1.000000 = bit-exact):**
+| core | MNN default | c8h4w1 | c4h4w1 | c4h4w2 (2-D, unrolled) |
 |---|---|---|---|---|
-| 32->32@72x96 | 119.2 | 119.8 | 127.5 | **308.0** |
-| 48->48@36x48 | 101.0 | 118.0 | 104.8 | **304.7** |
-| 96->96@18x24 | 30.2 | 30.3 | 30.3 | 30.7 |
-2.6x slower on both problem cores; on the 96-ch core it ties, like everything else at 79% of ceiling.
-**CAVEAT, stated honestly:** this implementation streams input rows and dispatches accumulators
-through a dynamic `for(orow = max(0,r-2); orow <= min(3,r))` loop with an if/else chain, plus
-ternary selects to pick the input column per tap. That very likely forces dynamic accumulator
-indexing and scratch spilling, which would account for a large part of the 2.6x. A fully unrolled
-version (r=0..5 and orow expanded statically, no selects) is the fair test. The margin is far too
-large to be closed by unrolling alone, so the geometry looks unpromising for these shapes -- but
-this is suggestive, NOT a clean falsification like §H.16/§H.19.
-Kept behind MNN_CONV_SPEC (default off) as a documented, caveated negative.
+| **32->32@72x96** | 119.5 | 119.3 | 127.7 | **109.3  (-8.5%)** |
+| 48->48@36x48 | 101.3 | 116.5 | 105.2 | 112.2 (+11%) |
+| 96->96@18x24 | 30.2 | 30.3 | 30.3 | tie (at 79% of ceiling, everything ties) |
+Raw cooled samples on the winning shape: default [119.8, 119.5, 119.3] vs c4h4w2 [109.3, 109.2, ...],
+i.e. tight and reproducible. **This is the FIRST kernel in the whole investigation to beat MNN's
+autotuned default on the dominant core shape.** It is shape-dependent (wins the large-spatial
+32-channel core, loses the smaller 48-channel one), which is exactly what the autotuner exists to
+resolve -- adding it to the DEFAULT candidate list would let the tuner pick it where it wins.
+**Thermal caveat for anyone reproducing:** this device throttles ~2.75x (119 -> 328us) after
+sustained benchmarking. Medians over a batch that straddles the throttle point are meaningless;
+interleave the arms AND cool between reps.
 
 ### §H.7 — FINAL VERDICT (Session A restricted-set specialization)
 Levers tried on the real Block1/Block2: PReLU fusion = BANKED (-8/9% per block, shippable, no new
