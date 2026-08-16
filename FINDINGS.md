@@ -639,6 +639,38 @@ Also relevant for batch=1 mobile inference: HNTMP / ILP-M Conv reports 2.3x over
 and 14.6x over im2col on mobile GPUs (arXiv 1909.02765) - the one published algorithm aimed at
 exactly this regime, and the only remaining unexplored algorithmic lead.
 
+### §H.21 — ILP-M / HNTMP (arXiv 1909.02765) evaluated; 2-D register tile measured
+Investigated the one published algorithm aimed at our exact regime (batch=1 mobile-GPU conv).
+**What it is:** ILP-M ("Instruction-Level Parallelism Maximizing"), a.k.a. HNTMP. It maps a thread
+to ONE output channel plus a 2-D spatial register tile `out_reg[wy][wx]`, iterating over space,
+so each loaded filter coefficient is reused across the whole tile with NO barriers. Reported
+14.6x over im2col, 2.30x over direct convolution on Mali-G76.
+**Why most of it does not transfer:**
+- Its core mechanism is barrier-free filter reuse. MNN's direct conv_2d_c* kernels already have
+  NO barriers (only the LDS and fused2 variants do), so that win is already banked.
+- Its benchmarks are ResNet conv2-conv5: 64-512 channels at 7x7-56x56. The paper explicitly does
+  not cover 16-48 channels or large spatial. Its home regime (256@14x14) is where we already
+  measure 2.24-3.03 TFLOP/s = 74-100% of this device's ceiling (§H.20) -- nothing to win there.
+- The one genuinely transferable idea: every MNN variant blocks in h OR w, never BOTH. The 2-D
+  register tile geometry was untested.
+**Built and measured `conv_2d_c4h4w2`** (4 out-channels x 4 rows x 2 cols = 8 accumulators, the
+same register class as the c8h4w1 winner, stride-1 only, MNN_CONV_SPEC). Correct: cosine 0.999996.
+Interleaved, median of 3:
+| core | MNN default | c8h4w1 | c4h4w1 | c4h4w2 (2-D) |
+|---|---|---|---|---|
+| 32->32@72x96 | 119.2 | 119.8 | 127.5 | **308.0** |
+| 48->48@36x48 | 101.0 | 118.0 | 104.8 | **304.7** |
+| 96->96@18x24 | 30.2 | 30.3 | 30.3 | 30.7 |
+2.6x slower on both problem cores; on the 96-ch core it ties, like everything else at 79% of ceiling.
+**CAVEAT, stated honestly:** this implementation streams input rows and dispatches accumulators
+through a dynamic `for(orow = max(0,r-2); orow <= min(3,r))` loop with an if/else chain, plus
+ternary selects to pick the input column per tap. That very likely forces dynamic accumulator
+indexing and scratch spilling, which would account for a large part of the 2.6x. A fully unrolled
+version (r=0..5 and orow expanded statically, no selects) is the fair test. The margin is far too
+large to be closed by unrolling alone, so the geometry looks unpromising for these shapes -- but
+this is suggestive, NOT a clean falsification like §H.16/§H.19.
+Kept behind MNN_CONV_SPEC (default off) as a documented, caveated negative.
+
 ### §H.7 — FINAL VERDICT (Session A restricted-set specialization)
 Levers tried on the real Block1/Block2: PReLU fusion = BANKED (-8/9% per block, shippable, no new
 code). Falsified on-device with numbers: NC4HW4-input theory, cross-layer fusion (<2%), LDS tiling

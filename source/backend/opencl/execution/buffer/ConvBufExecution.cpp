@@ -786,6 +786,10 @@ ErrorCode ConvBufExecution::onResize(const std::vector<Tensor *> &inputs, const 
             kernelName.push_back("conv_2d_c8h4w1_pa"); itemC.push_back(8); itemH.push_back(4); itemW.push_back(1);
             kernelName.push_back("conv_2d_c8h1w1"); itemC.push_back(8); itemH.push_back(1); itemW.push_back(1);
             kernelName.push_back("conv_2d_c4h8w1"); itemC.push_back(4); itemH.push_back(8); itemW.push_back(1);
+            // 2-D register tile (ILP-M / HNTMP geometry). Hardcodes stride 1.
+            if(mResource->mStrides[0] == 1 && mResource->mStrides[1] == 1){
+                kernelName.push_back("conv_2d_c4h4w2"); itemC.push_back(4); itemH.push_back(4); itemW.push_back(2);
+            }
         }
         // MNN_CONV_FORCE=<kernelName>: restrict the candidate set to one kernel (clean per-kernel measurement)
         const char* forceKnl = getenv("MNN_CONV_FORCE");

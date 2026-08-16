@@ -2353,6 +2353,120 @@ void conv_2d_3x3s2_lds(GLOBAL_SIZE_2_DIMS
     vstore4(CONVERT_FLOAT4(acc), 0, output + out_offset);
 }
 
+
+// conv_2d_c4h4w2 (env MNN_CONV_SPEC, stride-1 only): the 2-D register tile.
+// Suggested by ILP-M / HNTMP conv (arXiv 1909.02765), which maps a thread to ONE output channel
+// plus a 2-D spatial tile out_reg[wy][wx] and reuses each filter coefficient across the whole
+// tile. Every MNN variant blocks in h OR w, never both, so this geometry was untested.
+// 4 output channels x 4 rows x 2 cols = 8 accumulators: the same register class as the c8h4w1
+// winner, but the work is spread over space instead of over channels. Input rows are streamed
+// (6 rows for 4 output rows), 4 input columns cover both output columns.
+__kernel
+void conv_2d_c4h4w2(GLOBAL_SIZE_2_DIMS
+                      __global const FLOAT *input,
+                      __global const FLOAT *weight,
+                      __global const FLOAT *bias,
+                      __global FLOAT *output,
+                      __private const int2 in_hw,
+                      __private const int inChannel,
+                      __private const int in_c_blocks,
+                      __private const int batch,
+                      __private const int2 out_hw,
+                      __private const int2 filter_hw,
+                      __private const int2 stride_hw,
+                      __private const int2 pad_hw,
+                      __private const int2 dilate_hw,
+                      __private const int out_w_blocks,
+                      __private const int out_c_blocks,
+                      __private const int out_h_blocks,
+                      __private const int out_c_base_index
+                      #ifdef PRELU
+                      ,__global const FLOAT *slope_ptr
+                      #endif
+) {
+    const int out_c_w_idx = get_global_id(0);
+    const int out_b_h_idx = get_global_id(1);
+    DEAL_NON_UNIFORM_DIM2(out_c_w_idx, out_b_h_idx);
+
+    const int out_c_idx = out_c_w_idx / out_w_blocks + out_c_base_index;
+    if(out_c_idx >= out_c_blocks) return;
+    const int out_w_idx = (out_c_w_idx % out_w_blocks) << 1;
+    const int out_b_idx = out_b_h_idx / out_h_blocks;
+    const int out_h_idx = (out_b_h_idx % out_h_blocks) << 2;
+
+    COMPUTE_FLOAT4 b0 = CONVERT_COMPUTE_FLOAT4(vload4(out_c_idx, bias));
+    COMPUTE_FLOAT4 o00 = b0, o01 = b0, o10 = b0, o11 = b0;
+    COMPUTE_FLOAT4 o20 = b0, o21 = b0, o30 = b0, o31 = b0;
+
+    const int in_x0 = out_w_idx - pad_hw.y;         // stride 1
+    const int in_y0 = out_h_idx - pad_hw.x;
+    const int weight_oc_offset = out_c_blocks * 9 * 4;
+    const int in_hw_size = in_hw.x * in_hw.y;
+
+    for(ushort ic = 0; ic < in_c_blocks; ic++) {
+        const int inp_base = (out_b_idx + ic * batch) * in_hw_size * 4;
+        const int w_base = (((4 * ic) * out_c_blocks + out_c_idx) * 9) * 4;
+
+        // stream the 6 input rows that the 4 output rows need
+        for(int r = 0; r < 6; r++) {
+            const int iy = in_y0 + r;
+            COMPUTE_FLOAT4 v0 = (COMPUTE_FLOAT4)0, v1 = (COMPUTE_FLOAT4)0;
+            COMPUTE_FLOAT4 v2 = (COMPUTE_FLOAT4)0, v3 = (COMPUTE_FLOAT4)0;
+            if(iy >= 0 && iy < in_hw.x) {
+                const int row = inp_base + iy * in_hw.y * 4;
+                if(in_x0 + 0 >= 0 && in_x0 + 0 < in_hw.y) v0 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0 + 0) * 4));
+                if(in_x0 + 1 >= 0 && in_x0 + 1 < in_hw.y) v1 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0 + 1) * 4));
+                if(in_x0 + 2 >= 0 && in_x0 + 2 < in_hw.y) v2 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0 + 2) * 4));
+                if(in_x0 + 3 >= 0 && in_x0 + 3 < in_hw.y) v3 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0 + 3) * 4));
+            }
+            // this input row feeds output rows r-2..r (kernel row kh = r - outRow)
+            for(int orow = max(0, r - 2); orow <= min(3, r); orow++) {
+                const int kh = r - orow;
+                for(int kw = 0; kw < 3; kw++) {
+                    const int w_off = w_base + (kh * 3 + kw) * 4;
+                    COMPUTE_FLOAT4 w0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight + w_off));
+                    COMPUTE_FLOAT4 w1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight + w_off + weight_oc_offset));
+                    COMPUTE_FLOAT4 w2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight + w_off + weight_oc_offset * 2));
+                    COMPUTE_FLOAT4 w3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight + w_off + weight_oc_offset * 3));
+                    COMPUTE_FLOAT4 a = (kw == 0) ? v0 : ((kw == 1) ? v1 : v2);   // output col 0
+                    COMPUTE_FLOAT4 b = (kw == 0) ? v1 : ((kw == 1) ? v2 : v3);   // output col 1
+                    COMPUTE_FLOAT4 acc0, acc1;
+                    acc0 = mad(a.x, w0, (COMPUTE_FLOAT4)0); acc0 = mad(a.y, w1, acc0);
+                    acc0 = mad(a.z, w2, acc0); acc0 = mad(a.w, w3, acc0);
+                    acc1 = mad(b.x, w0, (COMPUTE_FLOAT4)0); acc1 = mad(b.y, w1, acc1);
+                    acc1 = mad(b.z, w2, acc1); acc1 = mad(b.w, w3, acc1);
+                    if(orow == 0) { o00 += acc0; o01 += acc1; }
+                    else if(orow == 1) { o10 += acc0; o11 += acc1; }
+                    else if(orow == 2) { o20 += acc0; o21 += acc1; }
+                    else { o30 += acc0; o31 += acc1; }
+                }
+            }
+        }
+    }
+#ifdef RELU
+    o00 = fmax(o00,(COMPUTE_FLOAT4)0); o01 = fmax(o01,(COMPUTE_FLOAT4)0);
+    o10 = fmax(o10,(COMPUTE_FLOAT4)0); o11 = fmax(o11,(COMPUTE_FLOAT4)0);
+    o20 = fmax(o20,(COMPUTE_FLOAT4)0); o21 = fmax(o21,(COMPUTE_FLOAT4)0);
+    o30 = fmax(o30,(COMPUTE_FLOAT4)0); o31 = fmax(o31,(COMPUTE_FLOAT4)0);
+#endif
+#ifdef PRELU
+    {
+        COMPUTE_FLOAT4 sl = CONVERT_COMPUTE_FLOAT4(vload4(out_c_idx, slope_ptr));
+        o00 = select(o00*sl,o00,o00>=0); o01 = select(o01*sl,o01,o01>=0);
+        o10 = select(o10*sl,o10,o10>=0); o11 = select(o11*sl,o11,o11>=0);
+        o20 = select(o20*sl,o20,o20>=0); o21 = select(o21*sl,o21,o21>=0);
+        o30 = select(o30*sl,o30,o30>=0); o31 = select(o31*sl,o31,o31>=0);
+    }
+#endif
+    const int base = (((out_b_idx + out_c_idx * batch) * out_hw.x + out_h_idx) * out_hw.y + out_w_idx) * 4;
+    const int rem_h = out_hw.x - out_h_idx;
+    const int rem_w = out_hw.y - out_w_idx;
+    #define MNNST(o, rr, cc) if(rr < rem_h && cc < rem_w) vstore4(CONVERT_FLOAT4(o), 0, output + base + (rr * out_hw.y + cc) * 4);
+    MNNST(o00,0,0) MNNST(o01,0,1) MNNST(o10,1,0) MNNST(o11,1,1)
+    MNNST(o20,2,0) MNNST(o21,2,1) MNNST(o30,3,0) MNNST(o31,3,1)
+    #undef MNNST
+}
+
 __kernel
 void conv_2d_c8h8w1(GLOBAL_SIZE_2_DIMS
                       __global const FLOAT *input,
