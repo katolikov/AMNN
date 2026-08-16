@@ -677,6 +677,33 @@ resolve -- adding it to the DEFAULT candidate list would let the tuner pick it w
 sustained benchmarking. Medians over a batch that straddles the throttle point are meaningless;
 interleave the arms AND cool between reps.
 
+### §H.22 — 2-D tile shape sweep: geometry beats register count, and the 16-acc theory holds
+Generated the whole 2-D tile family from one template (fully unrolled, no dynamic indexing, stride-1,
+env MNN_CONV_SPEC). All bit-exact (cosine 1.000000). Cooled + interleaved on 32->32@72x96, the
+dominant core (48->48@36x48 numbers in the same batch were thermally invalid -- its default read
+187us against a cooled 101us -- so the 48 figures below come from the earlier cooled run):
+| variant | accs | geometry | 32->32@72x96 | vs default |
+|---|---|---|---|---|
+| MNN default | - | autotuned | 119.7 | - |
+| c8h4w1 | 8 | 8ch x 4rows (1-D) | 120.2 | +0.4% |
+| **c4h4w2** | **8** | **4ch x 4rows x 2cols (2-D)** | **109.3** | **-8.6%** |
+| **c4h2w4** | **8** | **4ch x 2rows x 4cols (2-D)** | **115.5** | **-3.5%** |
+| c4h2w2 | 4 | 4ch x 2rows x 2cols | 130.2 | +8.8% |
+| c4h4w4 | 16 | 4ch x 4rows x 4cols | 399.3 | **+233.7%** |
+**Finding 1 — at EQUAL accumulator count, 2-D beats 1-D.** c4h4w2 (109.3) and c4h2w4 (115.5) both
+beat c8h4w1 (120.2) with the same 8 accumulators. So it is the tile GEOMETRY that matters, not the
+register budget alone: spreading the tile over two spatial axes gives better input reuse per load
+than spreading it over channels or over one axis. TWO different 2-D tiles now beat MNN's autotuned
+default; c4h4w2 reproduces at -8.6% (independently measured -8.5% earlier).
+**Finding 2 — 4 accumulators is too few** (c4h2w2 +8.8%): the tile stops amortising enough.
+**Finding 3 — the 16-accumulator theory SURVIVES.** §H.8 rejected all 16-acc variants by reasoning
+("register pressure is the same for any 16-acc variant so they're expected to regress identically"),
+without building them. c4h4w4 is exactly that test and regresses +233.7% -- worse than c8h8w1's
++48.7%. The theory-only rejection was correct. **The optimum is 8 accumulators arranged in 2-D.**
+On 48->48@36x48 (cooled) c4h4w2 is +11%, i.e. the win is shape-dependent -- which is what the
+autotuner exists to resolve. All variants are kept in the standard suite regardless of whether they
+win on this device: the winner is device- and clock-dependent (§H.18).
+
 ### §H.7 — FINAL VERDICT (Session A restricted-set specialization)
 Levers tried on the real Block1/Block2: PReLU fusion = BANKED (-8/9% per block, shippable, no new
 code). Falsified on-device with numbers: NC4HW4-input theory, cross-layer fusion (<2%), LDS tiling

@@ -202,6 +202,7 @@ def main(argv=None):
     cores = man["cores"]           # [{key,label,C,H,W}]
     variants = man["variants"]     # [kernel names]
     spec_only = set(man["spec_only"])
+    stride1_only = set(man.get("stride1_only", []))
     tiles = man["lds_tiles"][:3] if a.quick else man["lds_tiles"]
     out_path = Path(a.out) if a.out else HERE / f"report_{serial}.md"
 
@@ -321,13 +322,16 @@ def main(argv=None):
         say("> These are 3x3 **stride-2** convs. The LDS, im2col and fused2 kernels are stride-1\n"
             "> only, so they cannot run here — only the direct variants apply. Each conv in the\n"
             "> pair is reported separately (they have different shapes).\n")
-        head_vars = ["MNN default"] + variants
+        head_vars = ["MNN default"] + [v for v in variants if v not in stride1_only]
+        if stride1_only:
+            say("> Skipped here (stride-1 only): "
+                + ", ".join(sorted(v.replace("conv_2d_", "") for v in stride1_only)) + "\n")
         for h in heads:
             say(f"\n**{h['label']}**\n")
             tags = [c["tag"] for c in h["convs"]]
             fns = {"MNN default": lambda i, h=h: per_conv_us(
                 run_model(d, h["model"], h["shape"], 60, cache=f"h{h['key']}{i}.bin")[0], tags)}
-            for v in variants:
+            for v in head_vars[1:]:
                 env = ("MNN_CONV_SPEC=1 " if v in spec_only else "") + f"MNN_CONV_FORCE={v}"
                 fns[v] = (lambda i, e=env, v=v, h=h: per_conv_us(
                     run_model(d, h["model"], h["shape"], 60, env=e,

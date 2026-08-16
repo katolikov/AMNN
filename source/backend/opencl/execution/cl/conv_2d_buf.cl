@@ -3013,6 +3013,1817 @@ void conv_2d_c4h4w2(GLOBAL_SIZE_2_DIMS
     if(3 < rh && 1 < rw) vstore4(CONVERT_FLOAT4(o3b), 0, output + base + out_hw.y*12 + 4);
 }
 
+// conv_2d_c4h2w2 (env MNN_CONV_SPEC, stride-1 only): 2-D register tile, 2x2 outputs,
+// 16 outputs/thread = 4 float4 accumulators. FULLY UNROLLED (no dynamic accumulator
+// indexing, no column selects) -- see FINDINGS §H.21: a dynamic version of this geometry measured
+// 2.6x SLOWER purely from scratch spilling.
+__kernel
+void conv_2d_c4h2w2(GLOBAL_SIZE_2_DIMS
+                      __global const FLOAT *input, __global const FLOAT *weight,
+                      __global const FLOAT *bias, __global FLOAT *output,
+                      __private const int2 in_hw, __private const int inChannel,
+                      __private const int in_c_blocks, __private const int batch,
+                      __private const int2 out_hw, __private const int2 filter_hw,
+                      __private const int2 stride_hw, __private const int2 pad_hw,
+                      __private const int2 dilate_hw, __private const int out_w_blocks,
+                      __private const int out_c_blocks, __private const int out_h_blocks,
+                      __private const int out_c_base_index
+                      #ifdef PRELU
+                      ,__global const FLOAT *slope_ptr
+                      #endif
+) {
+    const int out_c_w_idx = get_global_id(0);
+    const int out_b_h_idx = get_global_id(1);
+    DEAL_NON_UNIFORM_DIM2(out_c_w_idx, out_b_h_idx);
+    const int out_c_idx = out_c_w_idx / out_w_blocks + out_c_base_index;
+    if(out_c_idx >= out_c_blocks) return;
+    const int out_w_idx = (out_c_w_idx % out_w_blocks) * 2;
+    const int out_b_idx = out_b_h_idx / out_h_blocks;
+    const int out_h_idx = (out_b_h_idx % out_h_blocks) * 2;
+    COMPUTE_FLOAT4 bv = CONVERT_COMPUTE_FLOAT4(vload4(out_c_idx, bias));
+    COMPUTE_FLOAT4 o0_0=bv, o0_1=bv, o1_0=bv, o1_1=bv;
+    const int in_x0 = out_w_idx - pad_hw.y;
+    const int in_y0 = out_h_idx - pad_hw.x;
+    const int weight_oc_offset = out_c_blocks * 9 * 4;
+    const int in_hw_size = in_hw.x * in_hw.y;
+    for(ushort ic = 0; ic < in_c_blocks; ic++) {
+        const int inp_base = (out_b_idx + ic * batch) * in_hw_size * 4;
+        const int w_base = (((4 * ic) * out_c_blocks + out_c_idx) * 9) * 4;
+        { const int iy = in_y0 + 0;
+          COMPUTE_FLOAT4 v0=(COMPUTE_FLOAT4)0, v1=(COMPUTE_FLOAT4)0, v2=(COMPUTE_FLOAT4)0, v3=(COMPUTE_FLOAT4)0;
+          if(iy >= 0 && iy < in_hw.x) { const int row = inp_base + iy * in_hw.y * 4;
+            if(in_x0+0 >= 0 && in_x0+0 < in_hw.y) v0 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+0)*4));
+            if(in_x0+1 >= 0 && in_x0+1 < in_hw.y) v1 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+1)*4));
+            if(in_x0+2 >= 0 && in_x0+2 < in_hw.y) v2 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+2)*4));
+            if(in_x0+3 >= 0 && in_x0+3 < in_hw.y) v3 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+3)*4));
+          }
+          { const int wo = w_base + (0*3+0)*4;
+            COMPUTE_FLOAT4 k0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo));
+            COMPUTE_FLOAT4 k1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset));
+            COMPUTE_FLOAT4 k2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*2));
+            COMPUTE_FLOAT4 k3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*3));
+            o0_0 = mad(v0.x, k0, o0_0);
+            o0_0 = mad(v0.y, k1, o0_0);
+            o0_0 = mad(v0.z, k2, o0_0);
+            o0_0 = mad(v0.w, k3, o0_0);
+            o0_1 = mad(v1.x, k0, o0_1);
+            o0_1 = mad(v1.y, k1, o0_1);
+            o0_1 = mad(v1.z, k2, o0_1);
+            o0_1 = mad(v1.w, k3, o0_1);
+          }
+          { const int wo = w_base + (0*3+1)*4;
+            COMPUTE_FLOAT4 k0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo));
+            COMPUTE_FLOAT4 k1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset));
+            COMPUTE_FLOAT4 k2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*2));
+            COMPUTE_FLOAT4 k3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*3));
+            o0_0 = mad(v1.x, k0, o0_0);
+            o0_0 = mad(v1.y, k1, o0_0);
+            o0_0 = mad(v1.z, k2, o0_0);
+            o0_0 = mad(v1.w, k3, o0_0);
+            o0_1 = mad(v2.x, k0, o0_1);
+            o0_1 = mad(v2.y, k1, o0_1);
+            o0_1 = mad(v2.z, k2, o0_1);
+            o0_1 = mad(v2.w, k3, o0_1);
+          }
+          { const int wo = w_base + (0*3+2)*4;
+            COMPUTE_FLOAT4 k0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo));
+            COMPUTE_FLOAT4 k1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset));
+            COMPUTE_FLOAT4 k2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*2));
+            COMPUTE_FLOAT4 k3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*3));
+            o0_0 = mad(v2.x, k0, o0_0);
+            o0_0 = mad(v2.y, k1, o0_0);
+            o0_0 = mad(v2.z, k2, o0_0);
+            o0_0 = mad(v2.w, k3, o0_0);
+            o0_1 = mad(v3.x, k0, o0_1);
+            o0_1 = mad(v3.y, k1, o0_1);
+            o0_1 = mad(v3.z, k2, o0_1);
+            o0_1 = mad(v3.w, k3, o0_1);
+          }
+        }
+        { const int iy = in_y0 + 1;
+          COMPUTE_FLOAT4 v0=(COMPUTE_FLOAT4)0, v1=(COMPUTE_FLOAT4)0, v2=(COMPUTE_FLOAT4)0, v3=(COMPUTE_FLOAT4)0;
+          if(iy >= 0 && iy < in_hw.x) { const int row = inp_base + iy * in_hw.y * 4;
+            if(in_x0+0 >= 0 && in_x0+0 < in_hw.y) v0 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+0)*4));
+            if(in_x0+1 >= 0 && in_x0+1 < in_hw.y) v1 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+1)*4));
+            if(in_x0+2 >= 0 && in_x0+2 < in_hw.y) v2 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+2)*4));
+            if(in_x0+3 >= 0 && in_x0+3 < in_hw.y) v3 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+3)*4));
+          }
+          { const int wo = w_base + (1*3+0)*4;
+            COMPUTE_FLOAT4 k0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo));
+            COMPUTE_FLOAT4 k1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset));
+            COMPUTE_FLOAT4 k2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*2));
+            COMPUTE_FLOAT4 k3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*3));
+            o0_0 = mad(v0.x, k0, o0_0);
+            o0_0 = mad(v0.y, k1, o0_0);
+            o0_0 = mad(v0.z, k2, o0_0);
+            o0_0 = mad(v0.w, k3, o0_0);
+            o0_1 = mad(v1.x, k0, o0_1);
+            o0_1 = mad(v1.y, k1, o0_1);
+            o0_1 = mad(v1.z, k2, o0_1);
+            o0_1 = mad(v1.w, k3, o0_1);
+          }
+          { const int wo = w_base + (1*3+1)*4;
+            COMPUTE_FLOAT4 k0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo));
+            COMPUTE_FLOAT4 k1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset));
+            COMPUTE_FLOAT4 k2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*2));
+            COMPUTE_FLOAT4 k3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*3));
+            o0_0 = mad(v1.x, k0, o0_0);
+            o0_0 = mad(v1.y, k1, o0_0);
+            o0_0 = mad(v1.z, k2, o0_0);
+            o0_0 = mad(v1.w, k3, o0_0);
+            o0_1 = mad(v2.x, k0, o0_1);
+            o0_1 = mad(v2.y, k1, o0_1);
+            o0_1 = mad(v2.z, k2, o0_1);
+            o0_1 = mad(v2.w, k3, o0_1);
+          }
+          { const int wo = w_base + (1*3+2)*4;
+            COMPUTE_FLOAT4 k0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo));
+            COMPUTE_FLOAT4 k1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset));
+            COMPUTE_FLOAT4 k2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*2));
+            COMPUTE_FLOAT4 k3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*3));
+            o0_0 = mad(v2.x, k0, o0_0);
+            o0_0 = mad(v2.y, k1, o0_0);
+            o0_0 = mad(v2.z, k2, o0_0);
+            o0_0 = mad(v2.w, k3, o0_0);
+            o0_1 = mad(v3.x, k0, o0_1);
+            o0_1 = mad(v3.y, k1, o0_1);
+            o0_1 = mad(v3.z, k2, o0_1);
+            o0_1 = mad(v3.w, k3, o0_1);
+          }
+          { const int wo = w_base + (0*3+0)*4;
+            COMPUTE_FLOAT4 k0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo));
+            COMPUTE_FLOAT4 k1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset));
+            COMPUTE_FLOAT4 k2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*2));
+            COMPUTE_FLOAT4 k3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*3));
+            o1_0 = mad(v0.x, k0, o1_0);
+            o1_0 = mad(v0.y, k1, o1_0);
+            o1_0 = mad(v0.z, k2, o1_0);
+            o1_0 = mad(v0.w, k3, o1_0);
+            o1_1 = mad(v1.x, k0, o1_1);
+            o1_1 = mad(v1.y, k1, o1_1);
+            o1_1 = mad(v1.z, k2, o1_1);
+            o1_1 = mad(v1.w, k3, o1_1);
+          }
+          { const int wo = w_base + (0*3+1)*4;
+            COMPUTE_FLOAT4 k0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo));
+            COMPUTE_FLOAT4 k1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset));
+            COMPUTE_FLOAT4 k2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*2));
+            COMPUTE_FLOAT4 k3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*3));
+            o1_0 = mad(v1.x, k0, o1_0);
+            o1_0 = mad(v1.y, k1, o1_0);
+            o1_0 = mad(v1.z, k2, o1_0);
+            o1_0 = mad(v1.w, k3, o1_0);
+            o1_1 = mad(v2.x, k0, o1_1);
+            o1_1 = mad(v2.y, k1, o1_1);
+            o1_1 = mad(v2.z, k2, o1_1);
+            o1_1 = mad(v2.w, k3, o1_1);
+          }
+          { const int wo = w_base + (0*3+2)*4;
+            COMPUTE_FLOAT4 k0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo));
+            COMPUTE_FLOAT4 k1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset));
+            COMPUTE_FLOAT4 k2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*2));
+            COMPUTE_FLOAT4 k3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*3));
+            o1_0 = mad(v2.x, k0, o1_0);
+            o1_0 = mad(v2.y, k1, o1_0);
+            o1_0 = mad(v2.z, k2, o1_0);
+            o1_0 = mad(v2.w, k3, o1_0);
+            o1_1 = mad(v3.x, k0, o1_1);
+            o1_1 = mad(v3.y, k1, o1_1);
+            o1_1 = mad(v3.z, k2, o1_1);
+            o1_1 = mad(v3.w, k3, o1_1);
+          }
+        }
+        { const int iy = in_y0 + 2;
+          COMPUTE_FLOAT4 v0=(COMPUTE_FLOAT4)0, v1=(COMPUTE_FLOAT4)0, v2=(COMPUTE_FLOAT4)0, v3=(COMPUTE_FLOAT4)0;
+          if(iy >= 0 && iy < in_hw.x) { const int row = inp_base + iy * in_hw.y * 4;
+            if(in_x0+0 >= 0 && in_x0+0 < in_hw.y) v0 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+0)*4));
+            if(in_x0+1 >= 0 && in_x0+1 < in_hw.y) v1 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+1)*4));
+            if(in_x0+2 >= 0 && in_x0+2 < in_hw.y) v2 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+2)*4));
+            if(in_x0+3 >= 0 && in_x0+3 < in_hw.y) v3 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+3)*4));
+          }
+          { const int wo = w_base + (2*3+0)*4;
+            COMPUTE_FLOAT4 k0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo));
+            COMPUTE_FLOAT4 k1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset));
+            COMPUTE_FLOAT4 k2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*2));
+            COMPUTE_FLOAT4 k3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*3));
+            o0_0 = mad(v0.x, k0, o0_0);
+            o0_0 = mad(v0.y, k1, o0_0);
+            o0_0 = mad(v0.z, k2, o0_0);
+            o0_0 = mad(v0.w, k3, o0_0);
+            o0_1 = mad(v1.x, k0, o0_1);
+            o0_1 = mad(v1.y, k1, o0_1);
+            o0_1 = mad(v1.z, k2, o0_1);
+            o0_1 = mad(v1.w, k3, o0_1);
+          }
+          { const int wo = w_base + (2*3+1)*4;
+            COMPUTE_FLOAT4 k0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo));
+            COMPUTE_FLOAT4 k1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset));
+            COMPUTE_FLOAT4 k2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*2));
+            COMPUTE_FLOAT4 k3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*3));
+            o0_0 = mad(v1.x, k0, o0_0);
+            o0_0 = mad(v1.y, k1, o0_0);
+            o0_0 = mad(v1.z, k2, o0_0);
+            o0_0 = mad(v1.w, k3, o0_0);
+            o0_1 = mad(v2.x, k0, o0_1);
+            o0_1 = mad(v2.y, k1, o0_1);
+            o0_1 = mad(v2.z, k2, o0_1);
+            o0_1 = mad(v2.w, k3, o0_1);
+          }
+          { const int wo = w_base + (2*3+2)*4;
+            COMPUTE_FLOAT4 k0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo));
+            COMPUTE_FLOAT4 k1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset));
+            COMPUTE_FLOAT4 k2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*2));
+            COMPUTE_FLOAT4 k3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*3));
+            o0_0 = mad(v2.x, k0, o0_0);
+            o0_0 = mad(v2.y, k1, o0_0);
+            o0_0 = mad(v2.z, k2, o0_0);
+            o0_0 = mad(v2.w, k3, o0_0);
+            o0_1 = mad(v3.x, k0, o0_1);
+            o0_1 = mad(v3.y, k1, o0_1);
+            o0_1 = mad(v3.z, k2, o0_1);
+            o0_1 = mad(v3.w, k3, o0_1);
+          }
+          { const int wo = w_base + (1*3+0)*4;
+            COMPUTE_FLOAT4 k0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo));
+            COMPUTE_FLOAT4 k1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset));
+            COMPUTE_FLOAT4 k2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*2));
+            COMPUTE_FLOAT4 k3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*3));
+            o1_0 = mad(v0.x, k0, o1_0);
+            o1_0 = mad(v0.y, k1, o1_0);
+            o1_0 = mad(v0.z, k2, o1_0);
+            o1_0 = mad(v0.w, k3, o1_0);
+            o1_1 = mad(v1.x, k0, o1_1);
+            o1_1 = mad(v1.y, k1, o1_1);
+            o1_1 = mad(v1.z, k2, o1_1);
+            o1_1 = mad(v1.w, k3, o1_1);
+          }
+          { const int wo = w_base + (1*3+1)*4;
+            COMPUTE_FLOAT4 k0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo));
+            COMPUTE_FLOAT4 k1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset));
+            COMPUTE_FLOAT4 k2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*2));
+            COMPUTE_FLOAT4 k3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*3));
+            o1_0 = mad(v1.x, k0, o1_0);
+            o1_0 = mad(v1.y, k1, o1_0);
+            o1_0 = mad(v1.z, k2, o1_0);
+            o1_0 = mad(v1.w, k3, o1_0);
+            o1_1 = mad(v2.x, k0, o1_1);
+            o1_1 = mad(v2.y, k1, o1_1);
+            o1_1 = mad(v2.z, k2, o1_1);
+            o1_1 = mad(v2.w, k3, o1_1);
+          }
+          { const int wo = w_base + (1*3+2)*4;
+            COMPUTE_FLOAT4 k0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo));
+            COMPUTE_FLOAT4 k1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset));
+            COMPUTE_FLOAT4 k2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*2));
+            COMPUTE_FLOAT4 k3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*3));
+            o1_0 = mad(v2.x, k0, o1_0);
+            o1_0 = mad(v2.y, k1, o1_0);
+            o1_0 = mad(v2.z, k2, o1_0);
+            o1_0 = mad(v2.w, k3, o1_0);
+            o1_1 = mad(v3.x, k0, o1_1);
+            o1_1 = mad(v3.y, k1, o1_1);
+            o1_1 = mad(v3.z, k2, o1_1);
+            o1_1 = mad(v3.w, k3, o1_1);
+          }
+        }
+        { const int iy = in_y0 + 3;
+          COMPUTE_FLOAT4 v0=(COMPUTE_FLOAT4)0, v1=(COMPUTE_FLOAT4)0, v2=(COMPUTE_FLOAT4)0, v3=(COMPUTE_FLOAT4)0;
+          if(iy >= 0 && iy < in_hw.x) { const int row = inp_base + iy * in_hw.y * 4;
+            if(in_x0+0 >= 0 && in_x0+0 < in_hw.y) v0 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+0)*4));
+            if(in_x0+1 >= 0 && in_x0+1 < in_hw.y) v1 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+1)*4));
+            if(in_x0+2 >= 0 && in_x0+2 < in_hw.y) v2 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+2)*4));
+            if(in_x0+3 >= 0 && in_x0+3 < in_hw.y) v3 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+3)*4));
+          }
+          { const int wo = w_base + (2*3+0)*4;
+            COMPUTE_FLOAT4 k0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo));
+            COMPUTE_FLOAT4 k1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset));
+            COMPUTE_FLOAT4 k2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*2));
+            COMPUTE_FLOAT4 k3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*3));
+            o1_0 = mad(v0.x, k0, o1_0);
+            o1_0 = mad(v0.y, k1, o1_0);
+            o1_0 = mad(v0.z, k2, o1_0);
+            o1_0 = mad(v0.w, k3, o1_0);
+            o1_1 = mad(v1.x, k0, o1_1);
+            o1_1 = mad(v1.y, k1, o1_1);
+            o1_1 = mad(v1.z, k2, o1_1);
+            o1_1 = mad(v1.w, k3, o1_1);
+          }
+          { const int wo = w_base + (2*3+1)*4;
+            COMPUTE_FLOAT4 k0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo));
+            COMPUTE_FLOAT4 k1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset));
+            COMPUTE_FLOAT4 k2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*2));
+            COMPUTE_FLOAT4 k3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*3));
+            o1_0 = mad(v1.x, k0, o1_0);
+            o1_0 = mad(v1.y, k1, o1_0);
+            o1_0 = mad(v1.z, k2, o1_0);
+            o1_0 = mad(v1.w, k3, o1_0);
+            o1_1 = mad(v2.x, k0, o1_1);
+            o1_1 = mad(v2.y, k1, o1_1);
+            o1_1 = mad(v2.z, k2, o1_1);
+            o1_1 = mad(v2.w, k3, o1_1);
+          }
+          { const int wo = w_base + (2*3+2)*4;
+            COMPUTE_FLOAT4 k0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo));
+            COMPUTE_FLOAT4 k1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset));
+            COMPUTE_FLOAT4 k2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*2));
+            COMPUTE_FLOAT4 k3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*3));
+            o1_0 = mad(v2.x, k0, o1_0);
+            o1_0 = mad(v2.y, k1, o1_0);
+            o1_0 = mad(v2.z, k2, o1_0);
+            o1_0 = mad(v2.w, k3, o1_0);
+            o1_1 = mad(v3.x, k0, o1_1);
+            o1_1 = mad(v3.y, k1, o1_1);
+            o1_1 = mad(v3.z, k2, o1_1);
+            o1_1 = mad(v3.w, k3, o1_1);
+          }
+        }
+    }
+#ifdef RELU
+    o0_0 = fmax(o0_0,(COMPUTE_FLOAT4)0);
+    o0_1 = fmax(o0_1,(COMPUTE_FLOAT4)0);
+    o1_0 = fmax(o1_0,(COMPUTE_FLOAT4)0);
+    o1_1 = fmax(o1_1,(COMPUTE_FLOAT4)0);
+#endif
+#ifdef PRELU
+    { COMPUTE_FLOAT4 sl = CONVERT_COMPUTE_FLOAT4(vload4(out_c_idx, slope_ptr));
+      o0_0 = select(o0_0*sl,o0_0,o0_0>=0);
+      o0_1 = select(o0_1*sl,o0_1,o0_1>=0);
+      o1_0 = select(o1_0*sl,o1_0,o1_0>=0);
+      o1_1 = select(o1_1*sl,o1_1,o1_1>=0);
+    }
+#endif
+    const int base = (((out_b_idx + out_c_idx * batch) * out_hw.x + out_h_idx) * out_hw.y + out_w_idx) * 4;
+    const int rh = out_hw.x - out_h_idx; const int rw = out_hw.y - out_w_idx;
+    if(0 < rh && 0 < rw) vstore4(CONVERT_FLOAT4(o0_0), 0, output + base + (0*out_hw.y + 0)*4);
+    if(0 < rh && 1 < rw) vstore4(CONVERT_FLOAT4(o0_1), 0, output + base + (0*out_hw.y + 1)*4);
+    if(1 < rh && 0 < rw) vstore4(CONVERT_FLOAT4(o1_0), 0, output + base + (1*out_hw.y + 0)*4);
+    if(1 < rh && 1 < rw) vstore4(CONVERT_FLOAT4(o1_1), 0, output + base + (1*out_hw.y + 1)*4);
+}
+
+// conv_2d_c4h2w4 (env MNN_CONV_SPEC, stride-1 only): 2-D register tile, 2x4 outputs,
+// 32 outputs/thread = 8 float4 accumulators. FULLY UNROLLED (no dynamic accumulator
+// indexing, no column selects) -- see FINDINGS §H.21: a dynamic version of this geometry measured
+// 2.6x SLOWER purely from scratch spilling.
+__kernel
+void conv_2d_c4h2w4(GLOBAL_SIZE_2_DIMS
+                      __global const FLOAT *input, __global const FLOAT *weight,
+                      __global const FLOAT *bias, __global FLOAT *output,
+                      __private const int2 in_hw, __private const int inChannel,
+                      __private const int in_c_blocks, __private const int batch,
+                      __private const int2 out_hw, __private const int2 filter_hw,
+                      __private const int2 stride_hw, __private const int2 pad_hw,
+                      __private const int2 dilate_hw, __private const int out_w_blocks,
+                      __private const int out_c_blocks, __private const int out_h_blocks,
+                      __private const int out_c_base_index
+                      #ifdef PRELU
+                      ,__global const FLOAT *slope_ptr
+                      #endif
+) {
+    const int out_c_w_idx = get_global_id(0);
+    const int out_b_h_idx = get_global_id(1);
+    DEAL_NON_UNIFORM_DIM2(out_c_w_idx, out_b_h_idx);
+    const int out_c_idx = out_c_w_idx / out_w_blocks + out_c_base_index;
+    if(out_c_idx >= out_c_blocks) return;
+    const int out_w_idx = (out_c_w_idx % out_w_blocks) * 4;
+    const int out_b_idx = out_b_h_idx / out_h_blocks;
+    const int out_h_idx = (out_b_h_idx % out_h_blocks) * 2;
+    COMPUTE_FLOAT4 bv = CONVERT_COMPUTE_FLOAT4(vload4(out_c_idx, bias));
+    COMPUTE_FLOAT4 o0_0=bv, o0_1=bv, o0_2=bv, o0_3=bv, o1_0=bv, o1_1=bv, o1_2=bv, o1_3=bv;
+    const int in_x0 = out_w_idx - pad_hw.y;
+    const int in_y0 = out_h_idx - pad_hw.x;
+    const int weight_oc_offset = out_c_blocks * 9 * 4;
+    const int in_hw_size = in_hw.x * in_hw.y;
+    for(ushort ic = 0; ic < in_c_blocks; ic++) {
+        const int inp_base = (out_b_idx + ic * batch) * in_hw_size * 4;
+        const int w_base = (((4 * ic) * out_c_blocks + out_c_idx) * 9) * 4;
+        { const int iy = in_y0 + 0;
+          COMPUTE_FLOAT4 v0=(COMPUTE_FLOAT4)0, v1=(COMPUTE_FLOAT4)0, v2=(COMPUTE_FLOAT4)0, v3=(COMPUTE_FLOAT4)0, v4=(COMPUTE_FLOAT4)0, v5=(COMPUTE_FLOAT4)0;
+          if(iy >= 0 && iy < in_hw.x) { const int row = inp_base + iy * in_hw.y * 4;
+            if(in_x0+0 >= 0 && in_x0+0 < in_hw.y) v0 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+0)*4));
+            if(in_x0+1 >= 0 && in_x0+1 < in_hw.y) v1 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+1)*4));
+            if(in_x0+2 >= 0 && in_x0+2 < in_hw.y) v2 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+2)*4));
+            if(in_x0+3 >= 0 && in_x0+3 < in_hw.y) v3 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+3)*4));
+            if(in_x0+4 >= 0 && in_x0+4 < in_hw.y) v4 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+4)*4));
+            if(in_x0+5 >= 0 && in_x0+5 < in_hw.y) v5 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+5)*4));
+          }
+          { const int wo = w_base + (0*3+0)*4;
+            COMPUTE_FLOAT4 k0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo));
+            COMPUTE_FLOAT4 k1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset));
+            COMPUTE_FLOAT4 k2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*2));
+            COMPUTE_FLOAT4 k3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*3));
+            o0_0 = mad(v0.x, k0, o0_0);
+            o0_0 = mad(v0.y, k1, o0_0);
+            o0_0 = mad(v0.z, k2, o0_0);
+            o0_0 = mad(v0.w, k3, o0_0);
+            o0_1 = mad(v1.x, k0, o0_1);
+            o0_1 = mad(v1.y, k1, o0_1);
+            o0_1 = mad(v1.z, k2, o0_1);
+            o0_1 = mad(v1.w, k3, o0_1);
+            o0_2 = mad(v2.x, k0, o0_2);
+            o0_2 = mad(v2.y, k1, o0_2);
+            o0_2 = mad(v2.z, k2, o0_2);
+            o0_2 = mad(v2.w, k3, o0_2);
+            o0_3 = mad(v3.x, k0, o0_3);
+            o0_3 = mad(v3.y, k1, o0_3);
+            o0_3 = mad(v3.z, k2, o0_3);
+            o0_3 = mad(v3.w, k3, o0_3);
+          }
+          { const int wo = w_base + (0*3+1)*4;
+            COMPUTE_FLOAT4 k0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo));
+            COMPUTE_FLOAT4 k1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset));
+            COMPUTE_FLOAT4 k2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*2));
+            COMPUTE_FLOAT4 k3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*3));
+            o0_0 = mad(v1.x, k0, o0_0);
+            o0_0 = mad(v1.y, k1, o0_0);
+            o0_0 = mad(v1.z, k2, o0_0);
+            o0_0 = mad(v1.w, k3, o0_0);
+            o0_1 = mad(v2.x, k0, o0_1);
+            o0_1 = mad(v2.y, k1, o0_1);
+            o0_1 = mad(v2.z, k2, o0_1);
+            o0_1 = mad(v2.w, k3, o0_1);
+            o0_2 = mad(v3.x, k0, o0_2);
+            o0_2 = mad(v3.y, k1, o0_2);
+            o0_2 = mad(v3.z, k2, o0_2);
+            o0_2 = mad(v3.w, k3, o0_2);
+            o0_3 = mad(v4.x, k0, o0_3);
+            o0_3 = mad(v4.y, k1, o0_3);
+            o0_3 = mad(v4.z, k2, o0_3);
+            o0_3 = mad(v4.w, k3, o0_3);
+          }
+          { const int wo = w_base + (0*3+2)*4;
+            COMPUTE_FLOAT4 k0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo));
+            COMPUTE_FLOAT4 k1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset));
+            COMPUTE_FLOAT4 k2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*2));
+            COMPUTE_FLOAT4 k3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*3));
+            o0_0 = mad(v2.x, k0, o0_0);
+            o0_0 = mad(v2.y, k1, o0_0);
+            o0_0 = mad(v2.z, k2, o0_0);
+            o0_0 = mad(v2.w, k3, o0_0);
+            o0_1 = mad(v3.x, k0, o0_1);
+            o0_1 = mad(v3.y, k1, o0_1);
+            o0_1 = mad(v3.z, k2, o0_1);
+            o0_1 = mad(v3.w, k3, o0_1);
+            o0_2 = mad(v4.x, k0, o0_2);
+            o0_2 = mad(v4.y, k1, o0_2);
+            o0_2 = mad(v4.z, k2, o0_2);
+            o0_2 = mad(v4.w, k3, o0_2);
+            o0_3 = mad(v5.x, k0, o0_3);
+            o0_3 = mad(v5.y, k1, o0_3);
+            o0_3 = mad(v5.z, k2, o0_3);
+            o0_3 = mad(v5.w, k3, o0_3);
+          }
+        }
+        { const int iy = in_y0 + 1;
+          COMPUTE_FLOAT4 v0=(COMPUTE_FLOAT4)0, v1=(COMPUTE_FLOAT4)0, v2=(COMPUTE_FLOAT4)0, v3=(COMPUTE_FLOAT4)0, v4=(COMPUTE_FLOAT4)0, v5=(COMPUTE_FLOAT4)0;
+          if(iy >= 0 && iy < in_hw.x) { const int row = inp_base + iy * in_hw.y * 4;
+            if(in_x0+0 >= 0 && in_x0+0 < in_hw.y) v0 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+0)*4));
+            if(in_x0+1 >= 0 && in_x0+1 < in_hw.y) v1 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+1)*4));
+            if(in_x0+2 >= 0 && in_x0+2 < in_hw.y) v2 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+2)*4));
+            if(in_x0+3 >= 0 && in_x0+3 < in_hw.y) v3 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+3)*4));
+            if(in_x0+4 >= 0 && in_x0+4 < in_hw.y) v4 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+4)*4));
+            if(in_x0+5 >= 0 && in_x0+5 < in_hw.y) v5 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+5)*4));
+          }
+          { const int wo = w_base + (1*3+0)*4;
+            COMPUTE_FLOAT4 k0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo));
+            COMPUTE_FLOAT4 k1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset));
+            COMPUTE_FLOAT4 k2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*2));
+            COMPUTE_FLOAT4 k3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*3));
+            o0_0 = mad(v0.x, k0, o0_0);
+            o0_0 = mad(v0.y, k1, o0_0);
+            o0_0 = mad(v0.z, k2, o0_0);
+            o0_0 = mad(v0.w, k3, o0_0);
+            o0_1 = mad(v1.x, k0, o0_1);
+            o0_1 = mad(v1.y, k1, o0_1);
+            o0_1 = mad(v1.z, k2, o0_1);
+            o0_1 = mad(v1.w, k3, o0_1);
+            o0_2 = mad(v2.x, k0, o0_2);
+            o0_2 = mad(v2.y, k1, o0_2);
+            o0_2 = mad(v2.z, k2, o0_2);
+            o0_2 = mad(v2.w, k3, o0_2);
+            o0_3 = mad(v3.x, k0, o0_3);
+            o0_3 = mad(v3.y, k1, o0_3);
+            o0_3 = mad(v3.z, k2, o0_3);
+            o0_3 = mad(v3.w, k3, o0_3);
+          }
+          { const int wo = w_base + (1*3+1)*4;
+            COMPUTE_FLOAT4 k0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo));
+            COMPUTE_FLOAT4 k1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset));
+            COMPUTE_FLOAT4 k2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*2));
+            COMPUTE_FLOAT4 k3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*3));
+            o0_0 = mad(v1.x, k0, o0_0);
+            o0_0 = mad(v1.y, k1, o0_0);
+            o0_0 = mad(v1.z, k2, o0_0);
+            o0_0 = mad(v1.w, k3, o0_0);
+            o0_1 = mad(v2.x, k0, o0_1);
+            o0_1 = mad(v2.y, k1, o0_1);
+            o0_1 = mad(v2.z, k2, o0_1);
+            o0_1 = mad(v2.w, k3, o0_1);
+            o0_2 = mad(v3.x, k0, o0_2);
+            o0_2 = mad(v3.y, k1, o0_2);
+            o0_2 = mad(v3.z, k2, o0_2);
+            o0_2 = mad(v3.w, k3, o0_2);
+            o0_3 = mad(v4.x, k0, o0_3);
+            o0_3 = mad(v4.y, k1, o0_3);
+            o0_3 = mad(v4.z, k2, o0_3);
+            o0_3 = mad(v4.w, k3, o0_3);
+          }
+          { const int wo = w_base + (1*3+2)*4;
+            COMPUTE_FLOAT4 k0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo));
+            COMPUTE_FLOAT4 k1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset));
+            COMPUTE_FLOAT4 k2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*2));
+            COMPUTE_FLOAT4 k3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*3));
+            o0_0 = mad(v2.x, k0, o0_0);
+            o0_0 = mad(v2.y, k1, o0_0);
+            o0_0 = mad(v2.z, k2, o0_0);
+            o0_0 = mad(v2.w, k3, o0_0);
+            o0_1 = mad(v3.x, k0, o0_1);
+            o0_1 = mad(v3.y, k1, o0_1);
+            o0_1 = mad(v3.z, k2, o0_1);
+            o0_1 = mad(v3.w, k3, o0_1);
+            o0_2 = mad(v4.x, k0, o0_2);
+            o0_2 = mad(v4.y, k1, o0_2);
+            o0_2 = mad(v4.z, k2, o0_2);
+            o0_2 = mad(v4.w, k3, o0_2);
+            o0_3 = mad(v5.x, k0, o0_3);
+            o0_3 = mad(v5.y, k1, o0_3);
+            o0_3 = mad(v5.z, k2, o0_3);
+            o0_3 = mad(v5.w, k3, o0_3);
+          }
+          { const int wo = w_base + (0*3+0)*4;
+            COMPUTE_FLOAT4 k0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo));
+            COMPUTE_FLOAT4 k1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset));
+            COMPUTE_FLOAT4 k2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*2));
+            COMPUTE_FLOAT4 k3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*3));
+            o1_0 = mad(v0.x, k0, o1_0);
+            o1_0 = mad(v0.y, k1, o1_0);
+            o1_0 = mad(v0.z, k2, o1_0);
+            o1_0 = mad(v0.w, k3, o1_0);
+            o1_1 = mad(v1.x, k0, o1_1);
+            o1_1 = mad(v1.y, k1, o1_1);
+            o1_1 = mad(v1.z, k2, o1_1);
+            o1_1 = mad(v1.w, k3, o1_1);
+            o1_2 = mad(v2.x, k0, o1_2);
+            o1_2 = mad(v2.y, k1, o1_2);
+            o1_2 = mad(v2.z, k2, o1_2);
+            o1_2 = mad(v2.w, k3, o1_2);
+            o1_3 = mad(v3.x, k0, o1_3);
+            o1_3 = mad(v3.y, k1, o1_3);
+            o1_3 = mad(v3.z, k2, o1_3);
+            o1_3 = mad(v3.w, k3, o1_3);
+          }
+          { const int wo = w_base + (0*3+1)*4;
+            COMPUTE_FLOAT4 k0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo));
+            COMPUTE_FLOAT4 k1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset));
+            COMPUTE_FLOAT4 k2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*2));
+            COMPUTE_FLOAT4 k3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*3));
+            o1_0 = mad(v1.x, k0, o1_0);
+            o1_0 = mad(v1.y, k1, o1_0);
+            o1_0 = mad(v1.z, k2, o1_0);
+            o1_0 = mad(v1.w, k3, o1_0);
+            o1_1 = mad(v2.x, k0, o1_1);
+            o1_1 = mad(v2.y, k1, o1_1);
+            o1_1 = mad(v2.z, k2, o1_1);
+            o1_1 = mad(v2.w, k3, o1_1);
+            o1_2 = mad(v3.x, k0, o1_2);
+            o1_2 = mad(v3.y, k1, o1_2);
+            o1_2 = mad(v3.z, k2, o1_2);
+            o1_2 = mad(v3.w, k3, o1_2);
+            o1_3 = mad(v4.x, k0, o1_3);
+            o1_3 = mad(v4.y, k1, o1_3);
+            o1_3 = mad(v4.z, k2, o1_3);
+            o1_3 = mad(v4.w, k3, o1_3);
+          }
+          { const int wo = w_base + (0*3+2)*4;
+            COMPUTE_FLOAT4 k0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo));
+            COMPUTE_FLOAT4 k1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset));
+            COMPUTE_FLOAT4 k2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*2));
+            COMPUTE_FLOAT4 k3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*3));
+            o1_0 = mad(v2.x, k0, o1_0);
+            o1_0 = mad(v2.y, k1, o1_0);
+            o1_0 = mad(v2.z, k2, o1_0);
+            o1_0 = mad(v2.w, k3, o1_0);
+            o1_1 = mad(v3.x, k0, o1_1);
+            o1_1 = mad(v3.y, k1, o1_1);
+            o1_1 = mad(v3.z, k2, o1_1);
+            o1_1 = mad(v3.w, k3, o1_1);
+            o1_2 = mad(v4.x, k0, o1_2);
+            o1_2 = mad(v4.y, k1, o1_2);
+            o1_2 = mad(v4.z, k2, o1_2);
+            o1_2 = mad(v4.w, k3, o1_2);
+            o1_3 = mad(v5.x, k0, o1_3);
+            o1_3 = mad(v5.y, k1, o1_3);
+            o1_3 = mad(v5.z, k2, o1_3);
+            o1_3 = mad(v5.w, k3, o1_3);
+          }
+        }
+        { const int iy = in_y0 + 2;
+          COMPUTE_FLOAT4 v0=(COMPUTE_FLOAT4)0, v1=(COMPUTE_FLOAT4)0, v2=(COMPUTE_FLOAT4)0, v3=(COMPUTE_FLOAT4)0, v4=(COMPUTE_FLOAT4)0, v5=(COMPUTE_FLOAT4)0;
+          if(iy >= 0 && iy < in_hw.x) { const int row = inp_base + iy * in_hw.y * 4;
+            if(in_x0+0 >= 0 && in_x0+0 < in_hw.y) v0 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+0)*4));
+            if(in_x0+1 >= 0 && in_x0+1 < in_hw.y) v1 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+1)*4));
+            if(in_x0+2 >= 0 && in_x0+2 < in_hw.y) v2 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+2)*4));
+            if(in_x0+3 >= 0 && in_x0+3 < in_hw.y) v3 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+3)*4));
+            if(in_x0+4 >= 0 && in_x0+4 < in_hw.y) v4 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+4)*4));
+            if(in_x0+5 >= 0 && in_x0+5 < in_hw.y) v5 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+5)*4));
+          }
+          { const int wo = w_base + (2*3+0)*4;
+            COMPUTE_FLOAT4 k0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo));
+            COMPUTE_FLOAT4 k1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset));
+            COMPUTE_FLOAT4 k2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*2));
+            COMPUTE_FLOAT4 k3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*3));
+            o0_0 = mad(v0.x, k0, o0_0);
+            o0_0 = mad(v0.y, k1, o0_0);
+            o0_0 = mad(v0.z, k2, o0_0);
+            o0_0 = mad(v0.w, k3, o0_0);
+            o0_1 = mad(v1.x, k0, o0_1);
+            o0_1 = mad(v1.y, k1, o0_1);
+            o0_1 = mad(v1.z, k2, o0_1);
+            o0_1 = mad(v1.w, k3, o0_1);
+            o0_2 = mad(v2.x, k0, o0_2);
+            o0_2 = mad(v2.y, k1, o0_2);
+            o0_2 = mad(v2.z, k2, o0_2);
+            o0_2 = mad(v2.w, k3, o0_2);
+            o0_3 = mad(v3.x, k0, o0_3);
+            o0_3 = mad(v3.y, k1, o0_3);
+            o0_3 = mad(v3.z, k2, o0_3);
+            o0_3 = mad(v3.w, k3, o0_3);
+          }
+          { const int wo = w_base + (2*3+1)*4;
+            COMPUTE_FLOAT4 k0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo));
+            COMPUTE_FLOAT4 k1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset));
+            COMPUTE_FLOAT4 k2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*2));
+            COMPUTE_FLOAT4 k3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*3));
+            o0_0 = mad(v1.x, k0, o0_0);
+            o0_0 = mad(v1.y, k1, o0_0);
+            o0_0 = mad(v1.z, k2, o0_0);
+            o0_0 = mad(v1.w, k3, o0_0);
+            o0_1 = mad(v2.x, k0, o0_1);
+            o0_1 = mad(v2.y, k1, o0_1);
+            o0_1 = mad(v2.z, k2, o0_1);
+            o0_1 = mad(v2.w, k3, o0_1);
+            o0_2 = mad(v3.x, k0, o0_2);
+            o0_2 = mad(v3.y, k1, o0_2);
+            o0_2 = mad(v3.z, k2, o0_2);
+            o0_2 = mad(v3.w, k3, o0_2);
+            o0_3 = mad(v4.x, k0, o0_3);
+            o0_3 = mad(v4.y, k1, o0_3);
+            o0_3 = mad(v4.z, k2, o0_3);
+            o0_3 = mad(v4.w, k3, o0_3);
+          }
+          { const int wo = w_base + (2*3+2)*4;
+            COMPUTE_FLOAT4 k0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo));
+            COMPUTE_FLOAT4 k1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset));
+            COMPUTE_FLOAT4 k2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*2));
+            COMPUTE_FLOAT4 k3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*3));
+            o0_0 = mad(v2.x, k0, o0_0);
+            o0_0 = mad(v2.y, k1, o0_0);
+            o0_0 = mad(v2.z, k2, o0_0);
+            o0_0 = mad(v2.w, k3, o0_0);
+            o0_1 = mad(v3.x, k0, o0_1);
+            o0_1 = mad(v3.y, k1, o0_1);
+            o0_1 = mad(v3.z, k2, o0_1);
+            o0_1 = mad(v3.w, k3, o0_1);
+            o0_2 = mad(v4.x, k0, o0_2);
+            o0_2 = mad(v4.y, k1, o0_2);
+            o0_2 = mad(v4.z, k2, o0_2);
+            o0_2 = mad(v4.w, k3, o0_2);
+            o0_3 = mad(v5.x, k0, o0_3);
+            o0_3 = mad(v5.y, k1, o0_3);
+            o0_3 = mad(v5.z, k2, o0_3);
+            o0_3 = mad(v5.w, k3, o0_3);
+          }
+          { const int wo = w_base + (1*3+0)*4;
+            COMPUTE_FLOAT4 k0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo));
+            COMPUTE_FLOAT4 k1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset));
+            COMPUTE_FLOAT4 k2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*2));
+            COMPUTE_FLOAT4 k3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*3));
+            o1_0 = mad(v0.x, k0, o1_0);
+            o1_0 = mad(v0.y, k1, o1_0);
+            o1_0 = mad(v0.z, k2, o1_0);
+            o1_0 = mad(v0.w, k3, o1_0);
+            o1_1 = mad(v1.x, k0, o1_1);
+            o1_1 = mad(v1.y, k1, o1_1);
+            o1_1 = mad(v1.z, k2, o1_1);
+            o1_1 = mad(v1.w, k3, o1_1);
+            o1_2 = mad(v2.x, k0, o1_2);
+            o1_2 = mad(v2.y, k1, o1_2);
+            o1_2 = mad(v2.z, k2, o1_2);
+            o1_2 = mad(v2.w, k3, o1_2);
+            o1_3 = mad(v3.x, k0, o1_3);
+            o1_3 = mad(v3.y, k1, o1_3);
+            o1_3 = mad(v3.z, k2, o1_3);
+            o1_3 = mad(v3.w, k3, o1_3);
+          }
+          { const int wo = w_base + (1*3+1)*4;
+            COMPUTE_FLOAT4 k0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo));
+            COMPUTE_FLOAT4 k1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset));
+            COMPUTE_FLOAT4 k2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*2));
+            COMPUTE_FLOAT4 k3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*3));
+            o1_0 = mad(v1.x, k0, o1_0);
+            o1_0 = mad(v1.y, k1, o1_0);
+            o1_0 = mad(v1.z, k2, o1_0);
+            o1_0 = mad(v1.w, k3, o1_0);
+            o1_1 = mad(v2.x, k0, o1_1);
+            o1_1 = mad(v2.y, k1, o1_1);
+            o1_1 = mad(v2.z, k2, o1_1);
+            o1_1 = mad(v2.w, k3, o1_1);
+            o1_2 = mad(v3.x, k0, o1_2);
+            o1_2 = mad(v3.y, k1, o1_2);
+            o1_2 = mad(v3.z, k2, o1_2);
+            o1_2 = mad(v3.w, k3, o1_2);
+            o1_3 = mad(v4.x, k0, o1_3);
+            o1_3 = mad(v4.y, k1, o1_3);
+            o1_3 = mad(v4.z, k2, o1_3);
+            o1_3 = mad(v4.w, k3, o1_3);
+          }
+          { const int wo = w_base + (1*3+2)*4;
+            COMPUTE_FLOAT4 k0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo));
+            COMPUTE_FLOAT4 k1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset));
+            COMPUTE_FLOAT4 k2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*2));
+            COMPUTE_FLOAT4 k3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*3));
+            o1_0 = mad(v2.x, k0, o1_0);
+            o1_0 = mad(v2.y, k1, o1_0);
+            o1_0 = mad(v2.z, k2, o1_0);
+            o1_0 = mad(v2.w, k3, o1_0);
+            o1_1 = mad(v3.x, k0, o1_1);
+            o1_1 = mad(v3.y, k1, o1_1);
+            o1_1 = mad(v3.z, k2, o1_1);
+            o1_1 = mad(v3.w, k3, o1_1);
+            o1_2 = mad(v4.x, k0, o1_2);
+            o1_2 = mad(v4.y, k1, o1_2);
+            o1_2 = mad(v4.z, k2, o1_2);
+            o1_2 = mad(v4.w, k3, o1_2);
+            o1_3 = mad(v5.x, k0, o1_3);
+            o1_3 = mad(v5.y, k1, o1_3);
+            o1_3 = mad(v5.z, k2, o1_3);
+            o1_3 = mad(v5.w, k3, o1_3);
+          }
+        }
+        { const int iy = in_y0 + 3;
+          COMPUTE_FLOAT4 v0=(COMPUTE_FLOAT4)0, v1=(COMPUTE_FLOAT4)0, v2=(COMPUTE_FLOAT4)0, v3=(COMPUTE_FLOAT4)0, v4=(COMPUTE_FLOAT4)0, v5=(COMPUTE_FLOAT4)0;
+          if(iy >= 0 && iy < in_hw.x) { const int row = inp_base + iy * in_hw.y * 4;
+            if(in_x0+0 >= 0 && in_x0+0 < in_hw.y) v0 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+0)*4));
+            if(in_x0+1 >= 0 && in_x0+1 < in_hw.y) v1 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+1)*4));
+            if(in_x0+2 >= 0 && in_x0+2 < in_hw.y) v2 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+2)*4));
+            if(in_x0+3 >= 0 && in_x0+3 < in_hw.y) v3 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+3)*4));
+            if(in_x0+4 >= 0 && in_x0+4 < in_hw.y) v4 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+4)*4));
+            if(in_x0+5 >= 0 && in_x0+5 < in_hw.y) v5 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+5)*4));
+          }
+          { const int wo = w_base + (2*3+0)*4;
+            COMPUTE_FLOAT4 k0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo));
+            COMPUTE_FLOAT4 k1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset));
+            COMPUTE_FLOAT4 k2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*2));
+            COMPUTE_FLOAT4 k3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*3));
+            o1_0 = mad(v0.x, k0, o1_0);
+            o1_0 = mad(v0.y, k1, o1_0);
+            o1_0 = mad(v0.z, k2, o1_0);
+            o1_0 = mad(v0.w, k3, o1_0);
+            o1_1 = mad(v1.x, k0, o1_1);
+            o1_1 = mad(v1.y, k1, o1_1);
+            o1_1 = mad(v1.z, k2, o1_1);
+            o1_1 = mad(v1.w, k3, o1_1);
+            o1_2 = mad(v2.x, k0, o1_2);
+            o1_2 = mad(v2.y, k1, o1_2);
+            o1_2 = mad(v2.z, k2, o1_2);
+            o1_2 = mad(v2.w, k3, o1_2);
+            o1_3 = mad(v3.x, k0, o1_3);
+            o1_3 = mad(v3.y, k1, o1_3);
+            o1_3 = mad(v3.z, k2, o1_3);
+            o1_3 = mad(v3.w, k3, o1_3);
+          }
+          { const int wo = w_base + (2*3+1)*4;
+            COMPUTE_FLOAT4 k0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo));
+            COMPUTE_FLOAT4 k1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset));
+            COMPUTE_FLOAT4 k2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*2));
+            COMPUTE_FLOAT4 k3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*3));
+            o1_0 = mad(v1.x, k0, o1_0);
+            o1_0 = mad(v1.y, k1, o1_0);
+            o1_0 = mad(v1.z, k2, o1_0);
+            o1_0 = mad(v1.w, k3, o1_0);
+            o1_1 = mad(v2.x, k0, o1_1);
+            o1_1 = mad(v2.y, k1, o1_1);
+            o1_1 = mad(v2.z, k2, o1_1);
+            o1_1 = mad(v2.w, k3, o1_1);
+            o1_2 = mad(v3.x, k0, o1_2);
+            o1_2 = mad(v3.y, k1, o1_2);
+            o1_2 = mad(v3.z, k2, o1_2);
+            o1_2 = mad(v3.w, k3, o1_2);
+            o1_3 = mad(v4.x, k0, o1_3);
+            o1_3 = mad(v4.y, k1, o1_3);
+            o1_3 = mad(v4.z, k2, o1_3);
+            o1_3 = mad(v4.w, k3, o1_3);
+          }
+          { const int wo = w_base + (2*3+2)*4;
+            COMPUTE_FLOAT4 k0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo));
+            COMPUTE_FLOAT4 k1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset));
+            COMPUTE_FLOAT4 k2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*2));
+            COMPUTE_FLOAT4 k3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*3));
+            o1_0 = mad(v2.x, k0, o1_0);
+            o1_0 = mad(v2.y, k1, o1_0);
+            o1_0 = mad(v2.z, k2, o1_0);
+            o1_0 = mad(v2.w, k3, o1_0);
+            o1_1 = mad(v3.x, k0, o1_1);
+            o1_1 = mad(v3.y, k1, o1_1);
+            o1_1 = mad(v3.z, k2, o1_1);
+            o1_1 = mad(v3.w, k3, o1_1);
+            o1_2 = mad(v4.x, k0, o1_2);
+            o1_2 = mad(v4.y, k1, o1_2);
+            o1_2 = mad(v4.z, k2, o1_2);
+            o1_2 = mad(v4.w, k3, o1_2);
+            o1_3 = mad(v5.x, k0, o1_3);
+            o1_3 = mad(v5.y, k1, o1_3);
+            o1_3 = mad(v5.z, k2, o1_3);
+            o1_3 = mad(v5.w, k3, o1_3);
+          }
+        }
+    }
+#ifdef RELU
+    o0_0 = fmax(o0_0,(COMPUTE_FLOAT4)0);
+    o0_1 = fmax(o0_1,(COMPUTE_FLOAT4)0);
+    o0_2 = fmax(o0_2,(COMPUTE_FLOAT4)0);
+    o0_3 = fmax(o0_3,(COMPUTE_FLOAT4)0);
+    o1_0 = fmax(o1_0,(COMPUTE_FLOAT4)0);
+    o1_1 = fmax(o1_1,(COMPUTE_FLOAT4)0);
+    o1_2 = fmax(o1_2,(COMPUTE_FLOAT4)0);
+    o1_3 = fmax(o1_3,(COMPUTE_FLOAT4)0);
+#endif
+#ifdef PRELU
+    { COMPUTE_FLOAT4 sl = CONVERT_COMPUTE_FLOAT4(vload4(out_c_idx, slope_ptr));
+      o0_0 = select(o0_0*sl,o0_0,o0_0>=0);
+      o0_1 = select(o0_1*sl,o0_1,o0_1>=0);
+      o0_2 = select(o0_2*sl,o0_2,o0_2>=0);
+      o0_3 = select(o0_3*sl,o0_3,o0_3>=0);
+      o1_0 = select(o1_0*sl,o1_0,o1_0>=0);
+      o1_1 = select(o1_1*sl,o1_1,o1_1>=0);
+      o1_2 = select(o1_2*sl,o1_2,o1_2>=0);
+      o1_3 = select(o1_3*sl,o1_3,o1_3>=0);
+    }
+#endif
+    const int base = (((out_b_idx + out_c_idx * batch) * out_hw.x + out_h_idx) * out_hw.y + out_w_idx) * 4;
+    const int rh = out_hw.x - out_h_idx; const int rw = out_hw.y - out_w_idx;
+    if(0 < rh && 0 < rw) vstore4(CONVERT_FLOAT4(o0_0), 0, output + base + (0*out_hw.y + 0)*4);
+    if(0 < rh && 1 < rw) vstore4(CONVERT_FLOAT4(o0_1), 0, output + base + (0*out_hw.y + 1)*4);
+    if(0 < rh && 2 < rw) vstore4(CONVERT_FLOAT4(o0_2), 0, output + base + (0*out_hw.y + 2)*4);
+    if(0 < rh && 3 < rw) vstore4(CONVERT_FLOAT4(o0_3), 0, output + base + (0*out_hw.y + 3)*4);
+    if(1 < rh && 0 < rw) vstore4(CONVERT_FLOAT4(o1_0), 0, output + base + (1*out_hw.y + 0)*4);
+    if(1 < rh && 1 < rw) vstore4(CONVERT_FLOAT4(o1_1), 0, output + base + (1*out_hw.y + 1)*4);
+    if(1 < rh && 2 < rw) vstore4(CONVERT_FLOAT4(o1_2), 0, output + base + (1*out_hw.y + 2)*4);
+    if(1 < rh && 3 < rw) vstore4(CONVERT_FLOAT4(o1_3), 0, output + base + (1*out_hw.y + 3)*4);
+}
+
+// conv_2d_c4h4w4 (env MNN_CONV_SPEC, stride-1 only): 2-D register tile, 4x4 outputs,
+// 64 outputs/thread = 16 float4 accumulators. FULLY UNROLLED (no dynamic accumulator
+// indexing, no column selects) -- see FINDINGS §H.21: a dynamic version of this geometry measured
+// 2.6x SLOWER purely from scratch spilling.
+__kernel
+void conv_2d_c4h4w4(GLOBAL_SIZE_2_DIMS
+                      __global const FLOAT *input, __global const FLOAT *weight,
+                      __global const FLOAT *bias, __global FLOAT *output,
+                      __private const int2 in_hw, __private const int inChannel,
+                      __private const int in_c_blocks, __private const int batch,
+                      __private const int2 out_hw, __private const int2 filter_hw,
+                      __private const int2 stride_hw, __private const int2 pad_hw,
+                      __private const int2 dilate_hw, __private const int out_w_blocks,
+                      __private const int out_c_blocks, __private const int out_h_blocks,
+                      __private const int out_c_base_index
+                      #ifdef PRELU
+                      ,__global const FLOAT *slope_ptr
+                      #endif
+) {
+    const int out_c_w_idx = get_global_id(0);
+    const int out_b_h_idx = get_global_id(1);
+    DEAL_NON_UNIFORM_DIM2(out_c_w_idx, out_b_h_idx);
+    const int out_c_idx = out_c_w_idx / out_w_blocks + out_c_base_index;
+    if(out_c_idx >= out_c_blocks) return;
+    const int out_w_idx = (out_c_w_idx % out_w_blocks) * 4;
+    const int out_b_idx = out_b_h_idx / out_h_blocks;
+    const int out_h_idx = (out_b_h_idx % out_h_blocks) * 4;
+    COMPUTE_FLOAT4 bv = CONVERT_COMPUTE_FLOAT4(vload4(out_c_idx, bias));
+    COMPUTE_FLOAT4 o0_0=bv, o0_1=bv, o0_2=bv, o0_3=bv, o1_0=bv, o1_1=bv, o1_2=bv, o1_3=bv, o2_0=bv, o2_1=bv, o2_2=bv, o2_3=bv, o3_0=bv, o3_1=bv, o3_2=bv, o3_3=bv;
+    const int in_x0 = out_w_idx - pad_hw.y;
+    const int in_y0 = out_h_idx - pad_hw.x;
+    const int weight_oc_offset = out_c_blocks * 9 * 4;
+    const int in_hw_size = in_hw.x * in_hw.y;
+    for(ushort ic = 0; ic < in_c_blocks; ic++) {
+        const int inp_base = (out_b_idx + ic * batch) * in_hw_size * 4;
+        const int w_base = (((4 * ic) * out_c_blocks + out_c_idx) * 9) * 4;
+        { const int iy = in_y0 + 0;
+          COMPUTE_FLOAT4 v0=(COMPUTE_FLOAT4)0, v1=(COMPUTE_FLOAT4)0, v2=(COMPUTE_FLOAT4)0, v3=(COMPUTE_FLOAT4)0, v4=(COMPUTE_FLOAT4)0, v5=(COMPUTE_FLOAT4)0;
+          if(iy >= 0 && iy < in_hw.x) { const int row = inp_base + iy * in_hw.y * 4;
+            if(in_x0+0 >= 0 && in_x0+0 < in_hw.y) v0 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+0)*4));
+            if(in_x0+1 >= 0 && in_x0+1 < in_hw.y) v1 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+1)*4));
+            if(in_x0+2 >= 0 && in_x0+2 < in_hw.y) v2 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+2)*4));
+            if(in_x0+3 >= 0 && in_x0+3 < in_hw.y) v3 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+3)*4));
+            if(in_x0+4 >= 0 && in_x0+4 < in_hw.y) v4 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+4)*4));
+            if(in_x0+5 >= 0 && in_x0+5 < in_hw.y) v5 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+5)*4));
+          }
+          { const int wo = w_base + (0*3+0)*4;
+            COMPUTE_FLOAT4 k0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo));
+            COMPUTE_FLOAT4 k1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset));
+            COMPUTE_FLOAT4 k2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*2));
+            COMPUTE_FLOAT4 k3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*3));
+            o0_0 = mad(v0.x, k0, o0_0);
+            o0_0 = mad(v0.y, k1, o0_0);
+            o0_0 = mad(v0.z, k2, o0_0);
+            o0_0 = mad(v0.w, k3, o0_0);
+            o0_1 = mad(v1.x, k0, o0_1);
+            o0_1 = mad(v1.y, k1, o0_1);
+            o0_1 = mad(v1.z, k2, o0_1);
+            o0_1 = mad(v1.w, k3, o0_1);
+            o0_2 = mad(v2.x, k0, o0_2);
+            o0_2 = mad(v2.y, k1, o0_2);
+            o0_2 = mad(v2.z, k2, o0_2);
+            o0_2 = mad(v2.w, k3, o0_2);
+            o0_3 = mad(v3.x, k0, o0_3);
+            o0_3 = mad(v3.y, k1, o0_3);
+            o0_3 = mad(v3.z, k2, o0_3);
+            o0_3 = mad(v3.w, k3, o0_3);
+          }
+          { const int wo = w_base + (0*3+1)*4;
+            COMPUTE_FLOAT4 k0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo));
+            COMPUTE_FLOAT4 k1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset));
+            COMPUTE_FLOAT4 k2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*2));
+            COMPUTE_FLOAT4 k3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*3));
+            o0_0 = mad(v1.x, k0, o0_0);
+            o0_0 = mad(v1.y, k1, o0_0);
+            o0_0 = mad(v1.z, k2, o0_0);
+            o0_0 = mad(v1.w, k3, o0_0);
+            o0_1 = mad(v2.x, k0, o0_1);
+            o0_1 = mad(v2.y, k1, o0_1);
+            o0_1 = mad(v2.z, k2, o0_1);
+            o0_1 = mad(v2.w, k3, o0_1);
+            o0_2 = mad(v3.x, k0, o0_2);
+            o0_2 = mad(v3.y, k1, o0_2);
+            o0_2 = mad(v3.z, k2, o0_2);
+            o0_2 = mad(v3.w, k3, o0_2);
+            o0_3 = mad(v4.x, k0, o0_3);
+            o0_3 = mad(v4.y, k1, o0_3);
+            o0_3 = mad(v4.z, k2, o0_3);
+            o0_3 = mad(v4.w, k3, o0_3);
+          }
+          { const int wo = w_base + (0*3+2)*4;
+            COMPUTE_FLOAT4 k0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo));
+            COMPUTE_FLOAT4 k1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset));
+            COMPUTE_FLOAT4 k2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*2));
+            COMPUTE_FLOAT4 k3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*3));
+            o0_0 = mad(v2.x, k0, o0_0);
+            o0_0 = mad(v2.y, k1, o0_0);
+            o0_0 = mad(v2.z, k2, o0_0);
+            o0_0 = mad(v2.w, k3, o0_0);
+            o0_1 = mad(v3.x, k0, o0_1);
+            o0_1 = mad(v3.y, k1, o0_1);
+            o0_1 = mad(v3.z, k2, o0_1);
+            o0_1 = mad(v3.w, k3, o0_1);
+            o0_2 = mad(v4.x, k0, o0_2);
+            o0_2 = mad(v4.y, k1, o0_2);
+            o0_2 = mad(v4.z, k2, o0_2);
+            o0_2 = mad(v4.w, k3, o0_2);
+            o0_3 = mad(v5.x, k0, o0_3);
+            o0_3 = mad(v5.y, k1, o0_3);
+            o0_3 = mad(v5.z, k2, o0_3);
+            o0_3 = mad(v5.w, k3, o0_3);
+          }
+        }
+        { const int iy = in_y0 + 1;
+          COMPUTE_FLOAT4 v0=(COMPUTE_FLOAT4)0, v1=(COMPUTE_FLOAT4)0, v2=(COMPUTE_FLOAT4)0, v3=(COMPUTE_FLOAT4)0, v4=(COMPUTE_FLOAT4)0, v5=(COMPUTE_FLOAT4)0;
+          if(iy >= 0 && iy < in_hw.x) { const int row = inp_base + iy * in_hw.y * 4;
+            if(in_x0+0 >= 0 && in_x0+0 < in_hw.y) v0 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+0)*4));
+            if(in_x0+1 >= 0 && in_x0+1 < in_hw.y) v1 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+1)*4));
+            if(in_x0+2 >= 0 && in_x0+2 < in_hw.y) v2 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+2)*4));
+            if(in_x0+3 >= 0 && in_x0+3 < in_hw.y) v3 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+3)*4));
+            if(in_x0+4 >= 0 && in_x0+4 < in_hw.y) v4 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+4)*4));
+            if(in_x0+5 >= 0 && in_x0+5 < in_hw.y) v5 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+5)*4));
+          }
+          { const int wo = w_base + (1*3+0)*4;
+            COMPUTE_FLOAT4 k0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo));
+            COMPUTE_FLOAT4 k1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset));
+            COMPUTE_FLOAT4 k2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*2));
+            COMPUTE_FLOAT4 k3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*3));
+            o0_0 = mad(v0.x, k0, o0_0);
+            o0_0 = mad(v0.y, k1, o0_0);
+            o0_0 = mad(v0.z, k2, o0_0);
+            o0_0 = mad(v0.w, k3, o0_0);
+            o0_1 = mad(v1.x, k0, o0_1);
+            o0_1 = mad(v1.y, k1, o0_1);
+            o0_1 = mad(v1.z, k2, o0_1);
+            o0_1 = mad(v1.w, k3, o0_1);
+            o0_2 = mad(v2.x, k0, o0_2);
+            o0_2 = mad(v2.y, k1, o0_2);
+            o0_2 = mad(v2.z, k2, o0_2);
+            o0_2 = mad(v2.w, k3, o0_2);
+            o0_3 = mad(v3.x, k0, o0_3);
+            o0_3 = mad(v3.y, k1, o0_3);
+            o0_3 = mad(v3.z, k2, o0_3);
+            o0_3 = mad(v3.w, k3, o0_3);
+          }
+          { const int wo = w_base + (1*3+1)*4;
+            COMPUTE_FLOAT4 k0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo));
+            COMPUTE_FLOAT4 k1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset));
+            COMPUTE_FLOAT4 k2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*2));
+            COMPUTE_FLOAT4 k3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*3));
+            o0_0 = mad(v1.x, k0, o0_0);
+            o0_0 = mad(v1.y, k1, o0_0);
+            o0_0 = mad(v1.z, k2, o0_0);
+            o0_0 = mad(v1.w, k3, o0_0);
+            o0_1 = mad(v2.x, k0, o0_1);
+            o0_1 = mad(v2.y, k1, o0_1);
+            o0_1 = mad(v2.z, k2, o0_1);
+            o0_1 = mad(v2.w, k3, o0_1);
+            o0_2 = mad(v3.x, k0, o0_2);
+            o0_2 = mad(v3.y, k1, o0_2);
+            o0_2 = mad(v3.z, k2, o0_2);
+            o0_2 = mad(v3.w, k3, o0_2);
+            o0_3 = mad(v4.x, k0, o0_3);
+            o0_3 = mad(v4.y, k1, o0_3);
+            o0_3 = mad(v4.z, k2, o0_3);
+            o0_3 = mad(v4.w, k3, o0_3);
+          }
+          { const int wo = w_base + (1*3+2)*4;
+            COMPUTE_FLOAT4 k0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo));
+            COMPUTE_FLOAT4 k1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset));
+            COMPUTE_FLOAT4 k2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*2));
+            COMPUTE_FLOAT4 k3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*3));
+            o0_0 = mad(v2.x, k0, o0_0);
+            o0_0 = mad(v2.y, k1, o0_0);
+            o0_0 = mad(v2.z, k2, o0_0);
+            o0_0 = mad(v2.w, k3, o0_0);
+            o0_1 = mad(v3.x, k0, o0_1);
+            o0_1 = mad(v3.y, k1, o0_1);
+            o0_1 = mad(v3.z, k2, o0_1);
+            o0_1 = mad(v3.w, k3, o0_1);
+            o0_2 = mad(v4.x, k0, o0_2);
+            o0_2 = mad(v4.y, k1, o0_2);
+            o0_2 = mad(v4.z, k2, o0_2);
+            o0_2 = mad(v4.w, k3, o0_2);
+            o0_3 = mad(v5.x, k0, o0_3);
+            o0_3 = mad(v5.y, k1, o0_3);
+            o0_3 = mad(v5.z, k2, o0_3);
+            o0_3 = mad(v5.w, k3, o0_3);
+          }
+          { const int wo = w_base + (0*3+0)*4;
+            COMPUTE_FLOAT4 k0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo));
+            COMPUTE_FLOAT4 k1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset));
+            COMPUTE_FLOAT4 k2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*2));
+            COMPUTE_FLOAT4 k3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*3));
+            o1_0 = mad(v0.x, k0, o1_0);
+            o1_0 = mad(v0.y, k1, o1_0);
+            o1_0 = mad(v0.z, k2, o1_0);
+            o1_0 = mad(v0.w, k3, o1_0);
+            o1_1 = mad(v1.x, k0, o1_1);
+            o1_1 = mad(v1.y, k1, o1_1);
+            o1_1 = mad(v1.z, k2, o1_1);
+            o1_1 = mad(v1.w, k3, o1_1);
+            o1_2 = mad(v2.x, k0, o1_2);
+            o1_2 = mad(v2.y, k1, o1_2);
+            o1_2 = mad(v2.z, k2, o1_2);
+            o1_2 = mad(v2.w, k3, o1_2);
+            o1_3 = mad(v3.x, k0, o1_3);
+            o1_3 = mad(v3.y, k1, o1_3);
+            o1_3 = mad(v3.z, k2, o1_3);
+            o1_3 = mad(v3.w, k3, o1_3);
+          }
+          { const int wo = w_base + (0*3+1)*4;
+            COMPUTE_FLOAT4 k0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo));
+            COMPUTE_FLOAT4 k1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset));
+            COMPUTE_FLOAT4 k2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*2));
+            COMPUTE_FLOAT4 k3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*3));
+            o1_0 = mad(v1.x, k0, o1_0);
+            o1_0 = mad(v1.y, k1, o1_0);
+            o1_0 = mad(v1.z, k2, o1_0);
+            o1_0 = mad(v1.w, k3, o1_0);
+            o1_1 = mad(v2.x, k0, o1_1);
+            o1_1 = mad(v2.y, k1, o1_1);
+            o1_1 = mad(v2.z, k2, o1_1);
+            o1_1 = mad(v2.w, k3, o1_1);
+            o1_2 = mad(v3.x, k0, o1_2);
+            o1_2 = mad(v3.y, k1, o1_2);
+            o1_2 = mad(v3.z, k2, o1_2);
+            o1_2 = mad(v3.w, k3, o1_2);
+            o1_3 = mad(v4.x, k0, o1_3);
+            o1_3 = mad(v4.y, k1, o1_3);
+            o1_3 = mad(v4.z, k2, o1_3);
+            o1_3 = mad(v4.w, k3, o1_3);
+          }
+          { const int wo = w_base + (0*3+2)*4;
+            COMPUTE_FLOAT4 k0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo));
+            COMPUTE_FLOAT4 k1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset));
+            COMPUTE_FLOAT4 k2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*2));
+            COMPUTE_FLOAT4 k3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*3));
+            o1_0 = mad(v2.x, k0, o1_0);
+            o1_0 = mad(v2.y, k1, o1_0);
+            o1_0 = mad(v2.z, k2, o1_0);
+            o1_0 = mad(v2.w, k3, o1_0);
+            o1_1 = mad(v3.x, k0, o1_1);
+            o1_1 = mad(v3.y, k1, o1_1);
+            o1_1 = mad(v3.z, k2, o1_1);
+            o1_1 = mad(v3.w, k3, o1_1);
+            o1_2 = mad(v4.x, k0, o1_2);
+            o1_2 = mad(v4.y, k1, o1_2);
+            o1_2 = mad(v4.z, k2, o1_2);
+            o1_2 = mad(v4.w, k3, o1_2);
+            o1_3 = mad(v5.x, k0, o1_3);
+            o1_3 = mad(v5.y, k1, o1_3);
+            o1_3 = mad(v5.z, k2, o1_3);
+            o1_3 = mad(v5.w, k3, o1_3);
+          }
+        }
+        { const int iy = in_y0 + 2;
+          COMPUTE_FLOAT4 v0=(COMPUTE_FLOAT4)0, v1=(COMPUTE_FLOAT4)0, v2=(COMPUTE_FLOAT4)0, v3=(COMPUTE_FLOAT4)0, v4=(COMPUTE_FLOAT4)0, v5=(COMPUTE_FLOAT4)0;
+          if(iy >= 0 && iy < in_hw.x) { const int row = inp_base + iy * in_hw.y * 4;
+            if(in_x0+0 >= 0 && in_x0+0 < in_hw.y) v0 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+0)*4));
+            if(in_x0+1 >= 0 && in_x0+1 < in_hw.y) v1 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+1)*4));
+            if(in_x0+2 >= 0 && in_x0+2 < in_hw.y) v2 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+2)*4));
+            if(in_x0+3 >= 0 && in_x0+3 < in_hw.y) v3 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+3)*4));
+            if(in_x0+4 >= 0 && in_x0+4 < in_hw.y) v4 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+4)*4));
+            if(in_x0+5 >= 0 && in_x0+5 < in_hw.y) v5 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+5)*4));
+          }
+          { const int wo = w_base + (2*3+0)*4;
+            COMPUTE_FLOAT4 k0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo));
+            COMPUTE_FLOAT4 k1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset));
+            COMPUTE_FLOAT4 k2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*2));
+            COMPUTE_FLOAT4 k3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*3));
+            o0_0 = mad(v0.x, k0, o0_0);
+            o0_0 = mad(v0.y, k1, o0_0);
+            o0_0 = mad(v0.z, k2, o0_0);
+            o0_0 = mad(v0.w, k3, o0_0);
+            o0_1 = mad(v1.x, k0, o0_1);
+            o0_1 = mad(v1.y, k1, o0_1);
+            o0_1 = mad(v1.z, k2, o0_1);
+            o0_1 = mad(v1.w, k3, o0_1);
+            o0_2 = mad(v2.x, k0, o0_2);
+            o0_2 = mad(v2.y, k1, o0_2);
+            o0_2 = mad(v2.z, k2, o0_2);
+            o0_2 = mad(v2.w, k3, o0_2);
+            o0_3 = mad(v3.x, k0, o0_3);
+            o0_3 = mad(v3.y, k1, o0_3);
+            o0_3 = mad(v3.z, k2, o0_3);
+            o0_3 = mad(v3.w, k3, o0_3);
+          }
+          { const int wo = w_base + (2*3+1)*4;
+            COMPUTE_FLOAT4 k0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo));
+            COMPUTE_FLOAT4 k1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset));
+            COMPUTE_FLOAT4 k2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*2));
+            COMPUTE_FLOAT4 k3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*3));
+            o0_0 = mad(v1.x, k0, o0_0);
+            o0_0 = mad(v1.y, k1, o0_0);
+            o0_0 = mad(v1.z, k2, o0_0);
+            o0_0 = mad(v1.w, k3, o0_0);
+            o0_1 = mad(v2.x, k0, o0_1);
+            o0_1 = mad(v2.y, k1, o0_1);
+            o0_1 = mad(v2.z, k2, o0_1);
+            o0_1 = mad(v2.w, k3, o0_1);
+            o0_2 = mad(v3.x, k0, o0_2);
+            o0_2 = mad(v3.y, k1, o0_2);
+            o0_2 = mad(v3.z, k2, o0_2);
+            o0_2 = mad(v3.w, k3, o0_2);
+            o0_3 = mad(v4.x, k0, o0_3);
+            o0_3 = mad(v4.y, k1, o0_3);
+            o0_3 = mad(v4.z, k2, o0_3);
+            o0_3 = mad(v4.w, k3, o0_3);
+          }
+          { const int wo = w_base + (2*3+2)*4;
+            COMPUTE_FLOAT4 k0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo));
+            COMPUTE_FLOAT4 k1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset));
+            COMPUTE_FLOAT4 k2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*2));
+            COMPUTE_FLOAT4 k3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*3));
+            o0_0 = mad(v2.x, k0, o0_0);
+            o0_0 = mad(v2.y, k1, o0_0);
+            o0_0 = mad(v2.z, k2, o0_0);
+            o0_0 = mad(v2.w, k3, o0_0);
+            o0_1 = mad(v3.x, k0, o0_1);
+            o0_1 = mad(v3.y, k1, o0_1);
+            o0_1 = mad(v3.z, k2, o0_1);
+            o0_1 = mad(v3.w, k3, o0_1);
+            o0_2 = mad(v4.x, k0, o0_2);
+            o0_2 = mad(v4.y, k1, o0_2);
+            o0_2 = mad(v4.z, k2, o0_2);
+            o0_2 = mad(v4.w, k3, o0_2);
+            o0_3 = mad(v5.x, k0, o0_3);
+            o0_3 = mad(v5.y, k1, o0_3);
+            o0_3 = mad(v5.z, k2, o0_3);
+            o0_3 = mad(v5.w, k3, o0_3);
+          }
+          { const int wo = w_base + (1*3+0)*4;
+            COMPUTE_FLOAT4 k0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo));
+            COMPUTE_FLOAT4 k1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset));
+            COMPUTE_FLOAT4 k2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*2));
+            COMPUTE_FLOAT4 k3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*3));
+            o1_0 = mad(v0.x, k0, o1_0);
+            o1_0 = mad(v0.y, k1, o1_0);
+            o1_0 = mad(v0.z, k2, o1_0);
+            o1_0 = mad(v0.w, k3, o1_0);
+            o1_1 = mad(v1.x, k0, o1_1);
+            o1_1 = mad(v1.y, k1, o1_1);
+            o1_1 = mad(v1.z, k2, o1_1);
+            o1_1 = mad(v1.w, k3, o1_1);
+            o1_2 = mad(v2.x, k0, o1_2);
+            o1_2 = mad(v2.y, k1, o1_2);
+            o1_2 = mad(v2.z, k2, o1_2);
+            o1_2 = mad(v2.w, k3, o1_2);
+            o1_3 = mad(v3.x, k0, o1_3);
+            o1_3 = mad(v3.y, k1, o1_3);
+            o1_3 = mad(v3.z, k2, o1_3);
+            o1_3 = mad(v3.w, k3, o1_3);
+          }
+          { const int wo = w_base + (1*3+1)*4;
+            COMPUTE_FLOAT4 k0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo));
+            COMPUTE_FLOAT4 k1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset));
+            COMPUTE_FLOAT4 k2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*2));
+            COMPUTE_FLOAT4 k3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*3));
+            o1_0 = mad(v1.x, k0, o1_0);
+            o1_0 = mad(v1.y, k1, o1_0);
+            o1_0 = mad(v1.z, k2, o1_0);
+            o1_0 = mad(v1.w, k3, o1_0);
+            o1_1 = mad(v2.x, k0, o1_1);
+            o1_1 = mad(v2.y, k1, o1_1);
+            o1_1 = mad(v2.z, k2, o1_1);
+            o1_1 = mad(v2.w, k3, o1_1);
+            o1_2 = mad(v3.x, k0, o1_2);
+            o1_2 = mad(v3.y, k1, o1_2);
+            o1_2 = mad(v3.z, k2, o1_2);
+            o1_2 = mad(v3.w, k3, o1_2);
+            o1_3 = mad(v4.x, k0, o1_3);
+            o1_3 = mad(v4.y, k1, o1_3);
+            o1_3 = mad(v4.z, k2, o1_3);
+            o1_3 = mad(v4.w, k3, o1_3);
+          }
+          { const int wo = w_base + (1*3+2)*4;
+            COMPUTE_FLOAT4 k0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo));
+            COMPUTE_FLOAT4 k1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset));
+            COMPUTE_FLOAT4 k2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*2));
+            COMPUTE_FLOAT4 k3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*3));
+            o1_0 = mad(v2.x, k0, o1_0);
+            o1_0 = mad(v2.y, k1, o1_0);
+            o1_0 = mad(v2.z, k2, o1_0);
+            o1_0 = mad(v2.w, k3, o1_0);
+            o1_1 = mad(v3.x, k0, o1_1);
+            o1_1 = mad(v3.y, k1, o1_1);
+            o1_1 = mad(v3.z, k2, o1_1);
+            o1_1 = mad(v3.w, k3, o1_1);
+            o1_2 = mad(v4.x, k0, o1_2);
+            o1_2 = mad(v4.y, k1, o1_2);
+            o1_2 = mad(v4.z, k2, o1_2);
+            o1_2 = mad(v4.w, k3, o1_2);
+            o1_3 = mad(v5.x, k0, o1_3);
+            o1_3 = mad(v5.y, k1, o1_3);
+            o1_3 = mad(v5.z, k2, o1_3);
+            o1_3 = mad(v5.w, k3, o1_3);
+          }
+          { const int wo = w_base + (0*3+0)*4;
+            COMPUTE_FLOAT4 k0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo));
+            COMPUTE_FLOAT4 k1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset));
+            COMPUTE_FLOAT4 k2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*2));
+            COMPUTE_FLOAT4 k3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*3));
+            o2_0 = mad(v0.x, k0, o2_0);
+            o2_0 = mad(v0.y, k1, o2_0);
+            o2_0 = mad(v0.z, k2, o2_0);
+            o2_0 = mad(v0.w, k3, o2_0);
+            o2_1 = mad(v1.x, k0, o2_1);
+            o2_1 = mad(v1.y, k1, o2_1);
+            o2_1 = mad(v1.z, k2, o2_1);
+            o2_1 = mad(v1.w, k3, o2_1);
+            o2_2 = mad(v2.x, k0, o2_2);
+            o2_2 = mad(v2.y, k1, o2_2);
+            o2_2 = mad(v2.z, k2, o2_2);
+            o2_2 = mad(v2.w, k3, o2_2);
+            o2_3 = mad(v3.x, k0, o2_3);
+            o2_3 = mad(v3.y, k1, o2_3);
+            o2_3 = mad(v3.z, k2, o2_3);
+            o2_3 = mad(v3.w, k3, o2_3);
+          }
+          { const int wo = w_base + (0*3+1)*4;
+            COMPUTE_FLOAT4 k0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo));
+            COMPUTE_FLOAT4 k1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset));
+            COMPUTE_FLOAT4 k2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*2));
+            COMPUTE_FLOAT4 k3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*3));
+            o2_0 = mad(v1.x, k0, o2_0);
+            o2_0 = mad(v1.y, k1, o2_0);
+            o2_0 = mad(v1.z, k2, o2_0);
+            o2_0 = mad(v1.w, k3, o2_0);
+            o2_1 = mad(v2.x, k0, o2_1);
+            o2_1 = mad(v2.y, k1, o2_1);
+            o2_1 = mad(v2.z, k2, o2_1);
+            o2_1 = mad(v2.w, k3, o2_1);
+            o2_2 = mad(v3.x, k0, o2_2);
+            o2_2 = mad(v3.y, k1, o2_2);
+            o2_2 = mad(v3.z, k2, o2_2);
+            o2_2 = mad(v3.w, k3, o2_2);
+            o2_3 = mad(v4.x, k0, o2_3);
+            o2_3 = mad(v4.y, k1, o2_3);
+            o2_3 = mad(v4.z, k2, o2_3);
+            o2_3 = mad(v4.w, k3, o2_3);
+          }
+          { const int wo = w_base + (0*3+2)*4;
+            COMPUTE_FLOAT4 k0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo));
+            COMPUTE_FLOAT4 k1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset));
+            COMPUTE_FLOAT4 k2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*2));
+            COMPUTE_FLOAT4 k3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*3));
+            o2_0 = mad(v2.x, k0, o2_0);
+            o2_0 = mad(v2.y, k1, o2_0);
+            o2_0 = mad(v2.z, k2, o2_0);
+            o2_0 = mad(v2.w, k3, o2_0);
+            o2_1 = mad(v3.x, k0, o2_1);
+            o2_1 = mad(v3.y, k1, o2_1);
+            o2_1 = mad(v3.z, k2, o2_1);
+            o2_1 = mad(v3.w, k3, o2_1);
+            o2_2 = mad(v4.x, k0, o2_2);
+            o2_2 = mad(v4.y, k1, o2_2);
+            o2_2 = mad(v4.z, k2, o2_2);
+            o2_2 = mad(v4.w, k3, o2_2);
+            o2_3 = mad(v5.x, k0, o2_3);
+            o2_3 = mad(v5.y, k1, o2_3);
+            o2_3 = mad(v5.z, k2, o2_3);
+            o2_3 = mad(v5.w, k3, o2_3);
+          }
+        }
+        { const int iy = in_y0 + 3;
+          COMPUTE_FLOAT4 v0=(COMPUTE_FLOAT4)0, v1=(COMPUTE_FLOAT4)0, v2=(COMPUTE_FLOAT4)0, v3=(COMPUTE_FLOAT4)0, v4=(COMPUTE_FLOAT4)0, v5=(COMPUTE_FLOAT4)0;
+          if(iy >= 0 && iy < in_hw.x) { const int row = inp_base + iy * in_hw.y * 4;
+            if(in_x0+0 >= 0 && in_x0+0 < in_hw.y) v0 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+0)*4));
+            if(in_x0+1 >= 0 && in_x0+1 < in_hw.y) v1 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+1)*4));
+            if(in_x0+2 >= 0 && in_x0+2 < in_hw.y) v2 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+2)*4));
+            if(in_x0+3 >= 0 && in_x0+3 < in_hw.y) v3 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+3)*4));
+            if(in_x0+4 >= 0 && in_x0+4 < in_hw.y) v4 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+4)*4));
+            if(in_x0+5 >= 0 && in_x0+5 < in_hw.y) v5 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+5)*4));
+          }
+          { const int wo = w_base + (2*3+0)*4;
+            COMPUTE_FLOAT4 k0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo));
+            COMPUTE_FLOAT4 k1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset));
+            COMPUTE_FLOAT4 k2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*2));
+            COMPUTE_FLOAT4 k3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*3));
+            o1_0 = mad(v0.x, k0, o1_0);
+            o1_0 = mad(v0.y, k1, o1_0);
+            o1_0 = mad(v0.z, k2, o1_0);
+            o1_0 = mad(v0.w, k3, o1_0);
+            o1_1 = mad(v1.x, k0, o1_1);
+            o1_1 = mad(v1.y, k1, o1_1);
+            o1_1 = mad(v1.z, k2, o1_1);
+            o1_1 = mad(v1.w, k3, o1_1);
+            o1_2 = mad(v2.x, k0, o1_2);
+            o1_2 = mad(v2.y, k1, o1_2);
+            o1_2 = mad(v2.z, k2, o1_2);
+            o1_2 = mad(v2.w, k3, o1_2);
+            o1_3 = mad(v3.x, k0, o1_3);
+            o1_3 = mad(v3.y, k1, o1_3);
+            o1_3 = mad(v3.z, k2, o1_3);
+            o1_3 = mad(v3.w, k3, o1_3);
+          }
+          { const int wo = w_base + (2*3+1)*4;
+            COMPUTE_FLOAT4 k0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo));
+            COMPUTE_FLOAT4 k1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset));
+            COMPUTE_FLOAT4 k2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*2));
+            COMPUTE_FLOAT4 k3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*3));
+            o1_0 = mad(v1.x, k0, o1_0);
+            o1_0 = mad(v1.y, k1, o1_0);
+            o1_0 = mad(v1.z, k2, o1_0);
+            o1_0 = mad(v1.w, k3, o1_0);
+            o1_1 = mad(v2.x, k0, o1_1);
+            o1_1 = mad(v2.y, k1, o1_1);
+            o1_1 = mad(v2.z, k2, o1_1);
+            o1_1 = mad(v2.w, k3, o1_1);
+            o1_2 = mad(v3.x, k0, o1_2);
+            o1_2 = mad(v3.y, k1, o1_2);
+            o1_2 = mad(v3.z, k2, o1_2);
+            o1_2 = mad(v3.w, k3, o1_2);
+            o1_3 = mad(v4.x, k0, o1_3);
+            o1_3 = mad(v4.y, k1, o1_3);
+            o1_3 = mad(v4.z, k2, o1_3);
+            o1_3 = mad(v4.w, k3, o1_3);
+          }
+          { const int wo = w_base + (2*3+2)*4;
+            COMPUTE_FLOAT4 k0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo));
+            COMPUTE_FLOAT4 k1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset));
+            COMPUTE_FLOAT4 k2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*2));
+            COMPUTE_FLOAT4 k3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*3));
+            o1_0 = mad(v2.x, k0, o1_0);
+            o1_0 = mad(v2.y, k1, o1_0);
+            o1_0 = mad(v2.z, k2, o1_0);
+            o1_0 = mad(v2.w, k3, o1_0);
+            o1_1 = mad(v3.x, k0, o1_1);
+            o1_1 = mad(v3.y, k1, o1_1);
+            o1_1 = mad(v3.z, k2, o1_1);
+            o1_1 = mad(v3.w, k3, o1_1);
+            o1_2 = mad(v4.x, k0, o1_2);
+            o1_2 = mad(v4.y, k1, o1_2);
+            o1_2 = mad(v4.z, k2, o1_2);
+            o1_2 = mad(v4.w, k3, o1_2);
+            o1_3 = mad(v5.x, k0, o1_3);
+            o1_3 = mad(v5.y, k1, o1_3);
+            o1_3 = mad(v5.z, k2, o1_3);
+            o1_3 = mad(v5.w, k3, o1_3);
+          }
+          { const int wo = w_base + (1*3+0)*4;
+            COMPUTE_FLOAT4 k0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo));
+            COMPUTE_FLOAT4 k1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset));
+            COMPUTE_FLOAT4 k2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*2));
+            COMPUTE_FLOAT4 k3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*3));
+            o2_0 = mad(v0.x, k0, o2_0);
+            o2_0 = mad(v0.y, k1, o2_0);
+            o2_0 = mad(v0.z, k2, o2_0);
+            o2_0 = mad(v0.w, k3, o2_0);
+            o2_1 = mad(v1.x, k0, o2_1);
+            o2_1 = mad(v1.y, k1, o2_1);
+            o2_1 = mad(v1.z, k2, o2_1);
+            o2_1 = mad(v1.w, k3, o2_1);
+            o2_2 = mad(v2.x, k0, o2_2);
+            o2_2 = mad(v2.y, k1, o2_2);
+            o2_2 = mad(v2.z, k2, o2_2);
+            o2_2 = mad(v2.w, k3, o2_2);
+            o2_3 = mad(v3.x, k0, o2_3);
+            o2_3 = mad(v3.y, k1, o2_3);
+            o2_3 = mad(v3.z, k2, o2_3);
+            o2_3 = mad(v3.w, k3, o2_3);
+          }
+          { const int wo = w_base + (1*3+1)*4;
+            COMPUTE_FLOAT4 k0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo));
+            COMPUTE_FLOAT4 k1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset));
+            COMPUTE_FLOAT4 k2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*2));
+            COMPUTE_FLOAT4 k3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*3));
+            o2_0 = mad(v1.x, k0, o2_0);
+            o2_0 = mad(v1.y, k1, o2_0);
+            o2_0 = mad(v1.z, k2, o2_0);
+            o2_0 = mad(v1.w, k3, o2_0);
+            o2_1 = mad(v2.x, k0, o2_1);
+            o2_1 = mad(v2.y, k1, o2_1);
+            o2_1 = mad(v2.z, k2, o2_1);
+            o2_1 = mad(v2.w, k3, o2_1);
+            o2_2 = mad(v3.x, k0, o2_2);
+            o2_2 = mad(v3.y, k1, o2_2);
+            o2_2 = mad(v3.z, k2, o2_2);
+            o2_2 = mad(v3.w, k3, o2_2);
+            o2_3 = mad(v4.x, k0, o2_3);
+            o2_3 = mad(v4.y, k1, o2_3);
+            o2_3 = mad(v4.z, k2, o2_3);
+            o2_3 = mad(v4.w, k3, o2_3);
+          }
+          { const int wo = w_base + (1*3+2)*4;
+            COMPUTE_FLOAT4 k0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo));
+            COMPUTE_FLOAT4 k1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset));
+            COMPUTE_FLOAT4 k2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*2));
+            COMPUTE_FLOAT4 k3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*3));
+            o2_0 = mad(v2.x, k0, o2_0);
+            o2_0 = mad(v2.y, k1, o2_0);
+            o2_0 = mad(v2.z, k2, o2_0);
+            o2_0 = mad(v2.w, k3, o2_0);
+            o2_1 = mad(v3.x, k0, o2_1);
+            o2_1 = mad(v3.y, k1, o2_1);
+            o2_1 = mad(v3.z, k2, o2_1);
+            o2_1 = mad(v3.w, k3, o2_1);
+            o2_2 = mad(v4.x, k0, o2_2);
+            o2_2 = mad(v4.y, k1, o2_2);
+            o2_2 = mad(v4.z, k2, o2_2);
+            o2_2 = mad(v4.w, k3, o2_2);
+            o2_3 = mad(v5.x, k0, o2_3);
+            o2_3 = mad(v5.y, k1, o2_3);
+            o2_3 = mad(v5.z, k2, o2_3);
+            o2_3 = mad(v5.w, k3, o2_3);
+          }
+          { const int wo = w_base + (0*3+0)*4;
+            COMPUTE_FLOAT4 k0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo));
+            COMPUTE_FLOAT4 k1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset));
+            COMPUTE_FLOAT4 k2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*2));
+            COMPUTE_FLOAT4 k3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*3));
+            o3_0 = mad(v0.x, k0, o3_0);
+            o3_0 = mad(v0.y, k1, o3_0);
+            o3_0 = mad(v0.z, k2, o3_0);
+            o3_0 = mad(v0.w, k3, o3_0);
+            o3_1 = mad(v1.x, k0, o3_1);
+            o3_1 = mad(v1.y, k1, o3_1);
+            o3_1 = mad(v1.z, k2, o3_1);
+            o3_1 = mad(v1.w, k3, o3_1);
+            o3_2 = mad(v2.x, k0, o3_2);
+            o3_2 = mad(v2.y, k1, o3_2);
+            o3_2 = mad(v2.z, k2, o3_2);
+            o3_2 = mad(v2.w, k3, o3_2);
+            o3_3 = mad(v3.x, k0, o3_3);
+            o3_3 = mad(v3.y, k1, o3_3);
+            o3_3 = mad(v3.z, k2, o3_3);
+            o3_3 = mad(v3.w, k3, o3_3);
+          }
+          { const int wo = w_base + (0*3+1)*4;
+            COMPUTE_FLOAT4 k0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo));
+            COMPUTE_FLOAT4 k1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset));
+            COMPUTE_FLOAT4 k2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*2));
+            COMPUTE_FLOAT4 k3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*3));
+            o3_0 = mad(v1.x, k0, o3_0);
+            o3_0 = mad(v1.y, k1, o3_0);
+            o3_0 = mad(v1.z, k2, o3_0);
+            o3_0 = mad(v1.w, k3, o3_0);
+            o3_1 = mad(v2.x, k0, o3_1);
+            o3_1 = mad(v2.y, k1, o3_1);
+            o3_1 = mad(v2.z, k2, o3_1);
+            o3_1 = mad(v2.w, k3, o3_1);
+            o3_2 = mad(v3.x, k0, o3_2);
+            o3_2 = mad(v3.y, k1, o3_2);
+            o3_2 = mad(v3.z, k2, o3_2);
+            o3_2 = mad(v3.w, k3, o3_2);
+            o3_3 = mad(v4.x, k0, o3_3);
+            o3_3 = mad(v4.y, k1, o3_3);
+            o3_3 = mad(v4.z, k2, o3_3);
+            o3_3 = mad(v4.w, k3, o3_3);
+          }
+          { const int wo = w_base + (0*3+2)*4;
+            COMPUTE_FLOAT4 k0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo));
+            COMPUTE_FLOAT4 k1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset));
+            COMPUTE_FLOAT4 k2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*2));
+            COMPUTE_FLOAT4 k3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*3));
+            o3_0 = mad(v2.x, k0, o3_0);
+            o3_0 = mad(v2.y, k1, o3_0);
+            o3_0 = mad(v2.z, k2, o3_0);
+            o3_0 = mad(v2.w, k3, o3_0);
+            o3_1 = mad(v3.x, k0, o3_1);
+            o3_1 = mad(v3.y, k1, o3_1);
+            o3_1 = mad(v3.z, k2, o3_1);
+            o3_1 = mad(v3.w, k3, o3_1);
+            o3_2 = mad(v4.x, k0, o3_2);
+            o3_2 = mad(v4.y, k1, o3_2);
+            o3_2 = mad(v4.z, k2, o3_2);
+            o3_2 = mad(v4.w, k3, o3_2);
+            o3_3 = mad(v5.x, k0, o3_3);
+            o3_3 = mad(v5.y, k1, o3_3);
+            o3_3 = mad(v5.z, k2, o3_3);
+            o3_3 = mad(v5.w, k3, o3_3);
+          }
+        }
+        { const int iy = in_y0 + 4;
+          COMPUTE_FLOAT4 v0=(COMPUTE_FLOAT4)0, v1=(COMPUTE_FLOAT4)0, v2=(COMPUTE_FLOAT4)0, v3=(COMPUTE_FLOAT4)0, v4=(COMPUTE_FLOAT4)0, v5=(COMPUTE_FLOAT4)0;
+          if(iy >= 0 && iy < in_hw.x) { const int row = inp_base + iy * in_hw.y * 4;
+            if(in_x0+0 >= 0 && in_x0+0 < in_hw.y) v0 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+0)*4));
+            if(in_x0+1 >= 0 && in_x0+1 < in_hw.y) v1 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+1)*4));
+            if(in_x0+2 >= 0 && in_x0+2 < in_hw.y) v2 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+2)*4));
+            if(in_x0+3 >= 0 && in_x0+3 < in_hw.y) v3 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+3)*4));
+            if(in_x0+4 >= 0 && in_x0+4 < in_hw.y) v4 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+4)*4));
+            if(in_x0+5 >= 0 && in_x0+5 < in_hw.y) v5 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+5)*4));
+          }
+          { const int wo = w_base + (2*3+0)*4;
+            COMPUTE_FLOAT4 k0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo));
+            COMPUTE_FLOAT4 k1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset));
+            COMPUTE_FLOAT4 k2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*2));
+            COMPUTE_FLOAT4 k3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*3));
+            o2_0 = mad(v0.x, k0, o2_0);
+            o2_0 = mad(v0.y, k1, o2_0);
+            o2_0 = mad(v0.z, k2, o2_0);
+            o2_0 = mad(v0.w, k3, o2_0);
+            o2_1 = mad(v1.x, k0, o2_1);
+            o2_1 = mad(v1.y, k1, o2_1);
+            o2_1 = mad(v1.z, k2, o2_1);
+            o2_1 = mad(v1.w, k3, o2_1);
+            o2_2 = mad(v2.x, k0, o2_2);
+            o2_2 = mad(v2.y, k1, o2_2);
+            o2_2 = mad(v2.z, k2, o2_2);
+            o2_2 = mad(v2.w, k3, o2_2);
+            o2_3 = mad(v3.x, k0, o2_3);
+            o2_3 = mad(v3.y, k1, o2_3);
+            o2_3 = mad(v3.z, k2, o2_3);
+            o2_3 = mad(v3.w, k3, o2_3);
+          }
+          { const int wo = w_base + (2*3+1)*4;
+            COMPUTE_FLOAT4 k0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo));
+            COMPUTE_FLOAT4 k1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset));
+            COMPUTE_FLOAT4 k2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*2));
+            COMPUTE_FLOAT4 k3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*3));
+            o2_0 = mad(v1.x, k0, o2_0);
+            o2_0 = mad(v1.y, k1, o2_0);
+            o2_0 = mad(v1.z, k2, o2_0);
+            o2_0 = mad(v1.w, k3, o2_0);
+            o2_1 = mad(v2.x, k0, o2_1);
+            o2_1 = mad(v2.y, k1, o2_1);
+            o2_1 = mad(v2.z, k2, o2_1);
+            o2_1 = mad(v2.w, k3, o2_1);
+            o2_2 = mad(v3.x, k0, o2_2);
+            o2_2 = mad(v3.y, k1, o2_2);
+            o2_2 = mad(v3.z, k2, o2_2);
+            o2_2 = mad(v3.w, k3, o2_2);
+            o2_3 = mad(v4.x, k0, o2_3);
+            o2_3 = mad(v4.y, k1, o2_3);
+            o2_3 = mad(v4.z, k2, o2_3);
+            o2_3 = mad(v4.w, k3, o2_3);
+          }
+          { const int wo = w_base + (2*3+2)*4;
+            COMPUTE_FLOAT4 k0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo));
+            COMPUTE_FLOAT4 k1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset));
+            COMPUTE_FLOAT4 k2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*2));
+            COMPUTE_FLOAT4 k3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*3));
+            o2_0 = mad(v2.x, k0, o2_0);
+            o2_0 = mad(v2.y, k1, o2_0);
+            o2_0 = mad(v2.z, k2, o2_0);
+            o2_0 = mad(v2.w, k3, o2_0);
+            o2_1 = mad(v3.x, k0, o2_1);
+            o2_1 = mad(v3.y, k1, o2_1);
+            o2_1 = mad(v3.z, k2, o2_1);
+            o2_1 = mad(v3.w, k3, o2_1);
+            o2_2 = mad(v4.x, k0, o2_2);
+            o2_2 = mad(v4.y, k1, o2_2);
+            o2_2 = mad(v4.z, k2, o2_2);
+            o2_2 = mad(v4.w, k3, o2_2);
+            o2_3 = mad(v5.x, k0, o2_3);
+            o2_3 = mad(v5.y, k1, o2_3);
+            o2_3 = mad(v5.z, k2, o2_3);
+            o2_3 = mad(v5.w, k3, o2_3);
+          }
+          { const int wo = w_base + (1*3+0)*4;
+            COMPUTE_FLOAT4 k0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo));
+            COMPUTE_FLOAT4 k1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset));
+            COMPUTE_FLOAT4 k2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*2));
+            COMPUTE_FLOAT4 k3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*3));
+            o3_0 = mad(v0.x, k0, o3_0);
+            o3_0 = mad(v0.y, k1, o3_0);
+            o3_0 = mad(v0.z, k2, o3_0);
+            o3_0 = mad(v0.w, k3, o3_0);
+            o3_1 = mad(v1.x, k0, o3_1);
+            o3_1 = mad(v1.y, k1, o3_1);
+            o3_1 = mad(v1.z, k2, o3_1);
+            o3_1 = mad(v1.w, k3, o3_1);
+            o3_2 = mad(v2.x, k0, o3_2);
+            o3_2 = mad(v2.y, k1, o3_2);
+            o3_2 = mad(v2.z, k2, o3_2);
+            o3_2 = mad(v2.w, k3, o3_2);
+            o3_3 = mad(v3.x, k0, o3_3);
+            o3_3 = mad(v3.y, k1, o3_3);
+            o3_3 = mad(v3.z, k2, o3_3);
+            o3_3 = mad(v3.w, k3, o3_3);
+          }
+          { const int wo = w_base + (1*3+1)*4;
+            COMPUTE_FLOAT4 k0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo));
+            COMPUTE_FLOAT4 k1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset));
+            COMPUTE_FLOAT4 k2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*2));
+            COMPUTE_FLOAT4 k3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*3));
+            o3_0 = mad(v1.x, k0, o3_0);
+            o3_0 = mad(v1.y, k1, o3_0);
+            o3_0 = mad(v1.z, k2, o3_0);
+            o3_0 = mad(v1.w, k3, o3_0);
+            o3_1 = mad(v2.x, k0, o3_1);
+            o3_1 = mad(v2.y, k1, o3_1);
+            o3_1 = mad(v2.z, k2, o3_1);
+            o3_1 = mad(v2.w, k3, o3_1);
+            o3_2 = mad(v3.x, k0, o3_2);
+            o3_2 = mad(v3.y, k1, o3_2);
+            o3_2 = mad(v3.z, k2, o3_2);
+            o3_2 = mad(v3.w, k3, o3_2);
+            o3_3 = mad(v4.x, k0, o3_3);
+            o3_3 = mad(v4.y, k1, o3_3);
+            o3_3 = mad(v4.z, k2, o3_3);
+            o3_3 = mad(v4.w, k3, o3_3);
+          }
+          { const int wo = w_base + (1*3+2)*4;
+            COMPUTE_FLOAT4 k0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo));
+            COMPUTE_FLOAT4 k1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset));
+            COMPUTE_FLOAT4 k2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*2));
+            COMPUTE_FLOAT4 k3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*3));
+            o3_0 = mad(v2.x, k0, o3_0);
+            o3_0 = mad(v2.y, k1, o3_0);
+            o3_0 = mad(v2.z, k2, o3_0);
+            o3_0 = mad(v2.w, k3, o3_0);
+            o3_1 = mad(v3.x, k0, o3_1);
+            o3_1 = mad(v3.y, k1, o3_1);
+            o3_1 = mad(v3.z, k2, o3_1);
+            o3_1 = mad(v3.w, k3, o3_1);
+            o3_2 = mad(v4.x, k0, o3_2);
+            o3_2 = mad(v4.y, k1, o3_2);
+            o3_2 = mad(v4.z, k2, o3_2);
+            o3_2 = mad(v4.w, k3, o3_2);
+            o3_3 = mad(v5.x, k0, o3_3);
+            o3_3 = mad(v5.y, k1, o3_3);
+            o3_3 = mad(v5.z, k2, o3_3);
+            o3_3 = mad(v5.w, k3, o3_3);
+          }
+        }
+        { const int iy = in_y0 + 5;
+          COMPUTE_FLOAT4 v0=(COMPUTE_FLOAT4)0, v1=(COMPUTE_FLOAT4)0, v2=(COMPUTE_FLOAT4)0, v3=(COMPUTE_FLOAT4)0, v4=(COMPUTE_FLOAT4)0, v5=(COMPUTE_FLOAT4)0;
+          if(iy >= 0 && iy < in_hw.x) { const int row = inp_base + iy * in_hw.y * 4;
+            if(in_x0+0 >= 0 && in_x0+0 < in_hw.y) v0 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+0)*4));
+            if(in_x0+1 >= 0 && in_x0+1 < in_hw.y) v1 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+1)*4));
+            if(in_x0+2 >= 0 && in_x0+2 < in_hw.y) v2 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+2)*4));
+            if(in_x0+3 >= 0 && in_x0+3 < in_hw.y) v3 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+3)*4));
+            if(in_x0+4 >= 0 && in_x0+4 < in_hw.y) v4 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+4)*4));
+            if(in_x0+5 >= 0 && in_x0+5 < in_hw.y) v5 = CONVERT_COMPUTE_FLOAT4(vload4(0, input + row + (in_x0+5)*4));
+          }
+          { const int wo = w_base + (2*3+0)*4;
+            COMPUTE_FLOAT4 k0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo));
+            COMPUTE_FLOAT4 k1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset));
+            COMPUTE_FLOAT4 k2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*2));
+            COMPUTE_FLOAT4 k3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*3));
+            o3_0 = mad(v0.x, k0, o3_0);
+            o3_0 = mad(v0.y, k1, o3_0);
+            o3_0 = mad(v0.z, k2, o3_0);
+            o3_0 = mad(v0.w, k3, o3_0);
+            o3_1 = mad(v1.x, k0, o3_1);
+            o3_1 = mad(v1.y, k1, o3_1);
+            o3_1 = mad(v1.z, k2, o3_1);
+            o3_1 = mad(v1.w, k3, o3_1);
+            o3_2 = mad(v2.x, k0, o3_2);
+            o3_2 = mad(v2.y, k1, o3_2);
+            o3_2 = mad(v2.z, k2, o3_2);
+            o3_2 = mad(v2.w, k3, o3_2);
+            o3_3 = mad(v3.x, k0, o3_3);
+            o3_3 = mad(v3.y, k1, o3_3);
+            o3_3 = mad(v3.z, k2, o3_3);
+            o3_3 = mad(v3.w, k3, o3_3);
+          }
+          { const int wo = w_base + (2*3+1)*4;
+            COMPUTE_FLOAT4 k0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo));
+            COMPUTE_FLOAT4 k1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset));
+            COMPUTE_FLOAT4 k2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*2));
+            COMPUTE_FLOAT4 k3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*3));
+            o3_0 = mad(v1.x, k0, o3_0);
+            o3_0 = mad(v1.y, k1, o3_0);
+            o3_0 = mad(v1.z, k2, o3_0);
+            o3_0 = mad(v1.w, k3, o3_0);
+            o3_1 = mad(v2.x, k0, o3_1);
+            o3_1 = mad(v2.y, k1, o3_1);
+            o3_1 = mad(v2.z, k2, o3_1);
+            o3_1 = mad(v2.w, k3, o3_1);
+            o3_2 = mad(v3.x, k0, o3_2);
+            o3_2 = mad(v3.y, k1, o3_2);
+            o3_2 = mad(v3.z, k2, o3_2);
+            o3_2 = mad(v3.w, k3, o3_2);
+            o3_3 = mad(v4.x, k0, o3_3);
+            o3_3 = mad(v4.y, k1, o3_3);
+            o3_3 = mad(v4.z, k2, o3_3);
+            o3_3 = mad(v4.w, k3, o3_3);
+          }
+          { const int wo = w_base + (2*3+2)*4;
+            COMPUTE_FLOAT4 k0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo));
+            COMPUTE_FLOAT4 k1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset));
+            COMPUTE_FLOAT4 k2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*2));
+            COMPUTE_FLOAT4 k3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight+wo+weight_oc_offset*3));
+            o3_0 = mad(v2.x, k0, o3_0);
+            o3_0 = mad(v2.y, k1, o3_0);
+            o3_0 = mad(v2.z, k2, o3_0);
+            o3_0 = mad(v2.w, k3, o3_0);
+            o3_1 = mad(v3.x, k0, o3_1);
+            o3_1 = mad(v3.y, k1, o3_1);
+            o3_1 = mad(v3.z, k2, o3_1);
+            o3_1 = mad(v3.w, k3, o3_1);
+            o3_2 = mad(v4.x, k0, o3_2);
+            o3_2 = mad(v4.y, k1, o3_2);
+            o3_2 = mad(v4.z, k2, o3_2);
+            o3_2 = mad(v4.w, k3, o3_2);
+            o3_3 = mad(v5.x, k0, o3_3);
+            o3_3 = mad(v5.y, k1, o3_3);
+            o3_3 = mad(v5.z, k2, o3_3);
+            o3_3 = mad(v5.w, k3, o3_3);
+          }
+        }
+    }
+#ifdef RELU
+    o0_0 = fmax(o0_0,(COMPUTE_FLOAT4)0);
+    o0_1 = fmax(o0_1,(COMPUTE_FLOAT4)0);
+    o0_2 = fmax(o0_2,(COMPUTE_FLOAT4)0);
+    o0_3 = fmax(o0_3,(COMPUTE_FLOAT4)0);
+    o1_0 = fmax(o1_0,(COMPUTE_FLOAT4)0);
+    o1_1 = fmax(o1_1,(COMPUTE_FLOAT4)0);
+    o1_2 = fmax(o1_2,(COMPUTE_FLOAT4)0);
+    o1_3 = fmax(o1_3,(COMPUTE_FLOAT4)0);
+    o2_0 = fmax(o2_0,(COMPUTE_FLOAT4)0);
+    o2_1 = fmax(o2_1,(COMPUTE_FLOAT4)0);
+    o2_2 = fmax(o2_2,(COMPUTE_FLOAT4)0);
+    o2_3 = fmax(o2_3,(COMPUTE_FLOAT4)0);
+    o3_0 = fmax(o3_0,(COMPUTE_FLOAT4)0);
+    o3_1 = fmax(o3_1,(COMPUTE_FLOAT4)0);
+    o3_2 = fmax(o3_2,(COMPUTE_FLOAT4)0);
+    o3_3 = fmax(o3_3,(COMPUTE_FLOAT4)0);
+#endif
+#ifdef PRELU
+    { COMPUTE_FLOAT4 sl = CONVERT_COMPUTE_FLOAT4(vload4(out_c_idx, slope_ptr));
+      o0_0 = select(o0_0*sl,o0_0,o0_0>=0);
+      o0_1 = select(o0_1*sl,o0_1,o0_1>=0);
+      o0_2 = select(o0_2*sl,o0_2,o0_2>=0);
+      o0_3 = select(o0_3*sl,o0_3,o0_3>=0);
+      o1_0 = select(o1_0*sl,o1_0,o1_0>=0);
+      o1_1 = select(o1_1*sl,o1_1,o1_1>=0);
+      o1_2 = select(o1_2*sl,o1_2,o1_2>=0);
+      o1_3 = select(o1_3*sl,o1_3,o1_3>=0);
+      o2_0 = select(o2_0*sl,o2_0,o2_0>=0);
+      o2_1 = select(o2_1*sl,o2_1,o2_1>=0);
+      o2_2 = select(o2_2*sl,o2_2,o2_2>=0);
+      o2_3 = select(o2_3*sl,o2_3,o2_3>=0);
+      o3_0 = select(o3_0*sl,o3_0,o3_0>=0);
+      o3_1 = select(o3_1*sl,o3_1,o3_1>=0);
+      o3_2 = select(o3_2*sl,o3_2,o3_2>=0);
+      o3_3 = select(o3_3*sl,o3_3,o3_3>=0);
+    }
+#endif
+    const int base = (((out_b_idx + out_c_idx * batch) * out_hw.x + out_h_idx) * out_hw.y + out_w_idx) * 4;
+    const int rh = out_hw.x - out_h_idx; const int rw = out_hw.y - out_w_idx;
+    if(0 < rh && 0 < rw) vstore4(CONVERT_FLOAT4(o0_0), 0, output + base + (0*out_hw.y + 0)*4);
+    if(0 < rh && 1 < rw) vstore4(CONVERT_FLOAT4(o0_1), 0, output + base + (0*out_hw.y + 1)*4);
+    if(0 < rh && 2 < rw) vstore4(CONVERT_FLOAT4(o0_2), 0, output + base + (0*out_hw.y + 2)*4);
+    if(0 < rh && 3 < rw) vstore4(CONVERT_FLOAT4(o0_3), 0, output + base + (0*out_hw.y + 3)*4);
+    if(1 < rh && 0 < rw) vstore4(CONVERT_FLOAT4(o1_0), 0, output + base + (1*out_hw.y + 0)*4);
+    if(1 < rh && 1 < rw) vstore4(CONVERT_FLOAT4(o1_1), 0, output + base + (1*out_hw.y + 1)*4);
+    if(1 < rh && 2 < rw) vstore4(CONVERT_FLOAT4(o1_2), 0, output + base + (1*out_hw.y + 2)*4);
+    if(1 < rh && 3 < rw) vstore4(CONVERT_FLOAT4(o1_3), 0, output + base + (1*out_hw.y + 3)*4);
+    if(2 < rh && 0 < rw) vstore4(CONVERT_FLOAT4(o2_0), 0, output + base + (2*out_hw.y + 0)*4);
+    if(2 < rh && 1 < rw) vstore4(CONVERT_FLOAT4(o2_1), 0, output + base + (2*out_hw.y + 1)*4);
+    if(2 < rh && 2 < rw) vstore4(CONVERT_FLOAT4(o2_2), 0, output + base + (2*out_hw.y + 2)*4);
+    if(2 < rh && 3 < rw) vstore4(CONVERT_FLOAT4(o2_3), 0, output + base + (2*out_hw.y + 3)*4);
+    if(3 < rh && 0 < rw) vstore4(CONVERT_FLOAT4(o3_0), 0, output + base + (3*out_hw.y + 0)*4);
+    if(3 < rh && 1 < rw) vstore4(CONVERT_FLOAT4(o3_1), 0, output + base + (3*out_hw.y + 1)*4);
+    if(3 < rh && 2 < rw) vstore4(CONVERT_FLOAT4(o3_2), 0, output + base + (3*out_hw.y + 2)*4);
+    if(3 < rh && 3 < rw) vstore4(CONVERT_FLOAT4(o3_3), 0, output + base + (3*out_hw.y + 3)*4);
+}
+
 __kernel
 void conv_2d_c8h8w1(GLOBAL_SIZE_2_DIMS
                       __global const FLOAT *input,

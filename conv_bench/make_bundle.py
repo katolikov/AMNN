@@ -37,8 +37,15 @@ HEADS = [
 CC = (32, 24, 48)                            # correctness shape: %16/%4 (LDS) and %6/%6 (fused2) ok
 VARIANTS = ["conv_2d_c4h1w1", "conv_2d_c4h1w2", "conv_2d_c4h4w1", "conv_2d_c4h1w4",
             "conv_2d_c8h2w1", "conv_2d_c8h4w1", "conv_2d_c8h1w4", "conv_2d_c8h8w1",
-            "conv_2d_c8h4w1_pa", "conv_2d_c8h1w1", "conv_2d_c4h8w1"]
-SPEC_ONLY = ["conv_2d_c8h8w1", "conv_2d_c8h4w1_pa", "conv_2d_c8h1w1", "conv_2d_c4h8w1"]
+            "conv_2d_c8h4w1_pa", "conv_2d_c8h1w1", "conv_2d_c4h8w1",
+            # 2-D register tiles (ILP-M/HNTMP geometry). Kept in the suite even where they lose on
+            # the reference device: the winner is device- and clock-dependent, and c4h4w2 already
+            # beats MNN's default by 8.5% on one core (FINDINGS §H.21).
+            "conv_2d_c4h4w2", "conv_2d_c4h2w2", "conv_2d_c4h2w4", "conv_2d_c4h4w4"]
+SPEC_ONLY = ["conv_2d_c8h8w1", "conv_2d_c8h4w1_pa", "conv_2d_c8h1w1", "conv_2d_c4h8w1",
+             "conv_2d_c4h4w2", "conv_2d_c4h2w2", "conv_2d_c4h2w4", "conv_2d_c4h4w4"]
+# these hardcode stride 1; forcing them on a stride-2 conv silently measures the default instead
+STRIDE1_ONLY = ["conv_2d_c4h4w2", "conv_2d_c4h2w2", "conv_2d_c4h2w4", "conv_2d_c4h4w4"]
 LDS_TILES = ["16x4", "48x4", "16x12", "8x4", "24x4", "16x2"]
 
 
@@ -96,7 +103,8 @@ def main():
         strip_to(f, OUT / "bin" / f.name)
         print(f"   {f.name}  {(OUT/'bin'/f.name).stat().st_size/1e6:.1f} MB")
 
-    man = {"variants": VARIANTS, "spec_only": SPEC_ONLY, "lds_tiles": LDS_TILES,
+    man = {"variants": VARIANTS, "spec_only": SPEC_ONLY, "stride1_only": STRIDE1_ONLY,
+           "lds_tiles": LDS_TILES,
            "cores": [], "heads": [], "blocks": [], "correctness": {}}
 
     # ---------- core models ----------
