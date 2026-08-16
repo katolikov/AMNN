@@ -834,6 +834,20 @@ ErrorCode ConvBufExecution::onResize(const std::vector<Tensor *> &inputs, const 
             if(nullptr != getenv("MNN_CONV_SPEC")){
                 buildOption.emplace("-DCONV_SPEC_UNROLL");
             }
+            // MNN_CONV_HARD=1: bake the shape into the program as compile-time constants, so the
+            // channel loop unrolls and every index/bounds expression constant-folds. One program
+            // build per distinct shape (cached), traded for the fastest possible code.
+            if(nullptr != getenv("MNN_CONV_HARD")){
+                buildOption.emplace("-DHC_IN_H=" + std::to_string(inputHeight));
+                buildOption.emplace("-DHC_IN_W=" + std::to_string(inputWidth));
+                buildOption.emplace("-DHC_OUT_H=" + std::to_string(height));
+                buildOption.emplace("-DHC_OUT_W=" + std::to_string(width));
+                buildOption.emplace("-DHC_ICB=" + std::to_string(inputChannelBlocks));
+                buildOption.emplace("-DHC_OCB=" + std::to_string(outChannelBlocks));
+                buildOption.emplace("-DHC_BATCH=" + std::to_string(batch));
+                buildOption.emplace("-DHC_WB=" + std::to_string(UP_DIV(width, itemW[knl_idx])));
+                buildOption.emplace("-DHC_HB=" + std::to_string(UP_DIV(height, itemH[knl_idx])));
+            }
             if(outputShape.at(3) % itemC[knl_idx] != 0){
                 buildOption.emplace("-DCHANNEL_BOUNDARY_PROTECT");
             }
@@ -891,6 +905,17 @@ ErrorCode ConvBufExecution::onResize(const std::vector<Tensor *> &inputs, const 
         std::set<std::string> buildOption = mResource->mBuildOptions;
         if(nullptr != getenv("MNN_CONV_SPEC")){
             buildOption.emplace("-DCONV_SPEC_UNROLL");
+        }
+        if(nullptr != getenv("MNN_CONV_HARD")){
+            buildOption.emplace("-DHC_IN_H=" + std::to_string(inputHeight));
+            buildOption.emplace("-DHC_IN_W=" + std::to_string(inputWidth));
+            buildOption.emplace("-DHC_OUT_H=" + std::to_string(height));
+            buildOption.emplace("-DHC_OUT_W=" + std::to_string(width));
+            buildOption.emplace("-DHC_ICB=" + std::to_string(inputChannelBlocks));
+            buildOption.emplace("-DHC_OCB=" + std::to_string(outChannelBlocks));
+            buildOption.emplace("-DHC_BATCH=" + std::to_string(batch));
+            buildOption.emplace("-DHC_WB=" + std::to_string(UP_DIV(width, itemW[min_index])));
+            buildOption.emplace("-DHC_HB=" + std::to_string(UP_DIV(height, itemH[min_index])));
         }
         if(outputShape.at(3) % itemC[min_index] != 0){
             buildOption.emplace("-DCHANNEL_BOUNDARY_PROTECT");

@@ -704,6 +704,30 @@ On 48->48@36x48 (cooled) c4h4w2 is +11%, i.e. the win is shape-dependent -- whic
 autotuner exists to resolve. All variants are kept in the standard suite regardless of whether they
 win on this device: the winner is device- and clock-dependent (§H.18).
 
+### §H.23 — Shape hardcoding: -18.7% vs MNN's default, the largest kernel win found
+Per the "specialise for our exact convs, duplication is fine" brief: every MNN conv kernel takes the
+whole shape as RUNTIME arguments (in_hw, out_hw, in_c_blocks, out_c_blocks, batch), so the compiler
+cannot fold index arithmetic, cannot bound the channel loop, and must emit a bounds branch per halo
+column. Added `MNN_CONV_HARD=1`, which passes -DHC_IN_H/-DHC_IN_W/-DHC_OUT_H/-DHC_OUT_W/-DHC_ICB/
+-DHC_OCB/-DHC_BATCH/-DHC_WB/-DHC_HB so every one becomes a compile-time constant. Costs one program
+build per distinct shape (cached by MNN's program cache). Correct: cosine 1.000000.
+| core | MNN default | c4h4w2 | c4h4w2 + hardcoded shape |
+|---|---|---|---|
+| **32->32@72x96** | 119.2 | 110.2 (-7.6%) | **96.8 (-18.7%)** |
+| 48->48@36x48 | 101.2 | 114.8 (+13.5%) | 101.7 (+0.5%) |
+| 96->96@18x24 | 30.3 | 30.3 | 30.3 (already at 79% of ceiling) |
+**-18.7% on the dominant core** -- more than double what the 2-D tile geometry alone gives, and the
+largest single-kernel win in this whole investigation. On the 48-core it rescues c4h4w2 from +13.5%
+back to parity, i.e. constant folding is worth ~13% there too.
+**Trap found and isolated:** the first version also put `opencl_unroll_hint` on the now-constant
+channel loop. That made it **+13.4% SLOWER than the non-hardcoded kernel** (135.7 vs 110.2) -- fully
+unrolling an 8-iteration loop around ~600 lines of generated code blows up I-cache/registers.
+Constant folding and loop unrolling are SEPARATE levers and must be measured separately: folding
+alone -18.7%, folding+unroll +13.4%. The unroll is now opt-in via -DHC_UNROLL_IC (default off).
+**Control:** `default+HARD` measured 119.7 vs 119.7 -- unchanged, because only the four 2-D tile
+kernels currently read the HC_* macros. **Applying the same macros to MNN's own stock kernels
+(c8h4w1, c4h1w2, ...) is therefore an untested, broadly-applicable lever** and the obvious next step.
+
 ### §H.7 — FINAL VERDICT (Session A restricted-set specialization)
 Levers tried on the real Block1/Block2: PReLU fusion = BANKED (-8/9% per block, shippable, no new
 code). Falsified on-device with numbers: NC4HW4-input theory, cross-layer fusion (<2%), LDS tiling
