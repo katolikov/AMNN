@@ -582,6 +582,24 @@ occupancy cost, exactly as at stride 1. The real coalescing loss at stride 2 com
 W-BLOCKING (Finding 1), not from stride 2 itself.
 Kept as a documented negative behind MNN_CONV_LDS (default off), same as the stride-1 variant.
 
+**§H.19b — the 96-channel core: kernel choice stops mattering, and equal MACs run 3.4x faster.**
+The new 6-deep core 96->96@18x24 measures **30.0us on ALL THIRTEEN implementations** (29.8-30.8:
+MNN default, all 11 forced variants, and LDS). Nothing distinguishes them. Compare at IDENTICAL
+work -- 48->48@36x48 and 96->96@18x24 are both exactly 71.7 MFLOP per conv:
+| conv | MFLOP | time | achieved | % of ~6.5 TF peak |
+|---|---|---|---|---|
+| 48->48@36x48 | 71.7 | 101.5us | 0.71 TFLOP/s | 11% |
+| 32->32@72x96 | 127.4 | 119.2us | 1.07 TFLOP/s | 16% |
+| **96->96@18x24** | **71.7** | **30.0us** | **2.39 TFLOP/s** | **37%** |
+Same MACs, **3.4x faster**, and the best utilisation measured anywhere in this investigation. The
+flatness across implementations is the tell: at 96 channels the conv has left the occupancy-starved
+regime, so blocking choice no longer changes anything -- whereas at 32/48 channels the spread
+between the best and worst kernel is ~2x. This is a direct, controlled confirmation of the
+model-level lever (§H.7 "widen channels at equal MACs"), now measured on shapes from the real
+model rather than synthetic sweeps. Practical reading: **no kernel work on the 32/48-channel cores
+can approach what changing their shape to 96 channels at equal MACs would deliver.**
+Run was thermally VALID (980 MHz start and end, 0% drift).
+
 ### §H.7 — FINAL VERDICT (Session A restricted-set specialization)
 Levers tried on the real Block1/Block2: PReLU fusion = BANKED (-8/9% per block, shippable, no new
 code). Falsified on-device with numbers: NC4HW4-input theory, cross-layer fusion (<2%), LDS tiling
