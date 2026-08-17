@@ -66,6 +66,19 @@ Beat that, not just the stock default, if you want the result to matter.
 
 ## Traps that have already cost real time
 
+0. **A stale `tdir/input.json` is indistinguishable from a compiler crash — check it first.**
+   The measurement helpers rewrite `tdir/input.json` on every call, so after any measurement loop
+   the staged shape is whatever ran last. Running a *different* model against it makes MNN segfault
+   **before printing anything**, and stdout is block-buffered, so you get a bare `Segmentation fault`
+   with no output at all. This already cost a full session: five "ANGLE/clspv crashes" were retracted
+   once the fixture was fixed (§H.24). Verified deterministic, same binary, A/B/A/B:
+   `[1,32,24,48]` runs, `[1,48,36,48]` segfaults, repeat. **Always push an `input.json` matching the
+   model you are about to run**, and if you see an unexplained segfault, check the shape before
+   suspecting anything else:
+   ```bash
+   adb shell cat /data/local/tmp/convprobe/tdir/input.json
+   ```
+
 1. **Never index accumulators dynamically.** The first `c4h4w2` used a runtime loop with an if/else
    accumulator chain and ternary column selects: **308 µs**. Fully unrolled, identical maths:
    **109 µs**. A 2.8× difference from spilling alone — it looked like a clean falsification and

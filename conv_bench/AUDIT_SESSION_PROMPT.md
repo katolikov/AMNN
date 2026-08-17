@@ -79,6 +79,19 @@ Beating only the stock default is not interesting any more.
 
 ## Traps that have already cost real time
 
+0. **A stale `tdir/input.json` is indistinguishable from a compiler crash — check it first.**
+   The measurement helpers rewrite `tdir/input.json` on every call, so after any measurement loop
+   the staged shape is whatever ran last. Running a *different* model against it makes MNN segfault
+   **before printing anything**, and stdout is block-buffered, so you get a bare `Segmentation fault`
+   with no output at all. This already cost a full session: five "ANGLE/clspv crashes" were retracted
+   once the fixture was fixed (§H.24). Verified deterministic, same binary, A/B/A/B:
+   `[1,32,24,48]` runs, `[1,48,36,48]` segfaults, repeat. **Always push an `input.json` matching the
+   model you are about to run**, and if you see an unexplained segfault, check the shape before
+   suspecting anything else:
+   ```bash
+   adb shell cat /data/local/tmp/convprobe/tdir/input.json
+   ```
+
 1. **Never index accumulators dynamically** — dynamic accumulator loops/selects spill to scratch and
    cost up to 2.8×. Generate kernels from a Python template, fully unrolled.
 2. **Constant folding and loop unrolling are separate levers**: folding is −18.7%, adding
