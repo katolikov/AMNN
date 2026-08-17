@@ -100,9 +100,10 @@ Beating only the stock default is not interesting any more.
 4. **The first `__kernel` in `conv_2d_buf.cl` sits inside `#ifdef CONV_LOCAL_SIZE`** — text inserted
    "before the first kernel" silently vanishes in normal builds.
 5. **`DEAL_NON_UNIFORM_DIM2` is a backslash-continued macro** — do not split it.
-6. **Modifying `conv_2d_buf.cl` near the stock kernels can crash ANGLE's clspv outright**, with no
-   diagnostic at all (§H.24) — a bare `Segmentation fault` and nothing else. Prefer a **new `.cl`
-   file with its own program name**; that workaround is itself untested and worth confirming.
+6. **A previously-documented "clspv crashes when you modify conv_2d_buf.cl" trap has been
+   RETRACTED** — it was the stale-`input.json` bug above (see the corrected §H.24). Editing,
+   relocating and duplicating kernels in that file are all fine as far as anyone has actually
+   measured. Do not design around a limitation that does not exist.
 7. **Always regenerate after editing a `.cl`:**
    `python3 source/backend/opencl/execution/cl/opencl_codegen.py source/backend/opencl/execution/cl/`
 8. **Give every forced kernel its own cache file.** Sharing one makes some runs emit no output, so a
