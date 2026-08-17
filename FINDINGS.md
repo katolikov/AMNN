@@ -728,36 +728,35 @@ alone -18.7%, folding+unroll +13.4%. The unroll is now opt-in via -DHC_UNROLL_IC
 kernels currently read the HC_* macros. **Applying the same macros to MNN's own stock kernels
 (c8h4w1, c4h1w2, ...) is therefore an untested, broadly-applicable lever** and the obvious next step.
 
-### §H.24 — Hardcoding the STOCK kernels: BLOCKED by a clspv crash (two approaches, both dead)
-§H.23 showed shape hardcoding is worth -18.7% on the four 2-D tile kernels. Extending it to MNN's
-own stock kernels should apply that to every conv. Two approaches, both reproducibly crash ANGLE's
-clspv **with no diagnostic at all** (the compiler dies in-process; even with an explicit fflush on
-the build-failure path the run prints nothing but "Segmentation fault"):
-1. **Relocate the shared HC_* macro block above the stock kernels** so they can use it. Crashes.
-   Bisected carefully: crashes with the stock kernels REVERTED and only the block moved, i.e. moving
-   an identical block of #defines earlier in the program source is sufficient to trigger it. Two
-   placements tried (top of file after DEAL_NON_UNIFORM_DIM2; immediately before conv_2d_c4h1w1),
-   both with 0 open conditionals above the block. Both crash.
-2. **Duplicate the kernels as `<name>_hc` copies placed AFTER the existing macro block**, leaving
-   every original byte-identical (the "duplication is fine" approach). Also crashes -- including
-   with a SINGLE copy (conv_2d_c8h4w1_hc), so it is not a program-size limit. The host registrations
-   were verified to sit inside the MNN_CONV_SPEC guard, so they are not even reached in the failing
-   run: the .cl change alone is sufficient.
-**Control:** the committed state builds and runs (49-51us on the correctness model) before and after
-every attempt, so the tree is healthy and the failures are real, not environmental.
-**Not understood.** The four 2-D tile kernels use the very same HC_* macros from the very same block
-and work fine, so the macros themselves are not the problem. Whatever clspv objects to is triggered
-by modifying/extending the conv_2d_buf program near the stock kernels.
-**Next hypothesis (untested):** put the hardcoded copies in a SEPARATE .cl file / program name so
-conv_2d_buf is not touched at all, and build them with their own -DHC_* option set. If that also
-crashes, the limit is per-context rather than per-program.
-**Two real bugs were found and fixed along the way** (both committed): a build failure now flushes
-stdout, so a failed kernel build no longer presents as a silent segfault; and two self-inflicted
-insertion traps are documented -- the first `__kernel` in conv_2d_buf.cl is inside
-`#ifdef CONV_LOCAL_SIZE` (so text inserted "before the first kernel" silently disappears in normal
-builds), and DEAL_NON_UNIFORM_DIM2 is a backslash-continued multi-line macro that must not be split.
-Also re-confirmed: the .cl codegen does not escape double quotes, so `"` in a comment breaks the
-generated C++.
+### §H.24 — CORRECTED: hardcoding the stock kernels is NOT blocked; the "clspv crash" was my test bug
+**The previous version of this section was wrong and is retracted.** It reported that extending the
+-18.7% shape-hardcoding win (§H.23) to MNN's 7 stock kernels was blocked by a reproducible ANGLE/clspv
+crash. It is not. Every one of those segfaults was a **shape mismatch in the smoke test**, not a
+compiler failure.
+**Root cause.** The measurement helpers (`run_report.run_model`) rewrite `tdir/input.json` on every
+call. After any measurement loop, the staged input shape is whatever that loop ran last — e.g.
+`[1,48,36,48]`. The follow-up smoke test then ran `cc.mnn`, which needs `[1,32,24,48]`, against that
+stale descriptor. MNN segfaults on the mismatch, before printing anything, and stdout is block-
+buffered so the crash presents as a bare `Segmentation fault` with no output whatsoever — exactly
+like a compiler crash. Pushing the correct `input.json` makes the identical, unmodified build run
+fine (0.31 ms).
+**What this invalidates:** the "clspv crashes on insertions/relocations near the stock kernels"
+conclusion, the "even a single duplicated kernel crashes" datum, and the §H.25 corollary that
+"in-place edits after the macro block are safe while insertions are not". All five of those
+"crashes" are explained by the fixture bug. Nothing is known to be wrong with any of the approaches
+tried: relocating the macro block, `_hc` duplicate copies, and supplying HC* purely as `-D` build
+options are all still viable and **none has actually been measured**.
+**Lesson for the harness:** a stale `tdir/input.json` is indistinguishable from a compiler crash.
+Any standalone `ModuleBasic.out` invocation must push an `input.json` matching that model first —
+do not inherit whatever a previous measurement left behind.
+**Still true and worth keeping:** the `fflush(stdout)` added to the build-failure path (a genuine
+build failure would otherwise be swallowed the same way), and the three real .cl authoring traps —
+the first `__kernel` in conv_2d_buf.cl sits inside `#ifdef CONV_LOCAL_SIZE`; `DEAL_NON_UNIFORM_DIM2`
+is a backslash-continued multi-line macro that must not be split; and the codegen does not escape
+double quotes, so a `"` in a comment breaks the generated C++.
+**Status: OPEN, unblocked, not implemented.** The next attempt should use the `-D` design (host emits
+`-DHCINH=in_hw.x` by default and `-DHCINH=72` under MNN_CONV_HARD, with no macro block in the .cl at
+all) and must verify with a correctly-shaped `input.json`.
 
 ### §H.25 — Hardcoding + conv fusion: DEAD, for three independent reasons
 Asked whether the -18.7% shape-hardcoding win (§H.23) could rescue 2-conv fusion, in particular by
@@ -787,9 +786,9 @@ inter-layer traffic is under 1 us/conv and per-conv time is flat versus chain de
 ⇒ Fusion is closed on all three axes. The only remaining fusion-shaped argument is DISPATCH
 reduction for wall-clock (~50% of wall is CPU/submission overhead), which is a different mechanism
 and is better attacked with MNN's record/replay queue than with a fused kernel.
-**Useful side result:** editing a kernel IN PLACE after the macro block is safe. Combined with §H.24
-(adding or relocating anything near the stock kernels crashes clspv), the failure is localised to
-insertions/relocations in the early part of conv_2d_buf.cl, not to the HC_* macros themselves.
+**Note:** an earlier version of this section drew a corollary about which .cl edits are "safe" from
+the supposed clspv crash. That crash was a test-fixture bug (see the corrected §H.24); the corollary
+is withdrawn. The fusion results above are unaffected -- they are direct measurements.
 
 ### §H.7 — FINAL VERDICT (Session A restricted-set specialization)
 Levers tried on the real Block1/Block2: PReLU fusion = BANKED (-8/9% per block, shippable, no new
