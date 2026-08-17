@@ -48,7 +48,12 @@ SPEC_ONLY = ["conv_2d_c8h8w1", "conv_2d_c8h4w1_pa", "conv_2d_c8h1w1", "conv_2d_c
 STRIDE1_ONLY = ["conv_2d_c4h4w2", "conv_2d_c4h2w2", "conv_2d_c4h2w4", "conv_2d_c4h4w4"]
 # kernels that read the HC_* compile-time constants, i.e. respond to MNN_CONV_HARD=1.
 # Keep in sync with the .cl: a kernel listed here but not using the macros just measures twice.
-HARD_CAPABLE = ["conv_2d_c4h4w2", "conv_2d_c4h2w2", "conv_2d_c4h2w4", "conv_2d_c4h4w4"]
+HARD_CAPABLE = ["conv_2d_c4h4w2", "conv_2d_c4h2w2", "conv_2d_c4h2w4", "conv_2d_c4h4w4",
+                # shape-specialised copies of the stock kernels (conv_2d_hc_buf.cl). Only
+                # meaningful WITH MNN_CONV_HARD -- without it they are their originals.
+                "conv_2d_c4h1w1_hc", "conv_2d_c4h1w2_hc", "conv_2d_c4h1w4_hc",
+                "conv_2d_c4h4w1_hc", "conv_2d_c8h4w1_hc", "conv_2d_c8h2w1_hc", "conv_2d_c8h1w4_hc"]
+SPEC_ONLY += HARD_CAPABLE   # every one of them needs MNN_CONV_SPEC to enter the candidate list
 LDS_TILES = ["16x4", "48x4", "16x12", "8x4", "24x4", "16x2"]
 
 

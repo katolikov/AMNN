@@ -203,7 +203,7 @@ def main(argv=None):
     variants = man["variants"]     # [kernel names]
     spec_only = set(man["spec_only"])
     stride1_only = set(man.get("stride1_only", []))
-    hard_capable = [v for v in man.get("hard_capable", []) if v in variants]
+    hard_capable = list(man.get("hard_capable", []))
     tiles = man["lds_tiles"][:3] if a.quick else man["lds_tiles"]
     out_path = Path(a.out) if a.out else HERE / f"report_{serial}.md"
 

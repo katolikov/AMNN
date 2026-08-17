@@ -20,6 +20,14 @@
 namespace MNN {
 namespace OpenCL {
 
+// *_hc kernels are shape-specialised copies living in conv_2d_hc_buf.cl -- their own program, so
+// conv_2d_buf.cl is never modified. Everything else builds from conv_2d_buf as before.
+static const char* hcProgramFor(const std::string& n) {
+    return (n.size() > 3 && n.compare(n.size() - 3, 3, "_hc") == 0) ? "conv_2d_hc_buf"
+                                                                   : "conv_2d_buf";
+}
+
+
 ConvBufCommonExecution::ConvBufCommonExecution(Backend *backend) {
     mOpenCLBackend = static_cast<OpenCLBackend *>(backend);
 }
@@ -784,6 +792,13 @@ ErrorCode ConvBufExecution::onResize(const std::vector<Tensor *> &inputs, const 
         if(nullptr != getenv("MNN_CONV_SPEC")){
             kernelName.push_back("conv_2d_c8h8w1"); itemC.push_back(8); itemH.push_back(8); itemW.push_back(1);
             kernelName.push_back("conv_2d_c8h4w1_pa"); itemC.push_back(8); itemH.push_back(4); itemW.push_back(1);
+            kernelName.push_back("conv_2d_c4h1w1_hc"); itemC.push_back(4); itemH.push_back(1); itemW.push_back(1);
+            kernelName.push_back("conv_2d_c4h1w2_hc"); itemC.push_back(4); itemH.push_back(1); itemW.push_back(2);
+            kernelName.push_back("conv_2d_c4h1w4_hc"); itemC.push_back(4); itemH.push_back(1); itemW.push_back(4);
+            kernelName.push_back("conv_2d_c4h4w1_hc"); itemC.push_back(4); itemH.push_back(4); itemW.push_back(1);
+            kernelName.push_back("conv_2d_c8h4w1_hc"); itemC.push_back(8); itemH.push_back(4); itemW.push_back(1);
+            kernelName.push_back("conv_2d_c8h2w1_hc"); itemC.push_back(8); itemH.push_back(2); itemW.push_back(1);
+            kernelName.push_back("conv_2d_c8h1w4_hc"); itemC.push_back(8); itemH.push_back(1); itemW.push_back(4);
             kernelName.push_back("conv_2d_c8h1w1"); itemC.push_back(8); itemH.push_back(1); itemW.push_back(1);
             kernelName.push_back("conv_2d_c4h8w1"); itemC.push_back(4); itemH.push_back(8); itemW.push_back(1);
             // 2-D register tile (ILP-M / HNTMP geometry). Hardcodes stride 1.
@@ -837,16 +852,26 @@ ErrorCode ConvBufExecution::onResize(const std::vector<Tensor *> &inputs, const 
             // MNN_CONV_HARD=1: bake the shape into the program as compile-time constants, so the
             // channel loop unrolls and every index/bounds expression constant-folds. One program
             // build per distinct shape (cached), traded for the fastest possible code.
-            if(nullptr != getenv("MNN_CONV_HARD")){
-                buildOption.emplace("-DHC_IN_H=" + std::to_string(inputHeight));
-                buildOption.emplace("-DHC_IN_W=" + std::to_string(inputWidth));
-                buildOption.emplace("-DHC_OUT_H=" + std::to_string(height));
-                buildOption.emplace("-DHC_OUT_W=" + std::to_string(width));
-                buildOption.emplace("-DHC_ICB=" + std::to_string(inputChannelBlocks));
-                buildOption.emplace("-DHC_OCB=" + std::to_string(outChannelBlocks));
-                buildOption.emplace("-DHC_BATCH=" + std::to_string(batch));
-                buildOption.emplace("-DHC_WB=" + std::to_string(UP_DIV(width, itemW[knl_idx])));
-                buildOption.emplace("-DHC_HB=" + std::to_string(UP_DIV(height, itemH[knl_idx])));
+            {
+                const bool hcHard = (nullptr != getenv("MNN_CONV_HARD"));
+                auto hcPut = [&](const char* n, const char* expr, int val){
+                    buildOption.emplace(std::string("-D") + n + "=" +
+                                        (hcHard ? std::to_string(val) : std::string(expr)));
+                };
+                hcPut("HCINH","in_hw.x",inputHeight);   hcPut("HCINW","in_hw.y",inputWidth);
+                hcPut("HCOUTH","out_hw.x",height);      hcPut("HCOUTW","out_hw.y",width);
+                hcPut("HCICB","in_c_blocks",inputChannelBlocks);
+                hcPut("HCOCB","out_c_blocks",outChannelBlocks);
+                hcPut("HCBATCH","batch",batch);
+                hcPut("HCFH","filter_hw.x",mResource->mKernelHeight);
+                hcPut("HCFW","filter_hw.y",mResource->mKernelWidth);
+                hcPut("HCSH","stride_hw.x",mResource->mStrides[0]);
+                hcPut("HCSW","stride_hw.y",mResource->mStrides[1]);
+                hcPut("HCPH","pad_hw.x",mPaddings[0]);  hcPut("HCPW","pad_hw.y",mPaddings[1]);
+                hcPut("HCDH","dilate_hw.x",mResource->mDilations[0]);
+                hcPut("HCDW","dilate_hw.y",mResource->mDilations[1]);
+                hcPut("HCWB","out_w_blocks",UP_DIV(width, itemW[knl_idx]));
+                hcPut("HCHB","out_h_blocks",UP_DIV(height, itemH[knl_idx]));
             }
             if(outputShape.at(3) % itemC[knl_idx] != 0){
                 buildOption.emplace("-DCHANNEL_BOUNDARY_PROTECT");
@@ -854,7 +879,7 @@ ErrorCode ConvBufExecution::onResize(const std::vector<Tensor *> &inputs, const 
             if((outputShape.at(2) % itemW[knl_idx]) != 0 || (outputShape.at(1) % itemH[knl_idx]) != 0){
                 buildOption.emplace("-DBLOCK_LEAVE");
             }
-            kernel[knl_idx]        = mOpenCLBackend->getOpenCLRuntime()->buildKernel("conv_2d_buf", kernelName[knl_idx], buildOption, mOpenCLBackend->getPrecision());
+            kernel[knl_idx]        = mOpenCLBackend->getOpenCLRuntime()->buildKernel(hcProgramFor(kernelName[knl_idx]), kernelName[knl_idx], buildOption, mOpenCLBackend->getPrecision());
             uint32_t maxWorkGroupSize = static_cast<uint32_t>(mOpenCLBackend->getOpenCLRuntime()->getMaxWorkGroupSize(kernel[knl_idx]));
 
             int each_oc = (UP_DIV(outputShape.at(3), itemC[knl_idx]) + conv_block_num - 1) / conv_block_num;
@@ -906,16 +931,26 @@ ErrorCode ConvBufExecution::onResize(const std::vector<Tensor *> &inputs, const 
         if(nullptr != getenv("MNN_CONV_SPEC")){
             buildOption.emplace("-DCONV_SPEC_UNROLL");
         }
-        if(nullptr != getenv("MNN_CONV_HARD")){
-            buildOption.emplace("-DHC_IN_H=" + std::to_string(inputHeight));
-            buildOption.emplace("-DHC_IN_W=" + std::to_string(inputWidth));
-            buildOption.emplace("-DHC_OUT_H=" + std::to_string(height));
-            buildOption.emplace("-DHC_OUT_W=" + std::to_string(width));
-            buildOption.emplace("-DHC_ICB=" + std::to_string(inputChannelBlocks));
-            buildOption.emplace("-DHC_OCB=" + std::to_string(outChannelBlocks));
-            buildOption.emplace("-DHC_BATCH=" + std::to_string(batch));
-            buildOption.emplace("-DHC_WB=" + std::to_string(UP_DIV(width, itemW[min_index])));
-            buildOption.emplace("-DHC_HB=" + std::to_string(UP_DIV(height, itemH[min_index])));
+        {
+            const bool hcHard = (nullptr != getenv("MNN_CONV_HARD"));
+            auto hcPut = [&](const char* n, const char* expr, int val){
+                buildOption.emplace(std::string("-D") + n + "=" +
+                                    (hcHard ? std::to_string(val) : std::string(expr)));
+            };
+            hcPut("HCINH","in_hw.x",inputHeight);   hcPut("HCINW","in_hw.y",inputWidth);
+            hcPut("HCOUTH","out_hw.x",height);      hcPut("HCOUTW","out_hw.y",width);
+            hcPut("HCICB","in_c_blocks",inputChannelBlocks);
+            hcPut("HCOCB","out_c_blocks",outChannelBlocks);
+            hcPut("HCBATCH","batch",batch);
+            hcPut("HCFH","filter_hw.x",mResource->mKernelHeight);
+            hcPut("HCFW","filter_hw.y",mResource->mKernelWidth);
+            hcPut("HCSH","stride_hw.x",mResource->mStrides[0]);
+            hcPut("HCSW","stride_hw.y",mResource->mStrides[1]);
+            hcPut("HCPH","pad_hw.x",mPaddings[0]);  hcPut("HCPW","pad_hw.y",mPaddings[1]);
+            hcPut("HCDH","dilate_hw.x",mResource->mDilations[0]);
+            hcPut("HCDW","dilate_hw.y",mResource->mDilations[1]);
+            hcPut("HCWB","out_w_blocks",UP_DIV(width, itemW[min_index]));
+            hcPut("HCHB","out_h_blocks",UP_DIV(height, itemH[min_index]));
         }
         if(outputShape.at(3) % itemC[min_index] != 0){
             buildOption.emplace("-DCHANNEL_BOUNDARY_PROTECT");
@@ -925,7 +960,7 @@ ErrorCode ConvBufExecution::onResize(const std::vector<Tensor *> &inputs, const 
         }
         
         for(int kernel_idx = 0; kernel_idx < conv_block_num; kernel_idx++) {
-            mKernel[kernel_idx]        = mOpenCLBackend->getOpenCLRuntime()->buildKernel("conv_2d_buf", kernelName[min_index], buildOption, mOpenCLBackend->getPrecision());
+            mKernel[kernel_idx]        = mOpenCLBackend->getOpenCLRuntime()->buildKernel(hcProgramFor(kernelName[min_index]), kernelName[min_index], buildOption, mOpenCLBackend->getPrecision());
             
             uint32_t idx            = 0;
             cl_int ret = CL_SUCCESS;

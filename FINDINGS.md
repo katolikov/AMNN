@@ -790,6 +790,39 @@ and is better attacked with MNN's record/replay queue than with a fused kernel.
 the supposed clspv crash. That crash was a test-fixture bug (see the corrected §H.24); the corollary
 is withdrawn. The fusion results above are unaffected -- they are direct measurements.
 
+### §H.26 — Shape-specialised copies of the STOCK kernels: implemented, and a new win on the 48-core
+§H.24 claimed this was blocked by a clspv crash; that was retracted (it was a stale-input.json test
+bug). Implemented properly this time, in a **dedicated new program file** so nothing existing moves:
+`conv_2d_hc_buf.cl` holds 7 copies (`conv_2d_c4h1w1_hc` ... `conv_2d_c8h1w4_hc`) of MNN's stock
+kernels with every shape value read from a `-D` option; the originals in conv_2d_buf.cl are
+byte-identical and untouched. The host picks the program by name suffix (`hcProgramFor`) and emits
+each value as the runtime expression by default, a literal under `MNN_CONV_HARD=1`.
+All 7 correct: **cosine 1.000000**.
+**Measured (cooled, interleaved; raw per-rep values tight):**
+| core | MNN default | plain kernel | + hardcoded |
+|---|---|---|---|
+| 32->32@72x96 | 119.2 | c4h4w1 127.5 | **c4h4w1_hc 113.2** (-11% vs its twin, **-5% vs default**) |
+| | | c8h4w1 119.2 | c8h4w1_hc 137.7 (**+16%** -- hardcoding HURTS this one) |
+| | | c4h1w2 206.7 | c4h1w2_hc 204.3 (-1%) |
+| 48->48@36x48 | 101.0 | c4h1w2 101.3 | **c4h1w2_hc 96.0 (-5% vs default)** |
+| | | c4h4w1 105.2 | c4h4w1_hc 133.8 (+33% -- hurts) |
+**Reading:** constant folding is **kernel- and shape-dependent, not a free win**. It helps
+c4h4w1 on the 32-core (-11%) and c4h1w2 on the 48-core (-5%), and actively hurts c8h4w1 (+16%) and
+c4h4w1 on the 48-core (+33%). There is no "hardcode everything" rule -- it has to be measured per
+(kernel, shape), which is exactly what the autotuner is for.
+**Why it still matters: the 48-core finally has a winner.** Nothing had beaten MNN's default on
+48->48@36x48 in this entire investigation (c4h4w2+HARD was +0.5%, every direct variant lost).
+`c4h1w2_hc` at 96.0 vs 101.0 is the first real gain there.
+**Current best per shape:** 32->32@72x96 = `c4h4w2` + MNN_CONV_HARD (96.8, -18.7%);
+48->48@36x48 = `c4h1w2_hc` + MNN_CONV_HARD (96.0, -5%); 96->96@18x24 = anything (at 79% of ceiling).
+**Build-system trap found (this is what actually blocked it for two sessions):**
+`opencl_codegen.py` writes `opencl_source_map.hpp` **into the current working directory**, not into
+`cl/`. Running it from the repo root leaves the real map stale -- harmless for existing programs
+(their entries already exist) but fatal for a NEW one, which then fails with `Can't find kernel
+source !`. A new `.cl` also needs a **cmake re-configure** so the glob picks up its generated `.cpp`.
+Run the codegen from inside `cl/`. Only diagnosable because of the fflush added to the build-failure
+path -- without it this too presents as a bare segfault.
+
 ### §H.7 — FINAL VERDICT (Session A restricted-set specialization)
 Levers tried on the real Block1/Block2: PReLU fusion = BANKED (-8/9% per block, shippable, no new
 code). Falsified on-device with numbers: NC4HW4-input theory, cross-layer fusion (<2%), LDS tiling

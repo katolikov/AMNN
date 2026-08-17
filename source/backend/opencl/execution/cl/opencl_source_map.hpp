@@ -164,6 +164,9 @@ extern const char* matmul;
 extern const char* binary;
 extern const char* roi_pooling;
 extern const char* depthwise_conv2d;
+#ifndef MNN_OPENCL_BUFFER_CLOSED
+extern const char* conv_2d_hc_buf;
+#endif
 extern const char* layernorm;
 #ifndef MNN_OPENCL_BUFFER_CLOSED
 extern const char* gemm_conv1x1_buf;
@@ -337,6 +340,9 @@ const std::map<std::string, const char*> OpenCLProgramMap =
   { "binary", binary },
   { "roi_pooling", roi_pooling },
   { "depthwise_conv2d", depthwise_conv2d },
+#ifndef MNN_OPENCL_BUFFER_CLOSED
+  { "conv_2d_hc_buf", conv_2d_hc_buf },
+#endif
   { "layernorm", layernorm },
 #ifndef MNN_OPENCL_BUFFER_CLOSED
   { "gemm_conv1x1_buf", gemm_conv1x1_buf },
@@ -379,7 +385,7 @@ const std::map<std::string, std::string> OpenCLProgramMd5Map =
   { "unary_buf", "bfa4bab8f0cf486ae77eb27193f03b9a" },
   { "depthwise_conv2d_buf", "d1c201a09afccebe794d50027acabdc1" },
   { "glmem_convert", "ee4866b2d889824e48d58fa3a78795d4" },
-  { "winogradTransform_buf", "efa5fda527fce5820ba48b90a4707fa7" },
+  { "winogradTransform_buf", "ee80c59288c8c0e4c07b8278b331e6aa" },
   { "winogradTransform_subgroup_buf", "904f2a0f1a062378418c6c90133ed5e0" },
   { "splitgelu_buf", "86d5b31ea14330d2b99273e4e868bd35" },
   { "select_buf", "1516b3f3c52ba8e8a0a5cd7f03ea86f2" },
@@ -401,7 +407,7 @@ const std::map<std::string, std::string> OpenCLProgramMd5Map =
   { "scale_buf", "9176b8e86fd4d326e7fa14640ce13b48" },
   { "matmul_buf", "b66faece7f0591d49c289e5227d9f680" },
   { "pooling", "900d1388836badea36a7e06ad7763b0d" },
-  { "conv_2d_buf", "2faa0378ab0d702419a92ecc2073851a" },
+  { "conv_2d_buf", "9fe7c2e66ae8df12c1c0b83c32edb32f" },
   { "gemm_int", "41770c2a12943f8fbdbfe259889ddf2d" },
   { "buffer_to_image", "bad95040692206db84b5a1bcc0b6f248" },
   { "winogradTransformDest2_3_1", "f2aaa52d652565e70a44868d4f6028e9" },
@@ -418,6 +424,7 @@ const std::map<std::string, std::string> OpenCLProgramMd5Map =
   { "binary", "5683a6a6fd24660f0d05a70938fa6a62" },
   { "roi_pooling", "ba4a81b7ec7058d14afb377c18674a76" },
   { "depthwise_conv2d", "a23dd590e0bdcdd60987e8bab5ed529f" },
+  { "conv_2d_hc_buf", "d862881a08e6e24b083c2e92144992ef" },
   { "layernorm", "bd457b4bd4f3c57818bc17e073b09e74" },
   { "gemm_conv1x1_buf", "5f8fd2f6e8278a2e003825a001b733ac" },
   { "winogradTransformDest2_5_1", "4f3d0d6b3e0ee7f0bff97acfbbdf653f" },
