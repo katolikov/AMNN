@@ -728,6 +728,37 @@ alone -18.7%, folding+unroll +13.4%. The unroll is now opt-in via -DHC_UNROLL_IC
 kernels currently read the HC_* macros. **Applying the same macros to MNN's own stock kernels
 (c8h4w1, c4h1w2, ...) is therefore an untested, broadly-applicable lever** and the obvious next step.
 
+### §H.24 — Hardcoding the STOCK kernels: BLOCKED by a clspv crash (two approaches, both dead)
+§H.23 showed shape hardcoding is worth -18.7% on the four 2-D tile kernels. Extending it to MNN's
+own stock kernels should apply that to every conv. Two approaches, both reproducibly crash ANGLE's
+clspv **with no diagnostic at all** (the compiler dies in-process; even with an explicit fflush on
+the build-failure path the run prints nothing but "Segmentation fault"):
+1. **Relocate the shared HC_* macro block above the stock kernels** so they can use it. Crashes.
+   Bisected carefully: crashes with the stock kernels REVERTED and only the block moved, i.e. moving
+   an identical block of #defines earlier in the program source is sufficient to trigger it. Two
+   placements tried (top of file after DEAL_NON_UNIFORM_DIM2; immediately before conv_2d_c4h1w1),
+   both with 0 open conditionals above the block. Both crash.
+2. **Duplicate the kernels as `<name>_hc` copies placed AFTER the existing macro block**, leaving
+   every original byte-identical (the "duplication is fine" approach). Also crashes -- including
+   with a SINGLE copy (conv_2d_c8h4w1_hc), so it is not a program-size limit. The host registrations
+   were verified to sit inside the MNN_CONV_SPEC guard, so they are not even reached in the failing
+   run: the .cl change alone is sufficient.
+**Control:** the committed state builds and runs (49-51us on the correctness model) before and after
+every attempt, so the tree is healthy and the failures are real, not environmental.
+**Not understood.** The four 2-D tile kernels use the very same HC_* macros from the very same block
+and work fine, so the macros themselves are not the problem. Whatever clspv objects to is triggered
+by modifying/extending the conv_2d_buf program near the stock kernels.
+**Next hypothesis (untested):** put the hardcoded copies in a SEPARATE .cl file / program name so
+conv_2d_buf is not touched at all, and build them with their own -DHC_* option set. If that also
+crashes, the limit is per-context rather than per-program.
+**Two real bugs were found and fixed along the way** (both committed): a build failure now flushes
+stdout, so a failed kernel build no longer presents as a silent segfault; and two self-inflicted
+insertion traps are documented -- the first `__kernel` in conv_2d_buf.cl is inside
+`#ifdef CONV_LOCAL_SIZE` (so text inserted "before the first kernel" silently disappears in normal
+builds), and DEAL_NON_UNIFORM_DIM2 is a backslash-continued multi-line macro that must not be split.
+Also re-confirmed: the .cl codegen does not escape double quotes, so `"` in a comment breaks the
+generated C++.
+
 ### §H.7 — FINAL VERDICT (Session A restricted-set specialization)
 Levers tried on the real Block1/Block2: PReLU fusion = BANKED (-8/9% per block, shippable, no new
 code). Falsified on-device with numbers: NC4HW4-input theory, cross-layer fusion (<2%), LDS tiling
