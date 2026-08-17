@@ -5243,7 +5243,7 @@ void conv_2d_3x3s1_fused2(GLOBAL_SIZE_2_DIMS
     const int gy = get_global_id(1);   // b*H + oy
     const int lx = get_local_id(0);
     const int ly = get_local_id(1);
-    const int H = in_hw.x, W = in_hw.y;
+    const int H = HCINH, W = HCINW;
     const int ox = gx;
     const int b  = gy / H;
     const int oy = gy % H;
@@ -5260,7 +5260,7 @@ void conv_2d_3x3s1_fused2(GLOBAL_SIZE_2_DIMS
         const int iy = iy_base + ty, ix = ix_base + tx;
         COMPUTE_FLOAT4 v = (COMPUTE_FLOAT4)0;
         if (iy >= 0 && iy < H && ix >= 0 && ix < W) {
-            v = CONVERT_COMPUTE_FLOAT4(vload4(0, input + ((((cb * batch + b) * H + iy) * W + ix) * 4)));
+            v = CONVERT_COMPUTE_FLOAT4(vload4(0, input + ((((cb * HCBATCH + b) * H + iy) * W + ix) * 4)));
         }
         lds_in[e] = v;
     }
@@ -5302,6 +5302,6 @@ void conv_2d_3x3s1_fused2(GLOBAL_SIZE_2_DIMS
                 }
             }
         }
-        vstore4(CONVERT_FLOAT4(acc), 0, output + ((((oc * batch + b) * H + oy) * W + ox) * 4));
+        vstore4(CONVERT_FLOAT4(acc), 0, output + ((((oc * HCBATCH + b) * H + oy) * W + ox) * 4));
     }
 }

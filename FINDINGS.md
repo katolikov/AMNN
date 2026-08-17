@@ -759,6 +759,38 @@ builds), and DEAL_NON_UNIFORM_DIM2 is a backslash-continued multi-line macro tha
 Also re-confirmed: the .cl codegen does not escape double quotes, so `"` in a comment breaks the
 generated C++.
 
+### §H.25 — Hardcoding + conv fusion: DEAD, for three independent reasons
+Asked whether the -18.7% shape-hardcoding win (§H.23) could rescue 2-conv fusion, in particular by
+letting the intermediate live in REGISTERS instead of the LDS that sank `fused2` (6.5x slower).
+**1. Register-resident fusion is capacity-infeasible.** conv2 reduces over ALL input channels, so a
+thread owning a TxT tile of conv2's output needs `(T+2)^2 x ICB` float4 of conv1 output:
+| conv2 tile | 32ch (ICB 8) | 48ch (ICB 12) | conv1 recompute |
+|---|---|---|---|
+| 1x1 | 72 float4 = 144 VGPR | 108 = 216 VGPR | **9.00x** |
+| 2x2 | 128 = **256 VGPR** | 192 = **384 VGPR** | 4.00x |
+| 4x4 | 288 = 576 VGPR | 432 = 864 VGPR | 2.25x |
+Against a 256 VGPR/lane hardware maximum. T=2 is already at or past the limit; T=1 fits but
+recomputes conv1 **9x** (conv1 and conv2 cost the same, so fusing at T=1 costs 9+1=10 units against
+2 unfused). This is arithmetic and hardware capacity, not an estimate: hardcoding cannot unlock
+register-resident fusion. The intermediate MUST live in LDS.
+**2. Hardcoding the existing LDS fusion changes nothing — measured.** `conv_2d_3x3s1_fused2` now
+reads the HC_* macros (it sits after the macro block, so nothing had to move; correct, cosine
+0.993444 vs the numpy conv^2 reference either way):
+| core | 1 conv | 2x1 conv | fused2 | fused2 + HARD |
+|---|---|---|---|---|
+| 32->32@72x96 | 120 | 240 | 1569 | **1570** |
+| 48->48@36x48 | 100 | 200 | 1245 | **1245** |
+Identical to the digit. `fused2` is bound by LDS occupancy and barriers (~10.5 KB per 36-thread
+workgroup), not by index arithmetic, so constant folding has nothing to fold that matters.
+**3. The prize was never there.** §H.1 measured the cross-layer fusion ceiling at **<2%**:
+inter-layer traffic is under 1 us/conv and per-conv time is flat versus chain depth.
+⇒ Fusion is closed on all three axes. The only remaining fusion-shaped argument is DISPATCH
+reduction for wall-clock (~50% of wall is CPU/submission overhead), which is a different mechanism
+and is better attacked with MNN's record/replay queue than with a fused kernel.
+**Useful side result:** editing a kernel IN PLACE after the macro block is safe. Combined with §H.24
+(adding or relocating anything near the stock kernels crashes clspv), the failure is localised to
+insertions/relocations in the early part of conv_2d_buf.cl, not to the HC_* macros themselves.
+
 ### §H.7 — FINAL VERDICT (Session A restricted-set specialization)
 Levers tried on the real Block1/Block2: PReLU fusion = BANKED (-8/9% per block, shippable, no new
 code). Falsified on-device with numbers: NC4HW4-input theory, cross-layer fusion (<2%), LDS tiling
