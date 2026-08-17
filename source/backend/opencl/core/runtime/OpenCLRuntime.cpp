@@ -496,6 +496,10 @@ bool OpenCLRuntime::buildProgram(const std::string &buildOptionsStr, cl::Program
             std::string buildLog = program->getBuildInfo<CL_PROGRAM_BUILD_LOG>(*mFirstGPUDevicePtr);
             MNN_PRINT("Program build log: %s \n", buildLog.c_str());
         }
+        // A failed build usually ends in a null-kernel dereference a moment later. stdout is
+        // block-buffered when piped, so without this flush the diagnostic dies with the process
+        // and the failure looks like a silent segfault with no output at all.
+        fflush(stdout);
         return false;
     }
     return true;
