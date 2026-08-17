@@ -66,7 +66,7 @@ SPLITK_FACTORS = [2, 4, 8]
 # Env flags that change which conv IMPLEMENTATION runs. Anything measured across these MUST use
 # conv_all_us()/total kernel time, never MNN's `conv time` counter (FINDINGS §H.27).
 IMPL_SWITCHING_ENVS = ["MNN_FORCE_WINOGRAD", "MNN_CONV_LDS", "MNN_CONV_SPLITK", "MNN_NO_WINOGRAD",
-                       "MNN_CONV_NCHW", "MNN_CONV_IMGEMM"]
+                       "MNN_CONV_NCHW", "MNN_CONV_IMGEMM", "MNN_CONV_IGEMM"]
 # Plain-NCHW conv path (env MNN_CONV_NCHW=1, FINDINGS §H.36). Loses on this model's shapes but wins
 # at C>=48 with large spatial, and has no channel-padding cliff -- re-decide on new hardware/shapes.
 # Its profiler events split: gemm2-0 = layout in, gemm2-2 = layout out, ori-* = the conv itself.
@@ -76,6 +76,12 @@ NCHW_MODE = True
 # shape with much larger N, could plausibly flip it. NOTE: at C>=64 MNN takes the Winograd path
 # before any MNN_CONV_* flag is read -- pair it with MNN_NO_WINOGRAD=1 or every arm measures the same thing.
 IMGEMM_MODE = True
+# Implicit GEMM (env MNN_CONV_IGEMM=1 for NC4HW4, =nchw for NCHW; FINDINGS §H.46). Gathers the
+# im2col columns on the fly, so nothing is materialised. Falsified here (+98..300%) because it is
+# LDS-throughput bound -- 9 LDS accesses per 8 mad instructions at the 8-float4 register budget.
+# Kept in the suite: a device that tolerates LARGER register tiles (check whether c4h4w4 still
+# regresses in section 4) would amortise that traffic and could flip it.
+IGEMM_MODES = ["1", "nchw"]
 
 
 def find_strip():
@@ -138,6 +144,7 @@ def main():
            "lds_modes": LDS_MODES,
            "splitk_factors": SPLITK_FACTORS,
            "impl_switching_envs": IMPL_SWITCHING_ENVS,
+           "igemm_modes": IGEMM_MODES,
            "cores": [], "heads": [], "blocks": [], "correctness": {}}
 
     # ---------- core models ----------

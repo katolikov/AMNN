@@ -716,8 +716,8 @@ def main(argv=None):
         "> every arm would silently measure the same kernel. All arms here therefore run with\n"
         "> MNN_NO_WINOGRAD=1. im2col is counted as conv work (it is part of the algorithm); only\n"
         "> the final NC4HW4 repack is excluded, matching §15 (FINDINGS §H.38).\n")
-    say("| shape | direct (NC4HW4) | im2col+GEMM | verdict |")
-    say("|---|---|---|---|")
+    say("| shape | direct (NC4HW4) | im2col+GEMM | implicit GEMM (NC4HW4) | implicit GEMM (NCHW) | verdict |")
+    say("|---|---|---|---|---|---|")
     NW = "MNN_NO_WINOGRAD=1 "
     for c in cores:
         cooldown(d, cool_s)
@@ -728,11 +728,22 @@ def main(argv=None):
             "gem": lambda i, m=m, shp=shp, dep=dep, k=k: conv_kernel_only_us(
                 run_model(d, m, shp, 60, env=NW + "MNN_CONV_IMGEMM=1",
                           cache=f"ig_g{k}{i}.bin")[0], dep)[0],
+            # implicit GEMM: gathers the columns on the fly, never materialising the matrix.
+            # The NC4HW4 variant uses no conversion kernels at all.
+            "imp4": lambda i, m=m, shp=shp, dep=dep, k=k: conv_kernel_only_us(
+                run_model(d, m, shp, 60, env=NW + "MNN_CONV_IGEMM=1",
+                          cache=f"ig_i{k}{i}.bin")[0], dep)[0],
+            "impn": lambda i, m=m, shp=shp, dep=dep, k=k: conv_kernel_only_us(
+                run_model(d, m, shp, 60, env=NW + "MNN_CONV_IGEMM=nchw",
+                          cache=f"ig_n{k}{i}.bin")[0], dep)[0],
         }, reps)
         D.setdefault("imgemm", {})[k] = r
-        v = ("**GEMM wins**" if r["gem"] and r["gem"] < r["dir"] * 0.97
-             else f"direct wins ({pct(r['gem'], r['dir'])})")
-        say(f"| {c['label']} | {r['dir']:.0f} | {r['gem']:.0f} | {v} |")
+        best = min(x for x in (r["gem"], r["imp4"], r["impn"]) if x) if any(
+            (r["gem"], r["imp4"], r["impn"])) else 0.0
+        v = ("**a GEMM wins**" if best and best < r["dir"] * 0.97
+             else f"direct wins ({pct(best, r['dir'])})")
+        say(f"| {c['label']} | {r['dir']:.0f} | {r['gem']:.0f} | {r['imp4']:.0f} | "
+            f"{r['impn']:.0f} | {v} |")
     say("\n> **Mechanism.** im2col materialises each input element 9 times and then STREAMS that\n"
         "> matrix through the ALUs, so it inflates inner-loop bytes-per-MAC ~9x — this is not the\n"
         "> same as a one-off buffer round-trip, which on some parts is free. For the GEMM to win it\n"

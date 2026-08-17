@@ -6164,3 +6164,178 @@ void conv_2d_nchw_fused2(GLOBAL_SIZE_2_DIMS
         o[3 * plane] = (FLOAT)a3;
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// conv_2d_implicit_gemm — LDS-tiled IMPLICIT GEMM 3x3 stride-1 conv.
+//   env MNN_CONV_IGEMM=1        -> NC4HW4 input/output (MNN's native layout)
+//   env MNN_CONV_IGEMM=nchw     -> NCHW input/output (via the existing conversion kernels)
+//
+// The GEMM is C[oc][m] = sum_k W[oc][k] * Im2Col[k][m] with k = (ic, kh, kw) and m = (b, y, x).
+// IMPLICIT means the Im2Col matrix is never materialised: the A-tile is gathered straight out of
+// the input while it is being staged into __local. That is the whole point -- §H.38's explicit
+// im2col+GEMM lost largely because it streamed a 9x-inflated operand out of global memory.
+//
+// The other thing this tests, which no previous kernel here does: a GEMM tile REUSES each gathered
+// column across all IG_NT output channels in the workgroup. Every direct conv_2d_c* kernel handles
+// only 4 output channels per thread, so it re-reads the input once per output-channel block
+// (8x for C=32, 12x for C=48). This is the untested LDS-tiled variant §H.38 called out.
+//
+// Layout is a compile-time switch and the ONLY thing that differs between the two variants, so the
+// NC4HW4-vs-NCHW comparison is exact: same tiling, same math, same register budget.
+//
+// Tile: 64 pixels x 32 output channels per workgroup, 64 threads, each owning 8 pixels x 4 channels
+// = 8 float4 accumulators -- deliberately the register class §H.22 measured as optimal.
+// K-step is 9, i.e. exactly one input channel's taps, which keeps the gather index math cheap.
+#define IG_MT 64          /* pixels per workgroup            */
+#define IG_NT 32          /* output channels per workgroup   */
+#define IG_TM 8           /* pixels per thread               */
+#define IG_TN 4           /* output channels per thread      */
+#define IG_KS 9           /* k-step = one input channel      */
+
+__kernel __attribute__((reqd_work_group_size(8, 8, 1)))
+void conv_2d_implicit_gemm(GLOBAL_SIZE_2_DIMS
+                           __global const FLOAT *input,
+                           __global const FLOAT *weight,   /* [ocb][ic][9][4] */
+                           __global const FLOAT *bias,
+                           __global FLOAT *output,
+                           __private const int in_channels,
+                           __private const int out_channels,
+                           __private const int batch,
+                           __private const int height,
+                           __private const int width
+                           #ifdef PRELU
+                           ,__global const FLOAT *slope_ptr
+                           #endif
+) {
+    __local COMPUTE_FLOAT lA[IG_KS * IG_MT];
+    __local COMPUTE_FLOAT lB[IG_KS * IG_NT];
+
+    const int lid   = get_local_id(1) * 8 + get_local_id(0);   /* 0..63 */
+    const int tid_m = lid & 7;          /* which 8-pixel strip  */
+    const int tid_n = lid >> 3;         /* which 4-channel strip */
+
+    const int m0  = get_group_id(0) * IG_MT;    /* first pixel  of this tile */
+    const int oc0 = get_group_id(1) * IG_NT;    /* first out-ch of this tile */
+
+    const int plane = height * width;
+    const int M     = batch * plane;
+    const int ocst  = (out_channels + 3) & ~3;
+
+    COMPUTE_FLOAT4 acc0=0,acc1=0,acc2=0,acc3=0,acc4=0,acc5=0,acc6=0,acc7=0;
+
+    // Loop-invariant pixel decomposition, hoisted out of both the tap loop and the channel loop.
+    // Thread `lid` stages the 9 taps of pixel (m0+lid), so this costs TWO integer divisions for
+    // the whole kernel instead of two per element per channel step. Integer division has no
+    // hardware instruction here, so leaving it in the inner loop is a large, purely artificial cost.
+    const int mg_s  = m0 + lid;
+    const int ok_s  = (mg_s < M);
+    const int b_s   = ok_s ? (mg_s / plane) : 0;
+    const int rem_s = mg_s - b_s * plane;
+    const int y_s   = ok_s ? (rem_s / width) : 0;
+    const int x_s   = rem_s - y_s * width;
+    // B staging: 9x32 elements over 64 threads. n is a power-of-two split, so no division either.
+    const int bn_s = lid & 31;
+    const int bt_s = lid >> 5;          /* 0 or 1 -> two taps per pass, 9 taps in ceil(9/2) passes */
+
+    for (int ic = 0; ic < in_channels; ic++) {
+        // ---- stage A: gather this input channel's 9 taps for this thread's pixel, straight from
+        //      the input. This is the implicit im2col -- no expanded buffer anywhere.
+        for (int t = 0; t < IG_KS; t++) {
+            COMPUTE_FLOAT v = 0;
+            if (ok_s) {
+                const int iy = y_s + (t / 3) - 1;
+                const int ix = x_s + (t - (t / 3) * 3) - 1;
+                if (iy >= 0 && iy < height && ix >= 0 && ix < width) {
+#ifdef IGEMM_NCHW
+                    const int cs = (in_channels + 3) & ~3;
+                    v = (COMPUTE_FLOAT)input[((b_s * cs + ic) * height + iy) * width + ix];
+#else
+                    /* NC4HW4: channels packed by 4, so this is a strided scalar read */
+                    v = (COMPUTE_FLOAT)input[((((ic >> 2) * batch + b_s) * height + iy) * width + ix) * 4
+                                             + (ic & 3)];
+#endif
+                }
+            }
+            lA[t * IG_MT + lid] = v;
+        }
+        // ---- stage B: the matching 9x32 weight block
+        for (int t = bt_s; t < IG_KS; t += 2) {
+            const int oc = oc0 + bn_s;
+            lB[t * IG_NT + bn_s] = (oc < out_channels)
+                  ? (COMPUTE_FLOAT)weight[((((oc >> 2) * in_channels + ic) * 9 + t) * 4) + (oc & 3)]
+                  : (COMPUTE_FLOAT)0;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        // ---- multiply: each gathered column is reused across all 32 output channels
+        for (int t = 0; t < IG_KS; t++) {
+            const COMPUTE_FLOAT4 wv = vload4(t * (IG_NT / 4) + tid_n, lB);
+            __local const COMPUTE_FLOAT *a = lA + t * IG_MT + tid_m * IG_TM;
+            acc0 = mad(wv, (COMPUTE_FLOAT4)(a[0]), acc0);
+            acc1 = mad(wv, (COMPUTE_FLOAT4)(a[1]), acc1);
+            acc2 = mad(wv, (COMPUTE_FLOAT4)(a[2]), acc2);
+            acc3 = mad(wv, (COMPUTE_FLOAT4)(a[3]), acc3);
+            acc4 = mad(wv, (COMPUTE_FLOAT4)(a[4]), acc4);
+            acc5 = mad(wv, (COMPUTE_FLOAT4)(a[5]), acc5);
+            acc6 = mad(wv, (COMPUTE_FLOAT4)(a[6]), acc6);
+            acc7 = mad(wv, (COMPUTE_FLOAT4)(a[7]), acc7);
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    const int oc = oc0 + tid_n * IG_TN;
+    if (oc >= out_channels) return;
+    COMPUTE_FLOAT4 bv = CONVERT_COMPUTE_FLOAT4(vload4(oc >> 2, bias));
+    acc0 += bv; acc1 += bv; acc2 += bv; acc3 += bv;
+    acc4 += bv; acc5 += bv; acc6 += bv; acc7 += bv;
+#ifdef RELU
+    acc0=fmax(acc0,(COMPUTE_FLOAT4)0); acc1=fmax(acc1,(COMPUTE_FLOAT4)0);
+    acc2=fmax(acc2,(COMPUTE_FLOAT4)0); acc3=fmax(acc3,(COMPUTE_FLOAT4)0);
+    acc4=fmax(acc4,(COMPUTE_FLOAT4)0); acc5=fmax(acc5,(COMPUTE_FLOAT4)0);
+    acc6=fmax(acc6,(COMPUTE_FLOAT4)0); acc7=fmax(acc7,(COMPUTE_FLOAT4)0);
+#endif
+#ifdef RELU6
+    acc0=clamp(acc0,(COMPUTE_FLOAT4)0,(COMPUTE_FLOAT4)6); acc1=clamp(acc1,(COMPUTE_FLOAT4)0,(COMPUTE_FLOAT4)6);
+    acc2=clamp(acc2,(COMPUTE_FLOAT4)0,(COMPUTE_FLOAT4)6); acc3=clamp(acc3,(COMPUTE_FLOAT4)0,(COMPUTE_FLOAT4)6);
+    acc4=clamp(acc4,(COMPUTE_FLOAT4)0,(COMPUTE_FLOAT4)6); acc5=clamp(acc5,(COMPUTE_FLOAT4)0,(COMPUTE_FLOAT4)6);
+    acc6=clamp(acc6,(COMPUTE_FLOAT4)0,(COMPUTE_FLOAT4)6); acc7=clamp(acc7,(COMPUTE_FLOAT4)0,(COMPUTE_FLOAT4)6);
+#endif
+#ifdef PRELU
+    { COMPUTE_FLOAT4 sv = CONVERT_COMPUTE_FLOAT4(vload4(oc >> 2, slope_ptr));
+      acc0=select(acc0*sv,acc0,acc0>=0); acc1=select(acc1*sv,acc1,acc1>=0);
+      acc2=select(acc2*sv,acc2,acc2>=0); acc3=select(acc3*sv,acc3,acc3>=0);
+      acc4=select(acc4*sv,acc4,acc4>=0); acc5=select(acc5*sv,acc5,acc5>=0);
+      acc6=select(acc6*sv,acc6,acc6>=0); acc7=select(acc7*sv,acc7,acc7>=0);
+    }
+#endif
+
+    // ---- store: 8 pixels, 4 consecutive output channels each
+    /* one decomposition for the thread's 8 consecutive pixels, then walk x/y forward */
+    const int mg_o  = m0 + tid_m * IG_TM;
+    const int b_o   = (mg_o < M) ? (mg_o / plane) : 0;
+    const int rem_o = mg_o - b_o * plane;
+    const int y_o   = (mg_o < M) ? (rem_o / width) : 0;
+    const int x_o   = rem_o - y_o * width;
+    #define IG_ST(I, A)                                                                           \
+    { const int mg = mg_o + (I);                                                                  \
+      if (mg < M) {                                                                               \
+        int xx = x_o + (I), yy = y_o, bb = b_o;                                                   \
+        while (xx >= width)  { xx -= width;  yy++; }                                              \
+        while (yy >= height) { yy -= height; bb++; }                                              \
+        _IG_WRITE(bb, yy, xx, A)                                                                  \
+      } }
+#ifdef IGEMM_NCHW
+    #define _IG_WRITE(B, Y, X, A)                                                                 \
+        { __global FLOAT *o = output + (((B) * ocst + oc) * height + (Y)) * width + (X);           \
+          o[0] = (FLOAT)(A).x; o[plane] = (FLOAT)(A).y;                                            \
+          o[2*plane] = (FLOAT)(A).z; o[3*plane] = (FLOAT)(A).w; }
+#else
+    #define _IG_WRITE(B, Y, X, A)                                                                 \
+        vstore4(CONVERT_FLOAT4(A), 0,                                                              \
+                output + (((((oc >> 2) * batch + (B)) * height + (Y)) * width + (X)) * 4));
+#endif
+    IG_ST(0,acc0) IG_ST(1,acc1) IG_ST(2,acc2) IG_ST(3,acc3)
+    IG_ST(4,acc4) IG_ST(5,acc5) IG_ST(6,acc6) IG_ST(7,acc7)
+    #undef IG_ST
+    #undef _IG_WRITE
+}

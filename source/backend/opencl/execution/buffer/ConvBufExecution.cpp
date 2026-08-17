@@ -721,6 +721,19 @@ ErrorCode ConvBufExecution::onResize(const std::vector<Tensor *> &inputs, const 
         // converts out, so the result is CORRECT and the conv kernel is directly comparable; the two
         // conversion kernels are timed separately (they are the cost this experiment is told to
         // ignore). 3x3 / stride 1 / dilation 1 / pad 1 only.
+        // MNN_CONV_IGEMM=1 (NC4HW4) or =nchw : LDS-tiled implicit GEMM. In NC4HW4 mode it reads
+        // and writes MNN's native layout directly, so it needs no conversion kernels at all; in
+        // nchw mode it borrows the existing NCHW conversion pair. Layout is the ONLY difference
+        // between the two, which is what makes the comparison exact.
+        const char* _ig = getenv("MNN_CONV_IGEMM");
+        const bool igNchw = (_ig != nullptr && std::string(_ig) == "nchw");
+        const bool useIGemm = (_ig != nullptr)
+            && mResource->mKernelHeight == 3 && mResource->mKernelWidth == 3
+            && mResource->mStrides[0] == 1 && mResource->mStrides[1] == 1
+            && mResource->mDilations[0] == 1 && mResource->mDilations[1] == 1
+            && mPaddings[0] == 1 && mPaddings[1] == 1
+            && mFilterDataPtr != nullptr;
+
         // MNN_CONV_NCHW_FUSE2=1: two chained 3x3 convs (same weights) in one NCHW kernel, the
         // NCHW counterpart of MNN_CONV_FUSED2. Compared against 2x the plain NCHW conv.
         int fuseTile = 6;
@@ -748,7 +761,7 @@ ErrorCode ConvBufExecution::onResize(const std::vector<Tensor *> &inputs, const 
         // stride 1 and stride 2 are separate kernels; the stride-2 one exists because the model's
         // heads are stride-2 with UNALIGNED channel counts, the regime where NC4HW4 pads hardest.
         const int nchwStride = mResource->mStrides[0];
-        const bool useNchw = (nullptr != getenv("MNN_CONV_NCHW") || useNchwFuse2)
+        const bool useNchw = (nullptr != getenv("MNN_CONV_NCHW") || useNchwFuse2 || (useIGemm && igNchw))
             && mResource->mKernelHeight == 3 && mResource->mKernelWidth == 3
             && (nchwStride == 1 || nchwStride == 2)
             && mResource->mStrides[0] == mResource->mStrides[1]
@@ -877,6 +890,62 @@ ErrorCode ConvBufExecution::onResize(const std::vector<Tensor *> &inputs, const 
 
             mOpenCLBackend->onReleaseBuffer(mImColTensor.get(), Backend::DYNAMIC);
             mOpenCLBackend->onReleaseBuffer(mNchwOutTensor.get(), Backend::DYNAMIC);
+        } else if (useIGemm && !igNchw) {
+            // NC4HW4 implicit GEMM: reads and writes MNN's native layout, so no conversion kernels
+            // are involved at all -- the fairest possible comparison against the direct convs.
+            const int icNum = inputChannels, ocNum = outChannel;
+            const int ocbNum = UP_DIV(ocNum, 4);
+            const int wCount = ocbNum * icNum * 9 * 4;
+            mNchwWeight.reset(Tensor::createDevice<float>({wCount}));
+            mOpenCLBackend->onAcquireBuffer(mNchwWeight.get(), Backend::STATIC);
+            {
+                cl_int err;
+                auto &q = mOpenCLBackend->getOpenCLRuntime()->commandQueue();
+                cl::Buffer &wb = *(cl::Buffer *)mNchwWeight->buffer().device;
+                const bool half = (mOpenCLBackend->getPrecision() != BackendConfig::Precision_High);
+                size_t bytes = wCount * (half ? sizeof(half_float::half) : sizeof(float));
+                auto pw = q.enqueueMapBuffer(wb, CL_TRUE, CL_MAP_WRITE, 0, bytes, nullptr, nullptr, &err);
+                if (pw != nullptr && err == CL_SUCCESS) {
+                    ::memset(pw, 0, bytes);
+                    for (int ocb = 0; ocb < ocbNum; ocb++)
+                    for (int ic = 0; ic < icNum; ic++)
+                    for (int tt = 0; tt < 9; tt++)
+                    for (int lane = 0; lane < 4; lane++) {
+                        const int oc = ocb * 4 + lane;
+                        if (oc >= ocNum) continue;
+                        const float v = mFilterDataPtr[(oc * icNum + ic) * 9 + tt];
+                        const size_t dd = (((size_t)(ocb * icNum + ic) * 9 + tt) * 4) + lane;
+                        if (half) ((half_float::half *)pw)[dd] = (half_float::half)v;
+                        else      ((float *)pw)[dd] = v;
+                    }
+                    q.enqueueUnmapMemObject(wb, pw);
+                } else {
+                    MNN_ERROR("MNN_CONV_IGEMM: weight map failed\n");
+                }
+            }
+            std::set<std::string> buildOption = mResource->mBuildOptions;
+            mKernel.resize(1);
+            mKernel[0] = mOpenCLBackend->getOpenCLRuntime()->buildKernel(
+                "conv_2d_buf", "conv_2d_implicit_gemm", buildOption, mOpenCLBackend->getPrecision());
+            mGlobalWorkSize = {(uint32_t)(UP_DIV(batch * height * width, 64) * 8),
+                               (uint32_t)(UP_DIV(ocNum, 32) * 8)};
+            mLocalWorkSize = {8, 8};
+            uint32_t idx = 0; cl_int ret = CL_SUCCESS;
+            ret |= mKernel[0]->get().setArg(idx++, mGlobalWorkSize[0]);
+            ret |= mKernel[0]->get().setArg(idx++, mGlobalWorkSize[1]);
+            ret |= mKernel[0]->get().setArg(idx++, openCLBuffer(input));
+            ret |= mKernel[0]->get().setArg(idx++, openCLBuffer(mNchwWeight.get()));
+            ret |= mKernel[0]->get().setArg(idx++, openCLBuffer(mResource->mBias.get()));
+            ret |= mKernel[0]->get().setArg(idx++, openCLBuffer(output));
+            ret |= mKernel[0]->get().setArg(idx++, icNum);
+            ret |= mKernel[0]->get().setArg(idx++, ocNum);
+            ret |= mKernel[0]->get().setArg(idx++, batch);
+            ret |= mKernel[0]->get().setArg(idx++, height);
+            ret |= mKernel[0]->get().setArg(idx++, width);
+            if (mResource->mPrelu) {
+                ret |= mKernel[0]->get().setArg(idx++, openCLBuffer(mResource->mSlope.get()));
+            }
+            MNN_CHECK_CL_SUCCESS(ret, "setArg implicit gemm");
         } else if (useNchw) {
             const int icNum = inputChannels, ocNum = outChannel;
             // Weights repacked OIHW -> [ocb][ic][kh][kw][4oc], so one tap is one aligned float4
@@ -965,9 +1034,13 @@ ErrorCode ConvBufExecution::onResize(const std::vector<Tensor *> &inputs, const 
 
             // pass 2: the NCHW convolution itself
             mKernel.resize(1);
-            const char* nchwKernelName = useNchwFuse2 ? "conv_2d_nchw_fused2"
+            const char* nchwKernelName = (useIGemm && igNchw) ? "conv_2d_implicit_gemm"
+                                       : useNchwFuse2 ? "conv_2d_nchw_fused2"
                                        : (nchwStride == 2) ? "conv_2d_nchw_s2_c4w8"
                                                            : "conv_2d_nchw_c4w8";
+            if (useIGemm && igNchw) {
+                buildOption.emplace("-DIGEMM_NCHW=1");
+            }
             if (useNchwFuse2) {
                 buildOption.emplace("-DFUSE_T=" + std::to_string(fuseTile));
                 buildOption.emplace("-DFUSE_C=" + std::to_string(icNum));
@@ -979,6 +1052,10 @@ ErrorCode ConvBufExecution::onResize(const std::vector<Tensor *> &inputs, const 
             if (useNchwFuse2) {
                 mGlobalWorkSize = {(uint32_t)width, (uint32_t)(batch * height)};
             }
+            if (useIGemm && igNchw) {
+                mGlobalWorkSize = {(uint32_t)(UP_DIV(batch * height * width, 64) * 8),
+                                   (uint32_t)(UP_DIV(ocNum, 32) * 8)};
+            }
             idx = 0; ret = CL_SUCCESS;
             ret |= mKernel[0]->get().setArg(idx++, mGlobalWorkSize[0]);
             ret |= mKernel[0]->get().setArg(idx++, mGlobalWorkSize[1]);
@@ -986,7 +1063,13 @@ ErrorCode ConvBufExecution::onResize(const std::vector<Tensor *> &inputs, const 
             ret |= mKernel[0]->get().setArg(idx++, openCLBuffer(mNchwWeight.get()));
             ret |= mKernel[0]->get().setArg(idx++, openCLBuffer(mResource->mBias.get()));
             ret |= mKernel[0]->get().setArg(idx++, openCLBuffer(mNchwOutTensor.get()));
-            if (useNchwFuse2) {
+            if (useIGemm && igNchw) {
+                ret |= mKernel[0]->get().setArg(idx++, icNum);
+                ret |= mKernel[0]->get().setArg(idx++, ocNum);
+                ret |= mKernel[0]->get().setArg(idx++, batch);
+                ret |= mKernel[0]->get().setArg(idx++, height);
+                ret |= mKernel[0]->get().setArg(idx++, width);
+            } else if (useNchwFuse2) {
                 ret |= mKernel[0]->get().setArg(idx++, batch);
                 ret |= mKernel[0]->get().setArg(idx++, height);
                 ret |= mKernel[0]->get().setArg(idx++, width);
@@ -1006,6 +1089,8 @@ ErrorCode ConvBufExecution::onResize(const std::vector<Tensor *> &inputs, const 
             if (useNchwFuse2) {
                 // reqd_work_group_size on the kernel: the LWS is fixed, not tuned
                 mLocalWorkSize = {(uint32_t)fuseTile, (uint32_t)fuseTile};
+            } else if (useIGemm && igNchw) {
+                mLocalWorkSize = {8, 8};
             } else
             mLocalWorkSize = localWS2DDefault(mGlobalWorkSize,
                 static_cast<uint32_t>(mOpenCLBackend->getOpenCLRuntime()->getMaxWorkGroupSize(mKernel[0])),

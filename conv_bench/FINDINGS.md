@@ -1543,3 +1543,56 @@ a 20000-loop job pinned to the GPU **after the report has finished**, which then
 contends with whatever is measured next and would look like a mysterious regression (cf. the 198 vs
 119 scare in §H.43). `sample_clock()` now ends with a name-based `pkill -9 -f ModuleBasic.out`,
 which is safe because it is only ever called between sections with nothing else of ours on device.
+
+### §H.46 — IMPLICIT GEMM (the standing prompt), built and measured in BOTH layouts: falsified
+`IMPLICIT_GEMM_SESSION_PROMPT.md` had never been executed — no implicit-GEMM kernel existed. Built
+`conv_2d_implicit_gemm`: an LDS-tiled GEMM that gathers the im2col columns **on the fly** out of the
+input while staging them into `__local`, so the expanded matrix is never materialised. This also
+closes the "LDS-tiled GEMM" variant §H.38 named as its one untested residual.
+
+Tile: 64 pixels × 32 output channels per workgroup, 64 threads, 8 pixels × 4 channels per thread =
+**8 float4 accumulators**, the register class §H.22 measured as optimal. K-step is 9 (one input
+channel's taps), which keeps the gather indexing cheap. **Layout is a compile-time switch and the
+only difference between the two variants** — same tiling, same math, same registers — so the
+NC4HW4-vs-NCHW comparison is exact. `MNN_CONV_IGEMM=1` (NC4HW4, no conversion kernels at all) /
+`=nchw`. Correct in both: cosine 0.999949–0.999989.
+
+**The first implementation was again a false negative — the fourth time this session.** It decomposed
+`m -> (b,y,x)` inside the staging loop: two *runtime* integer divisions per element, 9 per thread per
+channel step, for a value that is invariant in both loops. Hoisting it (two divisions for the whole
+kernel) was worth **1.8×**:
+| core | first cut | after hoisting | MNN default |
+|---|---|---|---|
+| 32→32@72×96 | 444 | **243** | 119 |
+| 48→48@36×48 | 596 | **319** | 101 |
+| 96→96@18×24 | 1021 | **584** | 146 |
+
+**Final, cooled + interleaved, all arms `MNN_NO_WINOGRAD=1`:**
+| core | MNN default | c4h4w2+HARD | iGEMM NC4HW4 | iGEMM NCHW |
+|---|---|---|---|---|
+| 32→32@72×96 | 119.0 | **97.0 (−18.5%)** | 243.0 (+104%) | 236.0 (+98%) |
+| 48→48@36×48 | **101.0** | 101.0 | 319.0 (+216%) | 312.8 (+210%) |
+| 96→96@18×24 | **146.0** | 170.0 | 584.0 (+300%) | 574.0 (+293%) |
+
+**Success criterion (>5% under the default on 48→48@36×48): NOT MET, by 3.1×.**
+
+**Why, structurally.** Per k the thread reads 8 scalar A values and one float4 B value from LDS and
+issues 8 `mad` instructions — **9 LDS accesses per 8 ALU instructions**. The kernel is LDS-throughput
+bound, not ALU bound, so the tiling that makes a GEMM fast on a big matrix cannot pay here: the fp16
+register budget (8 float4 before the §H.22 cliff) caps the tile at ~8×4, and that tile is too small
+to amortise the LDS traffic. The direct `conv_2d_c*` kernels avoid this entirely by holding inputs in
+*registers* across the 9 taps and never touching LDS.
+
+**On the premise.** The prompt's case rested on §H.13's GEMM-reduce beating the direct conv by 21% on
+the 48-core *with the data pre-arranged*. That advantage does not survive folding the gather back in
+— which is exactly what §H.14 argued on reasoning alone and is now measured.
+
+**Layout verdict (the part that was asked for explicitly): it barely matters.** NCHW is 2–3% ahead of
+NC4HW4 across all three cores (236/243, 313/319, 574/584) — the contiguous gather is slightly cheaper
+than NC4HW4's stride-4 scalar read, but both funnel through the same LDS bottleneck, which dominates.
+**For implicit GEMM the layout is not the lever.**
+
+**Untested residual, named honestly:** a wider output-channel tile (TM=4, TN=8 instead of 8×4) would
+cut LDS accesses per mad from ~1.1 to ~0.75 at the same 8-float4 register budget. That is ~1.5× on
+the binding resource against a 3.1× gap, so it is very unlikely to flip the result, but it is the one
+variant not built.
