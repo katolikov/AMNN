@@ -55,6 +55,27 @@ HARD_CAPABLE = ["conv_2d_c4h4w2", "conv_2d_c4h2w2", "conv_2d_c4h2w4", "conv_2d_c
                 "conv_2d_c4h4w1_hc", "conv_2d_c8h4w1_hc", "conv_2d_c8h2w1_hc", "conv_2d_c8h1w4_hc"]
 SPEC_ONLY += HARD_CAPABLE   # every one of them needs MNN_CONV_SPEC to enter the candidate list
 LDS_TILES = ["16x4", "48x4", "16x12", "8x4", "24x4", "16x2"]
+# LDS staging modes (env MNN_CONV_LDS=<mode>). "1" = the original 1-output/thread kernel;
+# "w2" = c4h1w2 blocking + LDS, which isolates LDS at constant register blocking (FINDINGS §H.30).
+# w2 needs out_w % (2*TILE_W) == 0, so its tile must be chosen per shape.
+LDS_MODES = ["1", "w2"]
+# Split-K over the input-channel reduction (env MNN_CONV_SPLITK=<n>, FINDINGS §H.31). Loses to the
+# autotuned default here, but wins 11.7% at constant blocking on the most output-starved shape --
+# on a device with more CUs, or a model with smaller outputs, the balance can flip.
+SPLITK_FACTORS = [2, 4, 8]
+# Env flags that change which conv IMPLEMENTATION runs. Anything measured across these MUST use
+# conv_all_us()/total kernel time, never MNN's `conv time` counter (FINDINGS §H.27).
+IMPL_SWITCHING_ENVS = ["MNN_FORCE_WINOGRAD", "MNN_CONV_LDS", "MNN_CONV_SPLITK", "MNN_NO_WINOGRAD",
+                       "MNN_CONV_NCHW", "MNN_CONV_IMGEMM"]
+# Plain-NCHW conv path (env MNN_CONV_NCHW=1, FINDINGS §H.36). Loses on this model's shapes but wins
+# at C>=48 with large spatial, and has no channel-padding cliff -- re-decide on new hardware/shapes.
+# Its profiler events split: gemm2-0 = layout in, gemm2-2 = layout out, ori-* = the conv itself.
+NCHW_MODE = True
+# im2col + GEMM in NCHW (env MNN_CONV_IMGEMM=1, FINDINGS §H.38). Falsified here (+83..120%), kept in
+# the suite because the loss is bandwidth-per-MAC driven and a device with more L2 per CU, or a
+# shape with much larger N, could plausibly flip it. NOTE: at C>=64 MNN takes the Winograd path
+# before any MNN_CONV_* flag is read -- pair it with MNN_NO_WINOGRAD=1 or every arm measures the same thing.
+IMGEMM_MODE = True
 
 
 def find_strip():
@@ -114,6 +135,9 @@ def main():
     man = {"variants": VARIANTS, "spec_only": SPEC_ONLY, "stride1_only": STRIDE1_ONLY,
            "hard_capable": HARD_CAPABLE,
            "lds_tiles": LDS_TILES,
+           "lds_modes": LDS_MODES,
+           "splitk_factors": SPLITK_FACTORS,
+           "impl_switching_envs": IMPL_SWITCHING_ENVS,
            "cores": [], "heads": [], "blocks": [], "correctness": {}}
 
     # ---------- core models ----------

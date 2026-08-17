@@ -86,6 +86,12 @@ private:
     std::vector<std::shared_ptr<KernelWrap>> mKernel;
     std::shared_ptr<Tensor> mConvGemmInpTensor;
     std::shared_ptr<Tensor> mConvGemmOutTensor;
+    std::shared_ptr<Tensor> mSplitKTensor;   // MNN_CONV_SPLITK scratch: SPLITK un-reduced partials
+    // MNN_CONV_NCHW scratch: plain-NCHW input/output planes + raw OIHW weights
+    std::shared_ptr<Tensor> mNchwInTensor;
+    std::shared_ptr<Tensor> mNchwOutTensor;
+    std::shared_ptr<Tensor> mNchwWeight;
+    std::shared_ptr<Tensor> mImColTensor;    // MNN_CONV_IMGEMM scratch: the [K][M] column matrix
     std::shared_ptr<KernelWrap> mPreKernel = nullptr;
     std::vector<uint32_t> mPreGlobalWorkSize{1, 1, 1};
     std::vector<uint32_t> mPreLocalWorkSize{1, 1, 1, 1};

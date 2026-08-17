@@ -77,6 +77,46 @@ def conv_us(out, depth=1):
     return (statistics.median(c) / depth) if c else 0.0
 
 
+def conv_all_us(out, depth=1):
+    """Sum of EVERY conv-related kernel per loop -- winograd transforms, layout conversions and
+    im2col included. MUST be used instead of conv_us() whenever an arm can change which conv
+    IMPLEMENTATION runs (MNN_FORCE_WINOGRAD / MNN_NO_WINOGRAD / MNN_CONV_LDS / MNN_CONV_SPLITK /
+    MNN_CONV_NCHW / MNN_CONV_IMGEMM). MNN's `conv time` counter omits the Winograd rearrange
+    kernels, which are launched TWICE per conv -- scoring a Winograd arm with it credits the
+    batchgemm half only, and turned a +15% regression into an apparent -45% win (FINDINGS §H.27)."""
+    acc = {}
+    for m in re.finditer(r"kernel time = (\d+)\s+us (\S+)", out):
+        us, name = int(m.group(1)), m.group(2)
+        if "onv" not in name:
+            continue
+        acc.setdefault(name.split("-total")[0], []).append(us)
+    loops = len(re.findall(r"total kernel time = \d+  us", out))
+    if not loops:
+        return 0.0
+    tot = sum(statistics.median(v[3:] if len(v) > 6 else v) * len(v) for v in acc.values())
+    return tot / loops / depth
+
+
+def conv_kernel_only_us(out, depth=1):
+    """conv_all_us minus the NCHW layout-conversion kernels (profiler tags gemm2-0 / gemm2-2).
+    Used for the NCHW sections: those conversions belong at the boundary of a conv BLOCK in any
+    real deployment, not on every conv, so charging them per-conv would measure a design nobody
+    would ship. The excluded amount is always reported alongside."""
+    acc, cvt = {}, []
+    for m in re.finditer(r"kernel time = (\d+)\s+us (\S+)", out):
+        us, name = int(m.group(1)), m.group(2)
+        if "onv" not in name:
+            continue
+        if "gemm2-0" in name or "gemm2-2" in name:
+            cvt.append(us); continue
+        acc.setdefault(name.split("-total")[0], []).append(us)
+    loops = len(re.findall(r"total kernel time = \d+  us", out))
+    if not loops:
+        return 0.0, 0.0
+    tot = sum(statistics.median(v[3:] if len(v) > 6 else v) * len(v) for v in acc.values())
+    return tot / loops / depth, (sum(cvt) / loops if cvt else 0.0)
+
+
 def conv_paths(out):
     """Which conv implementation MNN actually ran, from the profiler summary line.
     -> {'ori': us, 'wino': us, '1x1': us, 'gemm1': us, 'gemm2': us, 'other': us} (medians)."""
@@ -151,6 +191,11 @@ def sample_clock(d, model, shape, seconds=6):
     m = re.search(r"PID=(\d+)", out)
     if m:                                   # belt-and-braces: make sure the helper is gone
         d.shell(f"kill -9 {m.group(1)} 2>/dev/null; true")
+    # Final sweep. The PID kill above has been observed to MISS, leaving a 20000-loop job pinned to
+    # the GPU after the report exits -- which then throttles or contends with whatever runs next,
+    # silently. Nothing else of ours is on the device at this point (sample_clock is only called
+    # between sections), so a name-based kill is safe here and is the only reliable guarantee.
+    d.shell("pkill -9 -f ModuleBasic.out 2>/dev/null; true")
     body = out.split("PID=", 1)[-1]
     body = body.split(None, 1)[1] if len(body.split(None, 1)) > 1 else ""
     # 0 = GPU power-gated (idle), not a downclock -> drop
@@ -431,8 +476,11 @@ def main(argv=None):
 
     # ---- 7. Winograd: is it even selected, and does disabling it help?
     say("## 9. Winograd vs direct\n")
-    say("| shape | path MNN chose | default | Winograd OFF | verdict |")
-    say("|---|---|---|---|---|")
+    say("> Measured with **conv_all_us** (every conv kernel, transforms included). MNN's `conv\n"
+        "> time` counter omits the Winograd rearrange passes and would flatter Winograd by ~2x\n"
+        "> (FINDINGS §H.27).\n")
+    say("| shape | path MNN chose | default | Winograd OFF | Winograd FORCED | verdict |")
+    say("|---|---|---|---|---|---|")
     for c in cores:
         cooldown(d, cool_s)
         m, shp, dep = c["model"], c["shape"], c["depth"]
@@ -440,40 +488,73 @@ def main(argv=None):
         paths = conv_paths(o_def)
         chose = max(paths, key=lambda k: paths[k]) if any(paths.values()) else "?"
         r = interleaved({
-            "on": lambda i, m=m, shp=shp, c=c: conv_us(
+            # conv_all_us, NOT conv_us: this arm changes the conv implementation (§H.27)
+            "on": lambda i, m=m, shp=shp, c=c: conv_all_us(
                 run_model(d, m, shp, 120, cache=f"wa{c['key']}{i}.bin")[0], dep),
-            "off": lambda i, m=m, shp=shp, c=c: conv_us(
+            "off": lambda i, m=m, shp=shp, c=c: conv_all_us(
                 run_model(d, m, shp, 120, env="MNN_NO_WINOGRAD=1",
                           cache=f"wb{c['key']}{i}.bin")[0], dep),
+            "forced": lambda i, m=m, shp=shp, c=c: conv_all_us(
+                run_model(d, m, shp, 120, env="MNN_FORCE_WINOGRAD=1",
+                          cache=f"wf{c['key']}{i}.bin")[0], dep),
         }, reps)
-        on, off = r["on"], r["off"]
-        D.setdefault("winograd", {})[c["key"]] = {"path": chose, "default_us": on, "no_wino_us": off}
+        on, off, forced = r["on"], r["off"], r["forced"]
+        D.setdefault("winograd", {})[c["key"]] = {"path": chose, "default_us": on,
+                                                  "no_wino_us": off, "forced_wino_us": forced}
         if chose != "wino":
-            verdict = f"Winograd NOT used here (MNN picked `{chose}`) — switch is a no-op"
+            verdict = (f"**forcing Winograd is {pct(forced, on)}**" if forced and forced < on * 0.97
+                       else f"MNN picked `{chose}`; forcing Winograd {pct(forced, on)}")
         else:
             verdict = (f"Winograd wins {pct(off, on)} if disabled" if off > on
                        else f"**disabling Winograd is {pct(off, on)} FASTER**")
-        say(f"| {c['label']} | `{chose}` | {on:.0f} | {off:.0f} | {verdict} |")
-    say("\n> Winograd trades multiply-adds for extra transform passes. It is contraindicated at a\n"
-        "> high GPU clock for these small-channel shapes, but is the top candidate to flip when the\n"
-        "> GPU clock is LOW and memory is fast (arithmetic becomes the scarce resource).\n")
+        say(f"| {c['label']} | `{chose}` | {on:.0f} | {off:.0f} | {forced:.0f} | {verdict} |")
+    say("\n> Winograd trades multiply-adds for extra transform passes, so it wins at SMALL spatial\n"
+        "> size with ENOUGH channels and loses at large spatial / few channels. On the reference\n"
+        "> device MNN's selection gate (`in_w < out_c`) is mis-calibrated: forcing it on wins\n"
+        "> -13% at 48->48@36x48 and -25% at 32->32@36x48, while losing at 72x96 and above\n"
+        "> (FINDINGS §H.28/§H.29). It is a per-conv decision, never a per-model one.\n")
 
     # ---- 8. fused megakernel
-    say("## 10. Fused 2-layer megakernel\n")
-    say("| shape | fused (2 layers) | 2x single conv | verdict |")
-    say("|---|---|---|---|")
+    say("## 10. Fused 2-layer megakernel (NC4HW4 and NCHW)\n")
+    say("> Both fused kernels apply the SAME weights twice, so they fit in one conv Execution and\n"
+        "> are checked against the numpy conv(conv(x)) reference in §13. Each is compared with 2x\n"
+        "> the single conv IN ITS OWN LAYOUT, so fusion is the only variable. All arms run with\n"
+        "> MNN_NO_WINOGRAD=1: at higher channel counts MNN selects Winograd before any MNN_CONV_*\n"
+        "> flag is read, which would silently make every arm measure the same kernel.\n")
+    say("| shape | 1 conv | fused2 | 2x single | verdict | NCHW 1 conv | NCHW fused2 | verdict |")
+    say("|---|---|---|---|---|---|---|")
+    NWG = "MNN_NO_WINOGRAD=1 "
     for c in cores:
         cooldown(d, cool_s)
-        r = interleaved({
-            "one": lambda i, c=c: conv_us(run_model(d, c["single_model"], c["shape"], 200,
-                   cache=f"s1{c['key']}{i}.bin")[0]),
-            "fused": lambda i, c=c: conv_us(run_model(d, c["single_model"], c["shape"], 200,
-                     env="MNN_CONV_FUSED2=1", cache=f"f2{c['key']}{i}.bin")[0]),
-        }, reps)
-        one, fu = r["one"], r["fused"]
-        D.setdefault("fused2", {})[c["key"]] = {"fused_us": fu, "two_single_us": 2*one}
-        say(f"| {c['label']} | {fu:.0f} | {2*one:.0f} | {'FASTER' if fu < 2*one else 'SLOWER'} {pct(fu, 2*one)} |")
-    say("")
+        # the fused tile must divide both spatial dims
+        ft = next((x for x in (6, 8, 4, 2) if c["W"] % x == 0 and c["H"] % x == 0), 0)
+        arms = {
+            "one": lambda i, c=c: conv_all_us(run_model(d, c["single_model"], c["shape"], 200,
+                   env=NWG, cache=f"s1{c['key']}{i}.bin")[0]),
+            "fused": lambda i, c=c: conv_all_us(run_model(d, c["single_model"], c["shape"], 200,
+                     env=NWG + "MNN_CONV_FUSED2=1", cache=f"f2{c['key']}{i}.bin")[0]),
+            "none": lambda i, c=c: conv_kernel_only_us(run_model(d, c["single_model"], c["shape"],
+                    200, env=NWG + "MNN_CONV_NCHW=1", cache=f"n1{c['key']}{i}.bin")[0])[0],
+        }
+        if ft:
+            arms["nfused"] = lambda i, c=c, ft=ft: conv_kernel_only_us(run_model(
+                d, c["single_model"], c["shape"], 200,
+                env=NWG + f"MNN_CONV_NCHW_FUSE2=1 MNN_FUSE_TILE={ft}",
+                cache=f"nf{c['key']}{i}.bin")[0])[0]
+        r = interleaved(arms, reps)
+        one, fu, n1 = r["one"], r["fused"], r["none"]
+        nf = r.get("nfused", 0.0)
+        D.setdefault("fused2", {})[c["key"]] = {"fused_us": fu, "two_single_us": 2 * one,
+                                                "nchw_one_us": n1, "nchw_fused_us": nf}
+        v1 = f"{'FASTER' if fu < 2*one else 'SLOWER'} {pct(fu, 2*one)}"
+        v2 = (f"{'FASTER' if nf < 2*n1 else 'SLOWER'} {pct(nf, 2*n1)}" if nf and n1
+              else "n/a (tile)")
+        say(f"| {c['label']} | {one:.0f} | {fu:.0f} | {2*one:.0f} | {v1} "
+            f"| {n1:.0f} | {nf:.0f} | {v2} |")
+    say("\n> **Why fusion costs arithmetic:** a T x T output tile needs conv1 over a (T+2)^2 halo,\n"
+        "> so conv1 is recomputed ((T+2)/T)^2 times -- 1.78x at T=6. It buys back only the\n"
+        "> intermediate write+re-read, which §14's depth sweep shows is nearly free on this class of\n"
+        "> device. Fusion therefore wins only where inter-layer traffic is genuinely expensive.\n")
 
     # ---- 8. real blocks
     say("## 11. Real model blocks (deployment numbers)\n")
@@ -543,8 +624,125 @@ def main(argv=None):
     d.shell(f"rm -f {DEV}/tdir/input.txt")
     say("")
 
+    # ---- Session-B strategies (all env-gated, all default OFF)
+    say("## 14. LDS-at-constant-blocking and split-K\n")
+    say("> Two strategies that were previously closed by reasoning alone and are now measured.\n"
+        "> `MNN_CONV_LDS=w2` is conv_2d_c4h1w2 with the input staged in __local -- its comparison\n"
+        "> partner is conv_2d_c4h1w2 itself, so LDS is the only difference (FINDINGS §H.30).\n"
+        "> `MNN_CONV_SPLITK=n` splits the Cin reduction across n workgroups plus a reduce pass,\n"
+        "> attacking occupancy starvation directly (§H.31). Metric: conv_all_us.\n")
+    say("| shape | MNN default | c4h1w2 | c4h1w2+LDS | splitK=2 | splitK=4 |")
+    say("|---|---|---|---|---|---|")
+    for c in cores:
+        cooldown(d, cool_s)
+        m, shp, dep, k = c["model"], c["shape"], c["depth"], c["key"]
+        # the w2 LDS kernel needs out_w % (2*TILE_W) == 0 and out_h % TILE_H == 0
+        tile = None
+        for tw, th in ((16, 4), (8, 4), (4, 2)):
+            if c["W"] % (2 * tw) == 0 and c["H"] % th == 0:
+                tile = f"{tw}x{th}"; break
+        fns = {
+            "def": lambda i, m=m, shp=shp, dep=dep, k=k: conv_all_us(
+                run_model(d, m, shp, 60, cache=f"sb_d{k}{i}.bin")[0], dep),
+            "w2base": lambda i, m=m, shp=shp, dep=dep, k=k: conv_all_us(
+                run_model(d, m, shp, 60, env="MNN_CONV_SPEC=1 MNN_CONV_FORCE=conv_2d_c4h1w2",
+                          cache=f"sb_b{k}{i}.bin")[0], dep),
+            "sk2": lambda i, m=m, shp=shp, dep=dep, k=k: conv_all_us(
+                run_model(d, m, shp, 60, env="MNN_CONV_SPLITK=2",
+                          cache=f"sb_2{k}{i}.bin")[0], dep),
+            "sk4": lambda i, m=m, shp=shp, dep=dep, k=k: conv_all_us(
+                run_model(d, m, shp, 60, env="MNN_CONV_SPLITK=4",
+                          cache=f"sb_4{k}{i}.bin")[0], dep),
+        }
+        if tile:
+            fns["lds"] = lambda i, m=m, shp=shp, dep=dep, k=k, tl=tile: conv_all_us(
+                run_model(d, m, shp, 60, env=f"MNN_CONV_LDS=w2 MNN_LDS_TILE={tl}",
+                          cache=f"sb_l{k}{i}.bin")[0], dep)
+        r = interleaved(fns, reps)
+        D.setdefault("session_b", {})[k] = r
+        lds_s = f"{r['lds']:.0f}" if tile else "n/a (tile)"
+        say(f"| {c['label']} | {r['def']:.0f} | {r['w2base']:.0f} | {lds_s} | "
+            f"{r['sk2']:.0f} | {r['sk4']:.0f} |")
+    say("\n> **How to read this table on YOUR device** (the reference numbers are in FINDINGS\n"
+        "> §H.30/§H.31 and are NOT repeated here, because the whole point is to re-decide):\n"
+        "> - `c4h1w2+LDS` vs `c4h1w2` isolates LDS at constant blocking. LDS pays when the input\n"
+        ">   working set stops fitting in L2, and costs barriers regardless — expect it to help\n"
+        ">   more at large spatial size and on parts with less L2 per CU.\n"
+        "> - `splitK` multiplies thread count without changing the output shape, so it only helps\n"
+        ">   when the conv is output-starved; more CUs make that more likely. It always adds a\n"
+        ">   write+re-read of the partials, which is what it has to pay for.\n"
+        "> - Compare each against **MNN default**, not against each other. If the winner here is\n"
+        ">   not MNN default, that is a real finding for this device.\n"
+        "> Absolute values are only comparable within this section (arms are interleaved); check\n"
+        "> the thermal validity section at the end before trusting cross-section comparisons.\n")
+
+    # ---- NCHW layout
+    say("\n## 15. NCHW layout instead of NC4HW4 (conv-kernel time only)\n")
+    say("> **Metric caveat, read before using these numbers.** The NCHW path needs an\n"
+        "> NC4HW4->NCHW conversion before the conv and an NCHW->NC4HW4 conversion after it. In a\n"
+        "> real deployment those fold into custom ops at the boundaries of a conv BLOCK -- paid\n"
+        "> once per block, not once per conv -- so they are EXCLUDED from the conv column and\n"
+        "> reported separately. Any adoption decision must budget the conversion column and\n"
+        "> confirm that fold is actually possible for the graph in question (FINDINGS §H.36/§H.39).\n")
+    say("| shape | NC4HW4 | NCHW | NCHW+HARD | best vs NC4HW4 | conversions (excluded) |")
+    say("|---|---|---|---|---|---|")
+    for c in cores + [{"label": h["label"], "model": h["model"], "shape": h["shape"],
+                       "depth": 1, "key": h["key"], "H": 0, "W": 0} for h in man.get("heads", [])]:
+        cooldown(d, cool_s)
+        m, shp, dep, k = c["model"], c["shape"], c["depth"], c["key"]
+        base = conv_kernel_only_us(run_model(d, m, shp, 60, cache=f"nc_d{k}.bin")[0], dep)[0]
+        n_us, n_cvt = conv_kernel_only_us(
+            run_model(d, m, shp, 60, env="MNN_CONV_NCHW=1", cache=f"nc_n{k}.bin")[0], dep)
+        h_us, _ = conv_kernel_only_us(
+            run_model(d, m, shp, 60, env="MNN_CONV_NCHW=1 MNN_CONV_HARD=1",
+                      cache=f"nc_h{k}.bin")[0], dep)
+        D.setdefault("nchw", {})[k] = {"nc4hw4": base, "nchw": n_us, "nchw_hard": h_us,
+                                       "conversions": n_cvt}
+        best = min(x for x in (n_us, h_us) if x) if (n_us or h_us) else 0.0
+        say(f"| {c['label']} | {base:.0f} | {n_us:.0f} | {h_us:.0f} | "
+            f"{pct(best, base)} | {n_cvt:.0f} |")
+    say("\n> **Mechanism, so the table can be read on any device.** NC4HW4 pads channels to a\n"
+        "> multiple of 4 — C=18 costs what C=20 costs, C=34 what C=36 costs — and NCHW has no such\n"
+        "> cliff, so NCHW gains most where channel counts are NOT multiples of 4. Against that,\n"
+        "> NC4HW4's float4 load serves 4 channels of the reduction at once while NCHW reads one\n"
+        "> channel plane at a time, which costs NCHW more load instructions per MAC — and more so\n"
+        "> at stride 2, where the input plane is 4x the output. Whichever effect dominates on your\n"
+        "> part decides the sign. Reference-device outcome: FINDINGS §H.36 (stride 1) / §H.39\n"
+        "> (stride 2) / §H.40 (hardcoding).\n")
+
+    # ---- im2col + GEMM in NCHW
+    say("\n## 16. im2col + GEMM in NCHW\n")
+    say("> **Trap:** at C>=64 MNN selects the Winograd path before any MNN_CONV_* flag is read, so\n"
+        "> every arm would silently measure the same kernel. All arms here therefore run with\n"
+        "> MNN_NO_WINOGRAD=1. im2col is counted as conv work (it is part of the algorithm); only\n"
+        "> the final NC4HW4 repack is excluded, matching §15 (FINDINGS §H.38).\n")
+    say("| shape | direct (NC4HW4) | im2col+GEMM | verdict |")
+    say("|---|---|---|---|")
+    NW = "MNN_NO_WINOGRAD=1 "
+    for c in cores:
+        cooldown(d, cool_s)
+        m, shp, dep, k = c["model"], c["shape"], c["depth"], c["key"]
+        r = interleaved({
+            "dir": lambda i, m=m, shp=shp, dep=dep, k=k: conv_kernel_only_us(
+                run_model(d, m, shp, 60, env=NW, cache=f"ig_d{k}{i}.bin")[0], dep)[0],
+            "gem": lambda i, m=m, shp=shp, dep=dep, k=k: conv_kernel_only_us(
+                run_model(d, m, shp, 60, env=NW + "MNN_CONV_IMGEMM=1",
+                          cache=f"ig_g{k}{i}.bin")[0], dep)[0],
+        }, reps)
+        D.setdefault("imgemm", {})[k] = r
+        v = ("**GEMM wins**" if r["gem"] and r["gem"] < r["dir"] * 0.97
+             else f"direct wins ({pct(r['gem'], r['dir'])})")
+        say(f"| {c['label']} | {r['dir']:.0f} | {r['gem']:.0f} | {v} |")
+    say("\n> **Mechanism.** im2col materialises each input element 9 times and then STREAMS that\n"
+        "> matrix through the ALUs, so it inflates inner-loop bytes-per-MAC ~9x — this is not the\n"
+        "> same as a one-off buffer round-trip, which on some parts is free. For the GEMM to win it\n"
+        "> must out-tile the direct conv, but both are capped by the same register budget, so a\n"
+        "> device where LARGER register tiles pay off (see §4: does c4h4w4 stop regressing?) is\n"
+        "> where this could flip. This GEMM is deliberately simple — no LDS tiling of the column\n"
+        "> matrix — so treat a loss here as a bound, not a proof. Reference outcome: §H.38.\n\n")
+
     # ---- 11. what to do on this device
-    say("## 14. Recommendations for THIS device\n")
+    say("## 17. Recommendations for THIS device\n")
     recs = []
     for c in cores:
         if c["key"] in summary:
@@ -568,7 +766,7 @@ def main(argv=None):
     for r in recs: say(f"- {r}")
 
     # ---- 12. clock re-check: did the device throttle over the run?
-    say("\n## 15. GPU clock at END of run (thermal validity check)\n")
+    say("\n## 18. GPU clock at END of run (thermal validity check)\n")
     cooldown(d, cool_s)
     s2c, _ = sample_clock(d, cores[0]["model"], cores[0]["shape"])
     clk_end = max(s2c) if s2c else 0

@@ -30,6 +30,13 @@ bool ConvBufWinograd::valid(const Convolution2DCommon* common, const Tensor* inp
         return input->width() * input->height() <= 4096;
     }
 
+    // MNN_FORCE_WINOGRAD=1: bypass the channel/size heuristic below and take the Winograd path for
+    // ANY 3x3 s1 d1 conv. The hard requirements above still apply. Measurement flag only: the
+    // heuristic's opinion of small-channel shapes has never been checked against the clock.
+    if (nullptr != getenv("MNN_FORCE_WINOGRAD")) {
+        return true;
+    }
+
     bool valid = input->channel() >= 32 && output->channel() >= 32 && input->width() < output->channel();
     valid = valid || (input->channel() >= 64 && output->channel() >= 64);
     return valid;

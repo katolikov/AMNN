@@ -678,13 +678,22 @@ ErrorCode ConvBufExecution::onResize(const std::vector<Tensor *> &inputs, const 
         // half of each cache line -- staging a contiguous tile in LDS fixes a coalescing problem
         // that simply does not exist at stride 1 (which is why the stride-1 variant lost).
         const int ldsStride = mResource->mStrides[0];
-        bool useLDS = (nullptr != getenv("MNN_CONV_LDS"))
+        // MNN_CONV_LDS=w2 selects the c4h1w2-blocked LDS kernel instead of the 1-output/thread
+        // one. This isolates LDS at CONSTANT register blocking: its comparison partner is
+        // conv_2d_c4h1w2, which differs only in reading input from global instead of __local.
+        const char* _ldsEnv = getenv("MNN_CONV_LDS");
+        const bool ldsW2 = (_ldsEnv != nullptr && std::string(_ldsEnv) == "w2");
+        const int ldsWCover = ldsW2 ? (TILE_W_LDS * 2) : TILE_W_LDS;
+        bool useLDS = (nullptr != _ldsEnv)
             && mResource->mKernelHeight == 3 && mResource->mKernelWidth == 3
             && (ldsStride == 1 || ldsStride == 2)
             && mResource->mStrides[0] == mResource->mStrides[1]
             && mResource->mDilations[0] == 1 && mResource->mDilations[1] == 1
             && mPaddings[0] == 1 && mPaddings[1] == 1
-            && (width % TILE_W_LDS == 0) && (height % TILE_H_LDS == 0);
+            && (width % ldsWCover == 0) && (height % TILE_H_LDS == 0);
+        if (ldsW2 && ldsStride != 1) {
+            useLDS = false;   // the w2 variant hardcodes stride 1
+        }
         bool useIm2col = (nullptr != getenv("MNN_CONV_IM2COL"))
             && mResource->mKernelHeight == 3 && mResource->mKernelWidth == 3
             && mResource->mStrides[0] == 1 && mResource->mStrides[1] == 1
@@ -698,7 +707,399 @@ ErrorCode ConvBufExecution::onResize(const std::vector<Tensor *> &inputs, const 
             && mPaddings[0] == 1 && mPaddings[1] == 1
             && (inputChannels == outChannel)
             && (width % 6 == 0) && (height % 6 == 0);
-        if (useFused2) {
+        // MNN_CONV_SPLITK=<2|4|8>: split the Cin reduction across SPLITK workgroups and reduce
+        // afterwards. Attacks output-starvation (too few threads to fill 8 CUs) rather than
+        // arithmetic. Two passes into a DYNAMIC scratch buffer -- no atomics (no fp16 atomics here).
+        int splitK = 0;
+        { const char* _s = getenv("MNN_CONV_SPLITK"); if (_s) { splitK = atoi(_s); } }
+        const bool useSplitK = (splitK >= 2)
+            && mResource->mKernelHeight == 3 && mResource->mKernelWidth == 3
+            && mResource->mDilations[0] == 1 && mResource->mDilations[1] == 1
+            && mPaddings[0] == 1 && mPaddings[1] == 1
+            && (inputChannelBlocks >= splitK);
+        // MNN_CONV_NCHW=1: run the convolution in plain NCHW instead of NC4HW4. Converts in, convs,
+        // converts out, so the result is CORRECT and the conv kernel is directly comparable; the two
+        // conversion kernels are timed separately (they are the cost this experiment is told to
+        // ignore). 3x3 / stride 1 / dilation 1 / pad 1 only.
+        // MNN_CONV_NCHW_FUSE2=1: two chained 3x3 convs (same weights) in one NCHW kernel, the
+        // NCHW counterpart of MNN_CONV_FUSED2. Compared against 2x the plain NCHW conv.
+        int fuseTile = 6;
+        { const char* _f = getenv("MNN_FUSE_TILE"); if (_f) fuseTile = atoi(_f); }
+        const bool useNchwFuse2 = (nullptr != getenv("MNN_CONV_NCHW_FUSE2"))
+            && mResource->mKernelHeight == 3 && mResource->mKernelWidth == 3
+            && mResource->mStrides[0] == 1 && mResource->mStrides[1] == 1
+            && mResource->mDilations[0] == 1 && mResource->mDilations[1] == 1
+            && mPaddings[0] == 1 && mPaddings[1] == 1
+            && inputChannels == outChannel
+            && fuseTile >= 2 && (width % fuseTile == 0) && (height % fuseTile == 0)
+            && mFilterDataPtr != nullptr;
+        if (nullptr != getenv("MNN_CONV_NCHW_DEBUG")) {
+            MNN_PRINT("[FUSE2GATE] env=%d k=%dx%d s=%d,%d d=%d,%d p=%d,%d ic=%d oc=%d "
+                      "tile=%d w%%t=%d h%%t=%d filt=%d -> %d\n",
+                      getenv("MNN_CONV_NCHW_FUSE2") != nullptr,
+                      mResource->mKernelHeight, mResource->mKernelWidth,
+                      mResource->mStrides[0], mResource->mStrides[1],
+                      mResource->mDilations[0], mResource->mDilations[1],
+                      mPaddings[0], mPaddings[1], inputChannels, outChannel,
+                      fuseTile, width % fuseTile, height % fuseTile,
+                      mFilterDataPtr != nullptr, (int)useNchwFuse2);
+        }
+
+        // stride 1 and stride 2 are separate kernels; the stride-2 one exists because the model's
+        // heads are stride-2 with UNALIGNED channel counts, the regime where NC4HW4 pads hardest.
+        const int nchwStride = mResource->mStrides[0];
+        const bool useNchw = (nullptr != getenv("MNN_CONV_NCHW") || useNchwFuse2)
+            && mResource->mKernelHeight == 3 && mResource->mKernelWidth == 3
+            && (nchwStride == 1 || nchwStride == 2)
+            && mResource->mStrides[0] == mResource->mStrides[1]
+            && mResource->mDilations[0] == 1 && mResource->mDilations[1] == 1
+            && mPaddings[0] == 1 && mPaddings[1] == 1
+            && (width % 8 == 0)
+            // stride 2 reads an aligned 20-wide input window per 8 outputs; with an ODD input
+            // width the last window's final element lands exactly one past the row, so restrict
+            // the stride-2 kernel to even input widths rather than read out of bounds.
+            && (nchwStride == 1 || inputWidth % 2 == 0)
+            && mFilterDataPtr != nullptr;
+        // MNN_CONV_IMGEMM=1: im2col + GEMM, both in NCHW. im2col reads the NC4HW4 input directly,
+        // the GEMM writes NCHW, and only the final NC4HW4 repack is layout plumbing.
+        const bool useImGemm = (nullptr != getenv("MNN_CONV_IMGEMM"))
+            && mResource->mKernelHeight == 3 && mResource->mKernelWidth == 3
+            && mResource->mStrides[0] == 1 && mResource->mStrides[1] == 1
+            && mResource->mDilations[0] == 1 && mResource->mDilations[1] == 1
+            && mPaddings[0] == 1 && mPaddings[1] == 1
+            && (width % 4 == 0) && ((height * width) % 8 == 0)
+            && mFilterDataPtr != nullptr;
+        if (useImGemm) {
+            const int icNum = inputChannels, ocNum = outChannel;
+            const int ocbNum = UP_DIV(ocNum, 4), ocPad = ocbNum * 4;
+            const int Kdim = icNum * 9;
+            const int Mdim = batch * height * width;
+
+            // weights -> [ocb][k][4oc]
+            const int wCount = ocbNum * Kdim * 4;
+            mNchwWeight.reset(Tensor::createDevice<float>({wCount}));
+            mOpenCLBackend->onAcquireBuffer(mNchwWeight.get(), Backend::STATIC);
+            {
+                cl_int err;
+                auto &q = mOpenCLBackend->getOpenCLRuntime()->commandQueue();
+                cl::Buffer &wb = *(cl::Buffer *)mNchwWeight->buffer().device;
+                const bool half = (mOpenCLBackend->getPrecision() != BackendConfig::Precision_High);
+                size_t bytes = wCount * (half ? sizeof(half_float::half) : sizeof(float));
+                auto p = q.enqueueMapBuffer(wb, CL_TRUE, CL_MAP_WRITE, 0, bytes, nullptr, nullptr, &err);
+                if (p != nullptr && err == CL_SUCCESS) {
+                    ::memset(p, 0, bytes);
+                    for (int ocb = 0; ocb < ocbNum; ocb++) {
+                    for (int k = 0; k < Kdim; k++) {
+                    for (int lane = 0; lane < 4; lane++) {
+                        const int oc = ocb * 4 + lane;
+                        if (oc >= ocNum) continue;
+                        const float v = mFilterDataPtr[oc * Kdim + k];   // OIHW == [oc][ic*9+tap]
+                        const size_t d = ((size_t)(ocb * Kdim + k) * 4) + lane;
+                        if (half) ((half_float::half *)p)[d] = (half_float::half)v;
+                        else      ((float *)p)[d] = v;
+                    }}}
+                    q.enqueueUnmapMemObject(wb, p);
+                } else {
+                    MNN_ERROR("MNN_CONV_IMGEMM: weight map failed\n");
+                }
+            }
+
+            mImColTensor.reset(Tensor::createDevice<float>({(int)((size_t)Kdim * Mdim)}));
+            mNchwOutTensor.reset(Tensor::createDevice<float>({batch * ocPad * height * width}));
+            mOpenCLBackend->onAcquireBuffer(mImColTensor.get(), Backend::DYNAMIC);
+            mOpenCLBackend->onAcquireBuffer(mNchwOutTensor.get(), Backend::DYNAMIC);
+
+            std::set<std::string> buildOption = mResource->mBuildOptions;
+            cl_int ret = CL_SUCCESS; uint32_t idx = 0;
+
+            // pass 1: im2col (NC4HW4 -> col[K][M])
+            mPreKernel = mOpenCLBackend->getOpenCLRuntime()->buildKernel(
+                "conv_2d_buf", "im2col_nchw", {}, mOpenCLBackend->getPrecision());
+            mPreGlobalWorkSize = {(uint32_t)UP_DIV(Mdim, 4), (uint32_t)(UP_DIV(icNum, 4) * 9)};
+            ret |= mPreKernel->get().setArg(idx++, mPreGlobalWorkSize[0]);
+            ret |= mPreKernel->get().setArg(idx++, mPreGlobalWorkSize[1]);
+            ret |= mPreKernel->get().setArg(idx++, openCLBuffer(input));
+            ret |= mPreKernel->get().setArg(idx++, openCLBuffer(mImColTensor.get()));
+            ret |= mPreKernel->get().setArg(idx++, icNum);
+            ret |= mPreKernel->get().setArg(idx++, batch);
+            ret |= mPreKernel->get().setArg(idx++, inputHeight);
+            ret |= mPreKernel->get().setArg(idx++, inputWidth);
+            MNN_CHECK_CL_SUCCESS(ret, "setArg im2col");
+            mPreLocalWorkSize = localWS2DDefault(mPreGlobalWorkSize,
+                static_cast<uint32_t>(mOpenCLBackend->getOpenCLRuntime()->getMaxWorkGroupSize(mPreKernel)),
+                mOpenCLBackend->getOpenCLRuntime(), "im2col_nchw" + info, mPreKernel,
+                mOpenCLBackend->getCLTuneLevel(), "conv_2d_buf").first;
+
+            // pass 2: the GEMM
+            mKernel.resize(1);
+            mKernel[0] = mOpenCLBackend->getOpenCLRuntime()->buildKernel(
+                "conv_2d_buf", "gemm_nchw_c4m8", buildOption, mOpenCLBackend->getPrecision());
+            mGlobalWorkSize = {(uint32_t)UP_DIV(Mdim, 8), (uint32_t)ocbNum};
+            idx = 0; ret = CL_SUCCESS;
+            ret |= mKernel[0]->get().setArg(idx++, mGlobalWorkSize[0]);
+            ret |= mKernel[0]->get().setArg(idx++, mGlobalWorkSize[1]);
+            ret |= mKernel[0]->get().setArg(idx++, openCLBuffer(mImColTensor.get()));
+            ret |= mKernel[0]->get().setArg(idx++, openCLBuffer(mNchwWeight.get()));
+            ret |= mKernel[0]->get().setArg(idx++, openCLBuffer(mResource->mBias.get()));
+            ret |= mKernel[0]->get().setArg(idx++, openCLBuffer(mNchwOutTensor.get()));
+            ret |= mKernel[0]->get().setArg(idx++, Kdim);
+            ret |= mKernel[0]->get().setArg(idx++, ocNum);
+            ret |= mKernel[0]->get().setArg(idx++, batch);
+            ret |= mKernel[0]->get().setArg(idx++, height);
+            ret |= mKernel[0]->get().setArg(idx++, width);
+            if (mResource->mPrelu) {
+                ret |= mKernel[0]->get().setArg(idx++, openCLBuffer(mResource->mSlope.get()));
+            }
+            MNN_CHECK_CL_SUCCESS(ret, "setArg gemm_nchw");
+            mLocalWorkSize = localWS2DDefault(mGlobalWorkSize,
+                static_cast<uint32_t>(mOpenCLBackend->getOpenCLRuntime()->getMaxWorkGroupSize(mKernel[0])),
+                mOpenCLBackend->getOpenCLRuntime(), "gemm_nchw_c4m8" + info, mKernel[0],
+                mOpenCLBackend->getCLTuneLevel(), "conv_2d_buf").first;
+
+            // pass 3: NCHW -> NC4HW4
+            mPostKernel = mOpenCLBackend->getOpenCLRuntime()->buildKernel(
+                "conv_2d_buf", "cvt_nchw_to_nc4hw4", {}, mOpenCLBackend->getPrecision());
+            mPostGlobalWorkSize = {(uint32_t)(ocbNum * width), (uint32_t)(batch * height)};
+            idx = 0; ret = CL_SUCCESS;
+            ret |= mPostKernel->get().setArg(idx++, mPostGlobalWorkSize[0]);
+            ret |= mPostKernel->get().setArg(idx++, mPostGlobalWorkSize[1]);
+            ret |= mPostKernel->get().setArg(idx++, openCLBuffer(mNchwOutTensor.get()));
+            ret |= mPostKernel->get().setArg(idx++, openCLBuffer(output));
+            ret |= mPostKernel->get().setArg(idx++, ocNum);
+            ret |= mPostKernel->get().setArg(idx++, batch);
+            ret |= mPostKernel->get().setArg(idx++, height);
+            ret |= mPostKernel->get().setArg(idx++, width);
+            MNN_CHECK_CL_SUCCESS(ret, "setArg imgemm post");
+            mPostLocalWorkSize = localWS2DDefault(mPostGlobalWorkSize,
+                static_cast<uint32_t>(mOpenCLBackend->getOpenCLRuntime()->getMaxWorkGroupSize(mPostKernel)),
+                mOpenCLBackend->getOpenCLRuntime(), "cvt_nchw_to_nc4hw4" + info, mPostKernel,
+                mOpenCLBackend->getCLTuneLevel(), "conv_2d_buf").first;
+
+            mOpenCLBackend->onReleaseBuffer(mImColTensor.get(), Backend::DYNAMIC);
+            mOpenCLBackend->onReleaseBuffer(mNchwOutTensor.get(), Backend::DYNAMIC);
+        } else if (useNchw) {
+            const int icNum = inputChannels, ocNum = outChannel;
+            // Weights repacked OIHW -> [ocb][ic][kh][kw][4oc], so one tap is one aligned float4
+            // load serving all 4 output channels. The activation layout is what "NCHW" means here;
+            // the weight layout is free, and giving it the best form is what makes this a fair test.
+            const int ocbNum = UP_DIV(ocNum, 4);
+            const int wCount = ocbNum * icNum * 9 * 4;
+            mNchwWeight.reset(Tensor::createDevice<float>({wCount}));
+            mOpenCLBackend->onAcquireBuffer(mNchwWeight.get(), Backend::STATIC);
+            {
+                cl_int err;
+                auto &q = mOpenCLBackend->getOpenCLRuntime()->commandQueue();
+                cl::Buffer &wb = *(cl::Buffer *)mNchwWeight->buffer().device;
+                const bool half = (mOpenCLBackend->getPrecision() != BackendConfig::Precision_High);
+                size_t bytes = wCount * (half ? sizeof(half_float::half) : sizeof(float));
+                auto p = q.enqueueMapBuffer(wb, CL_TRUE, CL_MAP_WRITE, 0, bytes, nullptr, nullptr, &err);
+                if (p != nullptr && err == CL_SUCCESS) {
+                    ::memset(p, 0, bytes);
+                    for (int ocb = 0; ocb < ocbNum; ocb++) {
+                    for (int ic = 0; ic < icNum; ic++) {
+                    for (int t = 0; t < 9; t++) {
+                    for (int lane = 0; lane < 4; lane++) {
+                        const int oc = ocb * 4 + lane;
+                        if (oc >= ocNum) continue;
+                        const float v = mFilterDataPtr[(oc * icNum + ic) * 9 + t];
+                        const size_t d = (((size_t)(ocb * icNum + ic) * 9 + t) * 4) + lane;
+                        if (half) ((half_float::half *)p)[d] = (half_float::half)v;
+                        else      ((float *)p)[d] = v;
+                    }}}}
+                    q.enqueueUnmapMemObject(wb, p);
+                } else {
+                    MNN_ERROR("MNN_CONV_NCHW: weight map failed\n");
+                }
+            }
+            const int icPad = ROUND_UP(icNum, 4), ocPad = ROUND_UP(ocNum, 4);
+            mNchwInTensor.reset(Tensor::createDevice<float>({batch * icPad * inputHeight * inputWidth}));
+            mNchwOutTensor.reset(Tensor::createDevice<float>({batch * ocPad * height * width}));
+            mOpenCLBackend->onAcquireBuffer(mNchwInTensor.get(), Backend::DYNAMIC);
+            mOpenCLBackend->onAcquireBuffer(mNchwOutTensor.get(), Backend::DYNAMIC);
+
+            std::set<std::string> buildOption = mResource->mBuildOptions;
+            {
+                // Same contract as hcPut for the HC_* set: always emit, as the runtime arg name by
+                // default and as a literal under MNN_CONV_HARD=1. Lets the NCHW kernels get the
+                // same constant-folding that is worth -18.7% on the NC4HW4 side (§H.23).
+                const bool ncHard = (nullptr != getenv("MNN_CONV_HARD"));
+                auto ncPut = [&](const char* n, const char* expr, int val){
+                    buildOption.emplace(std::string("-D") + n + "=" +
+                                        (ncHard ? std::to_string(val) : std::string(expr)));
+                };
+                ncPut("NC_IC","in_channels",icNum);      ncPut("NC_OC","out_channels",ocNum);
+                ncPut("NC_BATCH","batch",batch);
+                ncPut("NC_INH","in_h",inputHeight);      ncPut("NC_INW","in_w",inputWidth);
+                ncPut("NC_OUTH","out_h",height);         ncPut("NC_OUTW","out_w",width);
+                // §H.34 lesson: a build option that silently fails to reach the kernel looks like
+                // "the lever does not help", not like an error. Make it observable.
+                if (nullptr != getenv("MNN_CONV_NCHW_DEBUG")) {
+                    std::string dbg;
+                    for (auto &o : buildOption) {
+                        if (o.compare(0, 4, "-DNC") == 0) { dbg += o; dbg += " "; }
+                    }
+                    MNN_PRINT("[NCHW] ci%d co%d %dx%d s%d hard=%d opts: %s\n", icNum, ocNum,
+                              height, width, nchwStride, ncHard ? 1 : 0, dbg.c_str());
+                }
+            }
+            cl_int ret = CL_SUCCESS;
+            uint32_t idx = 0;
+
+            // pass 1: NC4HW4 -> NCHW
+            mPreKernel = mOpenCLBackend->getOpenCLRuntime()->buildKernel(
+                "conv_2d_buf", "cvt_nc4hw4_to_nchw", {}, mOpenCLBackend->getPrecision());
+            mPreGlobalWorkSize = {(uint32_t)(icPad * inputWidth), (uint32_t)(batch * inputHeight)};
+            ret |= mPreKernel->get().setArg(idx++, mPreGlobalWorkSize[0]);
+            ret |= mPreKernel->get().setArg(idx++, mPreGlobalWorkSize[1]);
+            ret |= mPreKernel->get().setArg(idx++, openCLBuffer(input));
+            ret |= mPreKernel->get().setArg(idx++, openCLBuffer(mNchwInTensor.get()));
+            ret |= mPreKernel->get().setArg(idx++, icNum);
+            ret |= mPreKernel->get().setArg(idx++, batch);
+            ret |= mPreKernel->get().setArg(idx++, inputHeight);
+            ret |= mPreKernel->get().setArg(idx++, inputWidth);
+            MNN_CHECK_CL_SUCCESS(ret, "setArg nchw pre");
+            mPreLocalWorkSize = localWS2DDefault(mPreGlobalWorkSize,
+                static_cast<uint32_t>(mOpenCLBackend->getOpenCLRuntime()->getMaxWorkGroupSize(mPreKernel)),
+                mOpenCLBackend->getOpenCLRuntime(), "cvt_nc4hw4_to_nchw" + info, mPreKernel,
+                mOpenCLBackend->getCLTuneLevel(), "conv_2d_buf").first;
+
+            // pass 2: the NCHW convolution itself
+            mKernel.resize(1);
+            const char* nchwKernelName = useNchwFuse2 ? "conv_2d_nchw_fused2"
+                                       : (nchwStride == 2) ? "conv_2d_nchw_s2_c4w8"
+                                                           : "conv_2d_nchw_c4w8";
+            if (useNchwFuse2) {
+                buildOption.emplace("-DFUSE_T=" + std::to_string(fuseTile));
+                buildOption.emplace("-DFUSE_C=" + std::to_string(icNum));
+            }
+            mKernel[0] = mOpenCLBackend->getOpenCLRuntime()->buildKernel(
+                "conv_2d_buf", nchwKernelName, buildOption, mOpenCLBackend->getPrecision());
+            const int wBlocks = UP_DIV(width, 8);
+            mGlobalWorkSize = {(uint32_t)(UP_DIV(ocNum, 4) * wBlocks), (uint32_t)(batch * height)};
+            if (useNchwFuse2) {
+                mGlobalWorkSize = {(uint32_t)width, (uint32_t)(batch * height)};
+            }
+            idx = 0; ret = CL_SUCCESS;
+            ret |= mKernel[0]->get().setArg(idx++, mGlobalWorkSize[0]);
+            ret |= mKernel[0]->get().setArg(idx++, mGlobalWorkSize[1]);
+            ret |= mKernel[0]->get().setArg(idx++, openCLBuffer(mNchwInTensor.get()));
+            ret |= mKernel[0]->get().setArg(idx++, openCLBuffer(mNchwWeight.get()));
+            ret |= mKernel[0]->get().setArg(idx++, openCLBuffer(mResource->mBias.get()));
+            ret |= mKernel[0]->get().setArg(idx++, openCLBuffer(mNchwOutTensor.get()));
+            if (useNchwFuse2) {
+                ret |= mKernel[0]->get().setArg(idx++, batch);
+                ret |= mKernel[0]->get().setArg(idx++, height);
+                ret |= mKernel[0]->get().setArg(idx++, width);
+            } else {
+            ret |= mKernel[0]->get().setArg(idx++, icNum);
+            ret |= mKernel[0]->get().setArg(idx++, ocNum);
+            ret |= mKernel[0]->get().setArg(idx++, batch);
+            ret |= mKernel[0]->get().setArg(idx++, inputHeight);
+            ret |= mKernel[0]->get().setArg(idx++, inputWidth);
+            ret |= mKernel[0]->get().setArg(idx++, height);
+            ret |= mKernel[0]->get().setArg(idx++, width);
+            }
+            if (mResource->mPrelu && !useNchwFuse2) {
+                ret |= mKernel[0]->get().setArg(idx++, openCLBuffer(mResource->mSlope.get()));
+            }
+            MNN_CHECK_CL_SUCCESS(ret, "setArg nchw conv");
+            if (useNchwFuse2) {
+                // reqd_work_group_size on the kernel: the LWS is fixed, not tuned
+                mLocalWorkSize = {(uint32_t)fuseTile, (uint32_t)fuseTile};
+            } else
+            mLocalWorkSize = localWS2DDefault(mGlobalWorkSize,
+                static_cast<uint32_t>(mOpenCLBackend->getOpenCLRuntime()->getMaxWorkGroupSize(mKernel[0])),
+                mOpenCLBackend->getOpenCLRuntime(), std::string(nchwKernelName) + info, mKernel[0],
+                mOpenCLBackend->getCLTuneLevel(), "conv_2d_buf").first;
+
+            // pass 3: NCHW -> NC4HW4
+            mPostKernel = mOpenCLBackend->getOpenCLRuntime()->buildKernel(
+                "conv_2d_buf", "cvt_nchw_to_nc4hw4", {}, mOpenCLBackend->getPrecision());
+            mPostGlobalWorkSize = {(uint32_t)(UP_DIV(ocNum, 4) * width), (uint32_t)(batch * height)};
+            idx = 0; ret = CL_SUCCESS;
+            ret |= mPostKernel->get().setArg(idx++, mPostGlobalWorkSize[0]);
+            ret |= mPostKernel->get().setArg(idx++, mPostGlobalWorkSize[1]);
+            ret |= mPostKernel->get().setArg(idx++, openCLBuffer(mNchwOutTensor.get()));
+            ret |= mPostKernel->get().setArg(idx++, openCLBuffer(output));
+            ret |= mPostKernel->get().setArg(idx++, ocNum);
+            ret |= mPostKernel->get().setArg(idx++, batch);
+            ret |= mPostKernel->get().setArg(idx++, height);
+            ret |= mPostKernel->get().setArg(idx++, width);
+            MNN_CHECK_CL_SUCCESS(ret, "setArg nchw post");
+            mPostLocalWorkSize = localWS2DDefault(mPostGlobalWorkSize,
+                static_cast<uint32_t>(mOpenCLBackend->getOpenCLRuntime()->getMaxWorkGroupSize(mPostKernel)),
+                mOpenCLBackend->getOpenCLRuntime(), "cvt_nchw_to_nc4hw4" + info, mPostKernel,
+                mOpenCLBackend->getCLTuneLevel(), "conv_2d_buf").first;
+
+            mOpenCLBackend->onReleaseBuffer(mNchwInTensor.get(), Backend::DYNAMIC);
+            mOpenCLBackend->onReleaseBuffer(mNchwOutTensor.get(), Backend::DYNAMIC);
+        } else if (useSplitK) {
+            const int ocb = UP_DIV(outChannel, 4);
+            const int plane = ocb * batch * height * width * 4;
+            mSplitKTensor.reset(Tensor::createDevice<float>({splitK * plane}));
+            mOpenCLBackend->onAcquireBuffer(mSplitKTensor.get(), Backend::DYNAMIC);
+
+            int inShape[2]  = {inputHeight, inputWidth};
+            int outShape[2] = {height, width};
+            int strideShape[2] = {mResource->mStrides[0], mResource->mStrides[1]};
+            int padShape[2]    = {mPaddings[0], mPaddings[1]};
+            std::set<std::string> buildOption = mResource->mBuildOptions;
+
+            // pass 1: SPLITK un-reduced partials
+            mKernel.resize(1);
+            mKernel[0] = mOpenCLBackend->getOpenCLRuntime()->buildKernel(
+                "conv_2d_buf", "conv_2d_c4h1w1_splitk", buildOption, mOpenCLBackend->getPrecision());
+            mGlobalWorkSize = {(uint32_t)(ocb * width), (uint32_t)(batch * height * splitK)};
+            uint32_t idx = 0; cl_int ret = CL_SUCCESS;
+            ret |= mKernel[0]->get().setArg(idx++, mGlobalWorkSize[0]);
+            ret |= mKernel[0]->get().setArg(idx++, mGlobalWorkSize[1]);
+            ret |= mKernel[0]->get().setArg(idx++, openCLBuffer(input));
+            ret |= mKernel[0]->get().setArg(idx++, openCLBuffer(mResource->mFilter.get()));
+            ret |= mKernel[0]->get().setArg(idx++, openCLBuffer(mSplitKTensor.get()));
+            ret |= mKernel[0]->get().setArg(idx++, sizeof(inShape), inShape);
+            ret |= mKernel[0]->get().setArg(idx++, inputChannelBlocks);
+            ret |= mKernel[0]->get().setArg(idx++, batch);
+            ret |= mKernel[0]->get().setArg(idx++, sizeof(outShape), outShape);
+            ret |= mKernel[0]->get().setArg(idx++, sizeof(strideShape), strideShape);
+            ret |= mKernel[0]->get().setArg(idx++, sizeof(padShape), padShape);
+            ret |= mKernel[0]->get().setArg(idx++, ocb);
+            ret |= mKernel[0]->get().setArg(idx++, splitK);
+            MNN_CHECK_CL_SUCCESS(ret, "setArg splitk partial");
+            {
+                uint32_t mx = static_cast<uint32_t>(mOpenCLBackend->getOpenCLRuntime()->getMaxWorkGroupSize(mKernel[0]));
+                auto t = localWS2DDefault(mGlobalWorkSize, mx, mOpenCLBackend->getOpenCLRuntime(),
+                                          "conv_2d_c4h1w1_splitk" + info, mKernel[0],
+                                          mOpenCLBackend->getCLTuneLevel(), "conv_2d_buf");
+                mLocalWorkSize = {t.first[0], t.first[1]};
+            }
+
+            // pass 2: reduce + bias + activation
+            mPostKernel = mOpenCLBackend->getOpenCLRuntime()->buildKernel(
+                "conv_2d_buf", "conv_2d_splitk_reduce", buildOption, mOpenCLBackend->getPrecision());
+            mPostGlobalWorkSize = {(uint32_t)(ocb * width), (uint32_t)(batch * height)};
+            idx = 0; ret = CL_SUCCESS;
+            ret |= mPostKernel->get().setArg(idx++, mPostGlobalWorkSize[0]);
+            ret |= mPostKernel->get().setArg(idx++, mPostGlobalWorkSize[1]);
+            ret |= mPostKernel->get().setArg(idx++, openCLBuffer(mSplitKTensor.get()));
+            ret |= mPostKernel->get().setArg(idx++, openCLBuffer(mResource->mBias.get()));
+            ret |= mPostKernel->get().setArg(idx++, openCLBuffer(output));
+            ret |= mPostKernel->get().setArg(idx++, batch);
+            ret |= mPostKernel->get().setArg(idx++, sizeof(outShape), outShape);
+            ret |= mPostKernel->get().setArg(idx++, ocb);
+            ret |= mPostKernel->get().setArg(idx++, splitK);
+            if (mResource->mPrelu) {
+                ret |= mPostKernel->get().setArg(idx++, openCLBuffer(mResource->mSlope.get()));
+            }
+            MNN_CHECK_CL_SUCCESS(ret, "setArg splitk reduce");
+            {
+                uint32_t mx = static_cast<uint32_t>(mOpenCLBackend->getOpenCLRuntime()->getMaxWorkGroupSize(mPostKernel));
+                auto t = localWS2DDefault(mPostGlobalWorkSize, mx, mOpenCLBackend->getOpenCLRuntime(),
+                                          "conv_2d_splitk_reduce" + info, mPostKernel,
+                                          mOpenCLBackend->getCLTuneLevel(), "conv_2d_buf");
+                mPostLocalWorkSize = {t.first[0], t.first[1]};
+            }
+            mOpenCLBackend->onReleaseBuffer(mSplitKTensor.get(), Backend::DYNAMIC);
+        } else if (useFused2) {
             int inShape[2] = {inputHeight, inputWidth};
             int cblk = UP_DIV(outChannel, 4);
             std::set<std::string> buildOption = mResource->mBuildOptions;
@@ -747,8 +1148,10 @@ ErrorCode ConvBufExecution::onResize(const std::vector<Tensor *> &inputs, const 
             buildOption.emplace("-DTILE_W=" + std::to_string(TILE_W_LDS));
             buildOption.emplace("-DTILE_H=" + std::to_string(TILE_H_LDS));
             mKernel.resize(1);
-            mKernel[0] = mOpenCLBackend->getOpenCLRuntime()->buildKernel("conv_2d_buf", ldsStride == 2 ? "conv_2d_3x3s2_lds" : "conv_2d_3x3s1_lds", buildOption, mOpenCLBackend->getPrecision());
-            mGlobalWorkSize = {(uint32_t)(outChannelBlocks * width), (uint32_t)(batch * height)};
+            const char* ldsKernelName = ldsW2 ? "conv_2d_3x3s1_lds_w2"
+                                              : (ldsStride == 2 ? "conv_2d_3x3s2_lds" : "conv_2d_3x3s1_lds");
+            mKernel[0] = mOpenCLBackend->getOpenCLRuntime()->buildKernel("conv_2d_buf", ldsKernelName, buildOption, mOpenCLBackend->getPrecision());
+            mGlobalWorkSize = {(uint32_t)(outChannelBlocks * (ldsW2 ? (width / 2) : width)), (uint32_t)(batch * height)};
             mLocalWorkSize  = {(uint32_t)TILE_W_LDS, (uint32_t)TILE_H_LDS};
             uint32_t idx = 0;
             cl_int ret = CL_SUCCESS;

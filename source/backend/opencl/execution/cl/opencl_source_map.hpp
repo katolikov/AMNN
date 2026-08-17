@@ -44,6 +44,9 @@ extern const char* softmax;
 extern const char* binary_buf;
 #endif
 #ifndef MNN_OPENCL_BUFFER_CLOSED
+extern const char* quantile_buf;
+#endif
+#ifndef MNN_OPENCL_BUFFER_CLOSED
 extern const char* raster_buf;
 #endif
 #ifndef MNN_OPENCL_BUFFER_CLOSED
@@ -220,6 +223,9 @@ const std::map<std::string, const char*> OpenCLProgramMap =
   { "binary_buf", binary_buf },
 #endif
 #ifndef MNN_OPENCL_BUFFER_CLOSED
+  { "quantile_buf", quantile_buf },
+#endif
+#ifndef MNN_OPENCL_BUFFER_CLOSED
   { "raster_buf", raster_buf },
 #endif
 #ifndef MNN_OPENCL_BUFFER_CLOSED
@@ -375,6 +381,7 @@ const std::map<std::string, std::string> OpenCLProgramMd5Map =
   { "scale", "95773334e603db663c594945a064b9cc" },
   { "softmax", "aaa633bb6dd2c40f4379d09d754b5adc" },
   { "binary_buf", "6c5ee786c70aa485d9b49368517296e3" },
+  { "quantile_buf", "1277cad8e18463e2aee7cc46cdbde62f" },
   { "raster_buf", "7e9c4013c436cc929c8e1b4d69cf1bd4" },
   { "binary_subgroup_buf", "8444f988543cd4a4d9b124442f02f999" },
   { "depthwise_conv2d_subgroup_buf", "3e37457e72b7e629655aa04bd03e559e" },
@@ -407,7 +414,7 @@ const std::map<std::string, std::string> OpenCLProgramMd5Map =
   { "scale_buf", "9176b8e86fd4d326e7fa14640ce13b48" },
   { "matmul_buf", "b66faece7f0591d49c289e5227d9f680" },
   { "pooling", "900d1388836badea36a7e06ad7763b0d" },
-  { "conv_2d_buf", "9fe7c2e66ae8df12c1c0b83c32edb32f" },
+  { "conv_2d_buf", "2915cd3154ec4f28daafc4273ed6ec42" },
   { "gemm_int", "41770c2a12943f8fbdbfe259889ddf2d" },
   { "buffer_to_image", "bad95040692206db84b5a1bcc0b6f248" },
   { "winogradTransformDest2_3_1", "f2aaa52d652565e70a44868d4f6028e9" },

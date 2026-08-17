@@ -2234,6 +2234,132 @@ void conv_2d_3x3s1_lds(GLOBAL_SIZE_2_DIMS
     vstore4(CONVERT_FLOAT4(acc), 0, output + out_offset);
 }
 
+// ---------------------------------------------------------------------------------------------
+// conv_2d_3x3s1_lds_w2 — LDS staging at c4h1w2 blocking (env MNN_CONV_LDS=w2).
+//
+// The plain conv_2d_3x3s1_lds above is 1 output/thread and lost by 1.78x. That left one
+// confound open: it changed TWO things at once against the stock kernels (added LDS, and
+// dropped the register blocking from ~8 outputs/thread to 1). This kernel isolates LDS at
+// CONSTANT blocking - it is conv_2d_c4h1w2 (4 out-channels x 2 adjacent columns, same 2
+// accumulators, same reduction order) with the input read from LDS instead of global.
+// Comparing it against conv_2d_c4h1w2 leaves LDS as the only difference.
+//
+// One workgroup = (2*TILE_W) x TILE_H outputs for one output channel-block; the
+// (2*TILE_W+2) x (TILE_H+2) input halo is staged once per input channel-block.
+// Requires 3x3, stride 1, dilation 1, pad 1, out_w % (2*TILE_W) == 0, out_h % TILE_H == 0.
+#define LDSW2_W (2 * TILE_W + 2)
+#define LDSW2_H (TILE_H + 2)
+__kernel
+void conv_2d_3x3s1_lds_w2(GLOBAL_SIZE_2_DIMS
+                          __global const FLOAT *input,
+                          __global const FLOAT *weight,
+                          __global const FLOAT *bias,
+                          __global FLOAT *output,
+                          __private const int2 in_hw,
+                          __private const int inChannel,
+                          __private const int in_c_blocks,
+                          __private const int batch,
+                          __private const int2 out_hw,
+                          __private const int2 filter_hw,
+                          __private const int2 stride_hw,
+                          __private const int2 pad_hw,
+                          __private const int2 dilate_hw,
+                          __private const int out_w_blocks,
+                          __private const int out_c_blocks,
+                          __private const int out_h_blocks,
+                          __private const int out_c_base_index
+                          #ifdef PRELU
+                          ,__global const FLOAT *slope_ptr
+                          #endif
+) {
+    __local COMPUTE_FLOAT4 lds[LDSW2_H * LDSW2_W];
+
+    const int gx = get_global_id(0);   // out_c_idx * (out_w/2) + w_block
+    const int gy = get_global_id(1);   // out_b_idx * out_h + out_y
+    const int lx = get_local_id(0);    // 0..TILE_W-1
+    const int ly = get_local_id(1);    // 0..TILE_H-1
+
+    const int out_w = out_hw.y;
+    const int out_h = out_hw.x;
+    const int in_w  = in_hw.y;
+    const int in_h  = in_hw.x;
+
+    const int w_blocks  = out_w >> 1;
+    const int out_c_idx = gx / w_blocks;
+    const int out_x     = (gx % w_blocks) << 1;   // first of the two columns
+    const int out_b_idx = gy / out_h;
+    const int out_y     = gy % out_h;
+
+    // input halo origin for this workgroup (stride 1): the thread at (lx,ly) owns output
+    // columns out_x, out_x+1, so the group starts 2*lx columns to the left.
+    const int in_base_x = (out_x - (lx << 1)) - pad_hw.y;
+    const int in_base_y = (out_y - ly) - pad_hw.x;
+
+    COMPUTE_FLOAT4 out0 = CONVERT_COMPUTE_FLOAT4(vload4(out_c_idx, bias));
+    COMPUTE_FLOAT4 out1 = out0;
+
+    const int weight_oc_offset = out_c_blocks * 9 * 4;
+    const int lid        = ly * TILE_W + lx;
+    const int nthreads   = TILE_W * TILE_H;
+    const int tile_elems = LDSW2_W * LDSW2_H;
+
+    for (int ic = 0; ic < in_c_blocks; ic++) {
+        for (int e = lid; e < tile_elems; e += nthreads) {
+            const int ty = e / LDSW2_W;
+            const int tx = e % LDSW2_W;
+            const int iy = in_base_y + ty;
+            const int ix = in_base_x + tx;
+            COMPUTE_FLOAT4 v = (COMPUTE_FLOAT4)0;
+            if (iy >= 0 && iy < in_h && ix >= 0 && ix < in_w) {
+                const int inp_offset = (((ic * batch + out_b_idx) * in_h + iy) * in_w + ix) * 4;
+                v = CONVERT_COMPUTE_FLOAT4(vload4(0, input + inp_offset));
+            }
+            lds[e] = v;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        const int w_base = (((4 * ic) * out_c_blocks + out_c_idx) * 9) * 4;
+        for (int kh = 0; kh < 3; kh++) {
+            for (int kw = 0; kw < 3; kw++) {
+                const int lrow = (ly + kh) * LDSW2_W + (lx << 1) + kw;
+                COMPUTE_FLOAT4 in0 = lds[lrow];
+                COMPUTE_FLOAT4 in1 = lds[lrow + 1];
+                const int w_off = w_base + (kh * 3 + kw) * 4;
+                COMPUTE_FLOAT4 w0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight + w_off));
+                COMPUTE_FLOAT4 w1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight + w_off + weight_oc_offset));
+                COMPUTE_FLOAT4 w2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight + w_off + weight_oc_offset * 2));
+                COMPUTE_FLOAT4 w3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight + w_off + weight_oc_offset * 3));
+                out0 = mad(in0.x, w0, out0);
+                out0 = mad(in0.y, w1, out0);
+                out0 = mad(in0.z, w2, out0);
+                out0 = mad(in0.w, w3, out0);
+                out1 = mad(in1.x, w0, out1);
+                out1 = mad(in1.y, w1, out1);
+                out1 = mad(in1.z, w2, out1);
+                out1 = mad(in1.w, w3, out1);
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+#ifdef RELU
+    out0 = fmax(out0, (COMPUTE_FLOAT4)0);
+    out1 = fmax(out1, (COMPUTE_FLOAT4)0);
+#endif
+#ifdef RELU6
+    out0 = clamp(out0, (COMPUTE_FLOAT4)0, (COMPUTE_FLOAT4)6);
+    out1 = clamp(out1, (COMPUTE_FLOAT4)0, (COMPUTE_FLOAT4)6);
+#endif
+#ifdef PRELU
+    COMPUTE_FLOAT4 slope_in = CONVERT_COMPUTE_FLOAT4(vload4(out_c_idx, slope_ptr));
+    out0 = select(out0 * slope_in, out0, out0 >= 0);
+    out1 = select(out1 * slope_in, out1, out1 >= 0);
+#endif
+
+    const int out_offset = (((out_b_idx + out_c_idx * batch) * out_h + out_y) * out_w + out_x) * 4;
+    vstore8(CONVERT_FLOAT8((COMPUTE_FLOAT8)(out0, out1)), 0, output + out_offset);
+}
+
 // c8h8w1: register-blocked 3x3 variant, 8 output channels x 8 rows/thread = 16 accumulators
 // (2x the tile height of c8h4w1). More work-in-flight + more input-row reuse; tests whether the
 // autotuner's 8-accumulator optimum is the true optimum. Same NC4HW4 index math as c8h4w1.
@@ -2355,31 +2481,47 @@ void conv_2d_3x3s2_lds(GLOBAL_SIZE_2_DIMS
 
 
 // ---- shape access: runtime args by default, compile-time constants under MNN_CONV_HARD ----
-#ifdef HC_IN_H
-  #define HCINH   HC_IN_H
-  #define HCINW   HC_IN_W
-  #define HCOUTH  HC_OUT_H
-  #define HCOUTW  HC_OUT_W
-  #define HCICB   HC_ICB
-  #define HCOCB   HC_OCB
-  #define HCBATCH HC_BATCH
-  #define HCWB    HC_WB
-  #define HCHB    HC_HB
-  #ifdef HC_UNROLL_IC
-    #define HCUNROLL __attribute__((opencl_unroll_hint))
-  #else
-    #define HCUNROLL
-  #endif
-#else
+//
+// The HOST supplies every HC* name as a -D build option (ConvBufExecution's hcPut): the runtime
+// expression by default, a literal under MNN_CONV_HARD=1. The fallbacks below are ONLY for kernels
+// that are built outside that path (conv_2d_3x3s1_fused2 assembles its own build options), so each
+// one must be guarded -- an unguarded #define here silently REDEFINES the host's -D and wins,
+// because the .cl text is processed after the command-line macros.
+//
+// That is exactly the bug that made MNN_CONV_HARD a no-op for the four 2-D tile kernels between
+// §H.26 and §H.34: the guard used to be `#ifdef HC_IN_H`, but §H.26 renamed the host's defines to
+// HCINH/HCINW/... (no underscores), so the guard never fired, the #else branch ran, and it
+// overwrote the literals with the runtime expressions. Cost: the -18.7% win read as -4%.
+#ifndef HCINH
   #define HCINH   in_hw.x
+#endif
+#ifndef HCINW
   #define HCINW   in_hw.y
+#endif
+#ifndef HCOUTH
   #define HCOUTH  out_hw.x
+#endif
+#ifndef HCOUTW
   #define HCOUTW  out_hw.y
+#endif
+#ifndef HCICB
   #define HCICB   in_c_blocks
+#endif
+#ifndef HCOCB
   #define HCOCB   out_c_blocks
+#endif
+#ifndef HCBATCH
   #define HCBATCH batch
+#endif
+#ifndef HCWB
   #define HCWB    out_w_blocks
+#endif
+#ifndef HCHB
   #define HCHB    out_h_blocks
+#endif
+#ifdef HC_UNROLL_IC
+  #define HCUNROLL __attribute__((opencl_unroll_hint))
+#else
   #define HCUNROLL
 #endif
 
@@ -5303,5 +5445,722 @@ void conv_2d_3x3s1_fused2(GLOBAL_SIZE_2_DIMS
             }
         }
         vstore4(CONVERT_FLOAT4(acc), 0, output + ((((oc * HCBATCH + b) * H + oy) * W + ox) * 4));
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Split-K over input channels (env MNN_CONV_SPLITK=<2|4|8>).
+//
+// Why: the stride-2 heads are OUTPUT-starved, not arithmetic-bound. 64->96@36x48 s2 emits only
+// 18*24*24 = 10368 output float4s, which is too few waves to fill 8 CUs -- measured directly by
+// batch scaling (FINDINGS §H.31): batch 2 costs only 1.33x batch 1, so a third of the machine is
+// idle at batch 1. Splitting the Cin reduction across SPLITK workgroups multiplies the thread
+// count by SPLITK without touching the output shape, which is the one lever that attacks that
+// starvation head-on.
+//
+// Two passes, no atomics (fp16 atomics do not exist here): the partial kernel writes SPLITK
+// un-reduced partials to a scratch buffer, the reduce kernel sums them and applies bias +
+// activation. Blocking is c4h1w1 -- the max-parallel point, which is what an occupancy fix wants.
+//
+// partial layout: [SPLITK][out_c_blocks][batch][out_h][out_w][4]
+__kernel
+void conv_2d_c4h1w1_splitk(GLOBAL_SIZE_2_DIMS
+                           __global const FLOAT *input,
+                           __global const FLOAT *weight,
+                           __global FLOAT *partial,
+                           __private const int2 in_hw,
+                           __private const int in_c_blocks,
+                           __private const int batch,
+                           __private const int2 out_hw,
+                           __private const int2 stride_hw,
+                           __private const int2 pad_hw,
+                           __private const int out_c_blocks,
+                           __private const int split_k
+) {
+    const int out_c_w_idx = get_global_id(0);   // out_c_idx * out_w + out_w_idx
+    const int bhs_idx     = get_global_id(1);   // (s * batch * out_h) + (b * out_h + h)
+
+    DEAL_NON_UNIFORM_DIM2(out_c_w_idx, bhs_idx);
+
+    const int out_w   = out_hw.y;
+    const int out_h   = out_hw.x;
+    const int bh_span = batch * out_h;
+
+    const int out_c_idx = out_c_w_idx / out_w;
+    const int out_w_idx = out_c_w_idx % out_w;
+    const int s         = bhs_idx / bh_span;
+    const int bh        = bhs_idx % bh_span;
+    const int out_b_idx = bh / out_h;
+    const int out_h_idx = bh % out_h;
+
+    // this workgroup's slice of the input-channel reduction
+    const int ic_per   = (in_c_blocks + split_k - 1) / split_k;
+    const int ic_start = s * ic_per;
+    const int ic_end   = min(ic_start + ic_per, in_c_blocks);
+
+    COMPUTE_FLOAT4 out0 = (COMPUTE_FLOAT4)0;
+
+    const int in_w_base = mad24(out_w_idx, stride_hw.y, -pad_hw.y);
+    const int in_h_base = mad24(out_h_idx, stride_hw.x, -pad_hw.x);
+    const int weight_oc_offset = out_c_blocks * 9 * 4;
+
+    for (int ic = ic_start; ic < ic_end; ic++) {
+        int weight_offset = ((((4 * ic) * out_c_blocks + out_c_idx) * 3) * 3) * 4;
+        for (int fh = 0; fh < 3; fh++) {
+            const int iy = in_h_base + fh;
+            if (iy < 0 || iy >= in_hw.x) { weight_offset += 3 * 4; continue; }
+            const int inp_offset_base = (((out_b_idx + ic * batch) * in_hw.x + iy) * in_hw.y) * 4;
+            for (int fw = 0; fw < 3; fw++) {
+                const int ix = in_w_base + fw;
+                COMPUTE_FLOAT4 in0 = (ix < 0 || ix >= in_hw.y) ? (COMPUTE_FLOAT4)0
+                                     : CONVERT_COMPUTE_FLOAT4(vload4(ix, input + inp_offset_base));
+                COMPUTE_FLOAT4 w0 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight + weight_offset));
+                COMPUTE_FLOAT4 w1 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight + weight_offset + weight_oc_offset));
+                COMPUTE_FLOAT4 w2 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight + weight_offset + weight_oc_offset * 2));
+                COMPUTE_FLOAT4 w3 = CONVERT_COMPUTE_FLOAT4(vload4(0, weight + weight_offset + weight_oc_offset * 3));
+                out0 = mad(in0.x, w0, out0);
+                out0 = mad(in0.y, w1, out0);
+                out0 = mad(in0.z, w2, out0);
+                out0 = mad(in0.w, w3, out0);
+                weight_offset += 4;
+            }
+        }
+    }
+
+    const int plane      = out_c_blocks * batch * out_h * out_w;
+    const int out_offset = (((out_b_idx + out_c_idx * batch) * out_h + out_h_idx) * out_w + out_w_idx) * 4;
+    vstore4(CONVERT_FLOAT4(out0), 0, partial + s * plane * 4 + out_offset);
+}
+
+// Reduce the SPLITK partials, add bias, apply the fused activation, write the real output.
+__kernel
+void conv_2d_splitk_reduce(GLOBAL_SIZE_2_DIMS
+                           __global const FLOAT *partial,
+                           __global const FLOAT *bias,
+                           __global FLOAT *output,
+                           __private const int batch,
+                           __private const int2 out_hw,
+                           __private const int out_c_blocks,
+                           __private const int split_k
+                           #ifdef PRELU
+                           ,__global const FLOAT *slope_ptr
+                           #endif
+) {
+    const int out_c_w_idx = get_global_id(0);
+    const int bh_idx      = get_global_id(1);
+
+    DEAL_NON_UNIFORM_DIM2(out_c_w_idx, bh_idx);
+
+    const int out_w = out_hw.y;
+    const int out_h = out_hw.x;
+
+    const int out_c_idx = out_c_w_idx / out_w;
+    const int out_w_idx = out_c_w_idx % out_w;
+    const int out_b_idx = bh_idx / out_h;
+    const int out_h_idx = bh_idx % out_h;
+
+    const int plane      = out_c_blocks * batch * out_h * out_w;
+    const int out_offset = (((out_b_idx + out_c_idx * batch) * out_h + out_h_idx) * out_w + out_w_idx) * 4;
+
+    COMPUTE_FLOAT4 acc = CONVERT_COMPUTE_FLOAT4(vload4(out_c_idx, bias));
+    for (int s = 0; s < split_k; s++) {
+        acc += CONVERT_COMPUTE_FLOAT4(vload4(0, partial + s * plane * 4 + out_offset));
+    }
+
+#ifdef RELU
+    acc = fmax(acc, (COMPUTE_FLOAT4)0);
+#endif
+#ifdef RELU6
+    acc = clamp(acc, (COMPUTE_FLOAT4)0, (COMPUTE_FLOAT4)6);
+#endif
+#ifdef PRELU
+    COMPUTE_FLOAT4 slope_in = CONVERT_COMPUTE_FLOAT4(vload4(out_c_idx, slope_ptr));
+    acc = select(acc * slope_in, acc, acc >= 0);
+#endif
+
+    vstore4(CONVERT_FLOAT4(acc), 0, output + out_offset);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Plain-NCHW convolution path (env MNN_CONV_NCHW=1).
+//
+// Every stock MNN buffer conv works in NC4HW4: a float4 load fetches 4 CHANNELS of one pixel, and
+// the inner product is 4 mads broadcasting those 4 components against 4 weight vectors. NCHW
+// instead makes a float4 load fetch 4 adjacent PIXELS of one channel, so a weight value becomes a
+// scalar multiplier applied to a whole w-vector. Same arithmetic intensity, completely different
+// register/broadcast structure -- and untested here, because MNN never offers the choice.
+//
+// To keep this an honest comparison rather than a timing hack, the conv is made CORRECT: the
+// NC4HW4 input is converted into a scratch NCHW buffer first, the conv runs entirely in NCHW, and
+// the result is converted back. The conversion kernels are timed separately so the conv kernel can
+// be compared like for like (the caller was explicit that the surrounding layout cost is not the
+// question being asked).
+//
+// Blocking is 4 output channels x 8 adjacent pixels = 32 accumulator scalars = 8 float4, which is
+// deliberately the same register class as conv_2d_c4h4w2, the best NC4HW4 kernel found (§H.22).
+// Requires 3x3, stride 1, dilation 1, pad 1.
+__kernel
+void cvt_nc4hw4_to_nchw(GLOBAL_SIZE_2_DIMS
+                        __global const FLOAT *src, __global FLOAT *dst,
+                        __private const int channels, __private const int batch,
+                        __private const int height, __private const int width) {
+    const int cx_idx = get_global_id(0);   // c * width + x
+    const int bh_idx = get_global_id(1);   // b * height + y
+    DEAL_NON_UNIFORM_DIM2(cx_idx, bh_idx);
+    const int c = cx_idx / width;
+    const int x = cx_idx % width;
+    const int b = bh_idx / height;
+    const int y = bh_idx % height;
+    const int cb = c >> 2, lane = c & 3;
+    const int s = ((((cb * batch + b) * height + y) * width + x) << 2) + lane;
+    // cstride = channels rounded up to 4. The pad planes are zero-filled so the conv can write a
+    // full float4 of output channels without a bounds check and without running off the buffer.
+    const int cstride = (channels + 3) & ~3;
+    if (c >= cstride) return;
+    dst[((b * cstride + c) * height + y) * width + x] = (c < channels) ? src[s] : (FLOAT)0;
+}
+
+__kernel
+void cvt_nchw_to_nc4hw4(GLOBAL_SIZE_2_DIMS
+                        __global const FLOAT *src, __global FLOAT *dst,
+                        __private const int channels, __private const int batch,
+                        __private const int height, __private const int width) {
+    const int cx_idx = get_global_id(0);
+    const int bh_idx = get_global_id(1);
+    DEAL_NON_UNIFORM_DIM2(cx_idx, bh_idx);
+    const int cb = cx_idx / width;          // destination channel BLOCK
+    const int x  = cx_idx % width;
+    const int b  = bh_idx / height;
+    const int y  = bh_idx % height;
+    const int d = ((((cb * batch + b) * height + y) * width + x) << 2);
+    for (int lane = 0; lane < 4; lane++) {
+        const int c = (cb << 2) + lane;
+        // zero-fill the padding lanes when channels % 4 != 0, so the NC4HW4 consumer sees clean data
+        const int cstride = (channels + 3) & ~3;
+        dst[d + lane] = (c < channels) ? src[((b * cstride + c) * height + y) * width + x]
+                                       : (FLOAT)0;
+    }
+}
+
+#define NCHW_WT 8
+// ---- NCHW shape access: runtime args by default, compile-time constants under MNN_CONV_HARD ----
+// The host emits every NC_* name as a -D (the runtime expression, or a literal under
+// MNN_CONV_HARD=1). Guarded exactly like the HC_* set -- an unguarded #define here would shadow
+// the host's -D and silently disable hardcoding, which is the §H.34 bug.
+#ifndef NC_IC
+  #define NC_IC    in_channels
+#endif
+#ifndef NC_OC
+  #define NC_OC    out_channels
+#endif
+#ifndef NC_BATCH
+  #define NC_BATCH batch
+#endif
+#ifndef NC_INH
+  #define NC_INH   in_h
+#endif
+#ifndef NC_INW
+  #define NC_INW   in_w
+#endif
+#ifndef NC_OUTH
+  #define NC_OUTH  out_h
+#endif
+#ifndef NC_OUTW
+  #define NC_OUTW  out_w
+#endif
+// Fair-fight NCHW kernel, v2. v1 (indexed acc[4][8] + scalar strided weight loads) measured
+// 2-4x slower, which is exactly the shape of the false negative that the c4h4w2 2-D tile produced
+// once already -- so it was rewritten with every known trap removed:
+//   * 8 EXPLICIT float4 accumulators (a0..a7), one per pixel holding its 4 output channels; no
+//     array indexing anywhere, so nothing can spill to scratch;
+//   * weights REPACKED to [ocb][ic][kh][kw][4oc] so one tap is one ALIGNED float4 load serving all
+//     4 output channels -- v1 issued 4 scalar loads strided by ic*9, which is cache-hostile;
+//   * input read with 4 ALIGNED float4 loads per (channel,row) instead of 10 scalar loads.
+// Weight layout is free to differ: NCHW here is a claim about the ACTIVATION layout only.
+// Fast path requires out_channels % 4 == 0 and width % 8 == 0 (all target shapes qualify).
+__kernel
+void conv_2d_nchw_c4w8(GLOBAL_SIZE_2_DIMS
+                       __global const FLOAT *input,    // NCHW
+                       __global const FLOAT *weight,   // [ocb][ic][kh][kw][4]
+                       __global const FLOAT *bias,
+                       __global FLOAT *output,         // NCHW
+                       __private const int in_channels,
+                       __private const int out_channels,
+                       __private const int batch,
+                       __private const int in_h,
+                       __private const int in_w,
+                       __private const int out_h,
+                       __private const int out_w
+                       #ifdef PRELU
+                       ,__global const FLOAT *slope_ptr
+                       #endif
+) {
+    const int ocw_idx = get_global_id(0);
+    const int bh_idx  = get_global_id(1);
+    DEAL_NON_UNIFORM_DIM2(ocw_idx, bh_idx);
+
+    const int w_blocks = NC_OUTW >> 3;
+    const int ocb = ocw_idx / w_blocks;
+    const int x0  = (ocw_idx % w_blocks) << 3;
+    const int b   = bh_idx / NC_OUTH;
+    const int y   = bh_idx % NC_OUTH;
+    const int oc0 = ocb << 2;
+    if (oc0 >= NC_OC) return;
+
+    COMPUTE_FLOAT4 bv = CONVERT_COMPUTE_FLOAT4(vload4(ocb, bias));
+    COMPUTE_FLOAT4 a0=bv,a1=bv,a2=bv,a3=bv,a4=bv,a5=bv,a6=bv,a7=bv;
+
+    const int wbase_ocb = ocb * NC_IC * 9;
+
+    for (int ic = 0; ic < NC_IC; ic++) {
+        const int wbase_ic = wbase_ocb + ic * 9;
+        for (int kh = 0; kh < 3; kh++) {
+            const int iy = y + kh - 1;
+            if (iy < 0 || iy >= NC_INH) continue;
+            const int in_cstride = (NC_IC + 3) & ~3;
+            __global const FLOAT *row = input + ((b * in_cstride + ic) * NC_INH + iy) * NC_INW;
+
+            // 4 ALIGNED float4 loads spanning x0-4 .. x0+11; only r[-1..8] are used.
+            COMPUTE_FLOAT4 vm = (x0 >= 4) ? CONVERT_COMPUTE_FLOAT4(vload4((x0 >> 2) - 1, row))
+                                          : (COMPUTE_FLOAT4)0;
+            COMPUTE_FLOAT4 v0 = CONVERT_COMPUTE_FLOAT4(vload4((x0 >> 2),     row));
+            COMPUTE_FLOAT4 v1 = CONVERT_COMPUTE_FLOAT4(vload4((x0 >> 2) + 1, row));
+            COMPUTE_FLOAT4 v2 = (x0 + 8 < NC_INW) ? CONVERT_COMPUTE_FLOAT4(vload4((x0 >> 2) + 2, row))
+                                                 : (COMPUTE_FLOAT4)0;
+            // left halo column is 0 at the image edge, not a wrapped neighbour
+            const COMPUTE_FLOAT rm1 = (x0 >= 1) ? vm.w : (COMPUTE_FLOAT)0;
+            const COMPUTE_FLOAT r8  = (x0 + 8 < NC_INW) ? v2.x : (COMPUTE_FLOAT)0;
+
+            #define NCHW_TAP(KW, e0,e1,e2,e3,e4,e5,e6,e7)                              \
+                { COMPUTE_FLOAT4 wv = CONVERT_COMPUTE_FLOAT4(vload4(wbase_ic + kh*3 + (KW), weight)); \
+                  a0 = mad(wv, (COMPUTE_FLOAT4)(e0), a0); a1 = mad(wv, (COMPUTE_FLOAT4)(e1), a1); \
+                  a2 = mad(wv, (COMPUTE_FLOAT4)(e2), a2); a3 = mad(wv, (COMPUTE_FLOAT4)(e3), a3); \
+                  a4 = mad(wv, (COMPUTE_FLOAT4)(e4), a4); a5 = mad(wv, (COMPUTE_FLOAT4)(e5), a5); \
+                  a6 = mad(wv, (COMPUTE_FLOAT4)(e6), a6); a7 = mad(wv, (COMPUTE_FLOAT4)(e7), a7); }
+
+            NCHW_TAP(0, rm1,  v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z)
+            NCHW_TAP(1, v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w)
+            NCHW_TAP(2, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w, r8)
+            #undef NCHW_TAP
+        }
+    }
+
+#ifdef RELU
+    a0=fmax(a0,(COMPUTE_FLOAT4)0); a1=fmax(a1,(COMPUTE_FLOAT4)0);
+    a2=fmax(a2,(COMPUTE_FLOAT4)0); a3=fmax(a3,(COMPUTE_FLOAT4)0);
+    a4=fmax(a4,(COMPUTE_FLOAT4)0); a5=fmax(a5,(COMPUTE_FLOAT4)0);
+    a6=fmax(a6,(COMPUTE_FLOAT4)0); a7=fmax(a7,(COMPUTE_FLOAT4)0);
+#endif
+#ifdef RELU6
+    a0=clamp(a0,(COMPUTE_FLOAT4)0,(COMPUTE_FLOAT4)6); a1=clamp(a1,(COMPUTE_FLOAT4)0,(COMPUTE_FLOAT4)6);
+    a2=clamp(a2,(COMPUTE_FLOAT4)0,(COMPUTE_FLOAT4)6); a3=clamp(a3,(COMPUTE_FLOAT4)0,(COMPUTE_FLOAT4)6);
+    a4=clamp(a4,(COMPUTE_FLOAT4)0,(COMPUTE_FLOAT4)6); a5=clamp(a5,(COMPUTE_FLOAT4)0,(COMPUTE_FLOAT4)6);
+    a6=clamp(a6,(COMPUTE_FLOAT4)0,(COMPUTE_FLOAT4)6); a7=clamp(a7,(COMPUTE_FLOAT4)0,(COMPUTE_FLOAT4)6);
+#endif
+#ifdef PRELU
+    { COMPUTE_FLOAT4 sv = CONVERT_COMPUTE_FLOAT4(vload4(ocb, slope_ptr));
+      a0=select(a0*sv,a0,a0>=0); a1=select(a1*sv,a1,a1>=0);
+      a2=select(a2*sv,a2,a2>=0); a3=select(a3*sv,a3,a3>=0);
+      a4=select(a4*sv,a4,a4>=0); a5=select(a5*sv,a5,a5>=0);
+      a6=select(a6*sv,a6,a6>=0); a7=select(a7*sv,a7,a7>=0);
+    }
+#endif
+
+    // scatter back: each accumulator holds 4 CHANNELS of one pixel, and channels are far apart
+    // in NCHW -- this transpose-on-store is the structural cost of the layout.
+    const int plane = NC_OUTH * NC_OUTW;
+    // padded stride: writing the full float4 of channels is then always in bounds, even when
+    // out_channels is not a multiple of 4 (C=18/34/50 in the real model's heads)
+    const int out_cstride = (NC_OC + 3) & ~3;
+    __global FLOAT *o = output + ((b * out_cstride + oc0) * NC_OUTH + y) * NC_OUTW + x0;
+    #define NCHW_ST(I, A) { o[(I)] = (FLOAT)(A).x; o[(I)+plane] = (FLOAT)(A).y; \
+                            o[(I)+2*plane] = (FLOAT)(A).z; o[(I)+3*plane] = (FLOAT)(A).w; }
+    NCHW_ST(0,a0) NCHW_ST(1,a1) NCHW_ST(2,a2) NCHW_ST(3,a3)
+    NCHW_ST(4,a4) NCHW_ST(5,a5) NCHW_ST(6,a6) NCHW_ST(7,a7)
+    #undef NCHW_ST
+}
+
+// ---------------------------------------------------------------------------------------------
+// im2col + GEMM in NCHW (env MNN_CONV_IMGEMM=1).
+//
+// Retried because the reason it was rejected has been falsified. §H.13 killed im2col partly on the
+// cost of materialising the column matrix; §H.35 then measured that memory traffic on this device
+// costs approximately nothing at any size (a 6.9 MB intermediate round-trip is free). And §H.36
+// showed NCHW's efficiency improves with channel count, which is exactly the regime a GEMM wants.
+//
+// Under NCHW the shapes line up with no contortion: col is [K = C*9, M = B*H*W], the GEMM is
+// [OC, K] x [K, M], and its output [OC, M] IS the NCHW output -- no post-transform of the result,
+// only the final NC4HW4 repack that the surrounding engine requires.
+//
+// Requires 3x3 s1 p1 d1, W % 4 == 0, (H*W) % 8 == 0.
+
+// im2col: reads the NC4HW4 input DIRECTLY (no separate layout pass) and writes the NCHW column
+// matrix. One thread owns (channel block, tap, 4 consecutive output pixels): it reads 4 whole
+// float4s -- so the NC4HW4 side stays fully coalesced -- and scatters them into the 4 column rows
+// belonging to that block's 4 channels.
+__kernel
+void im2col_nchw(GLOBAL_SIZE_2_DIMS
+                 __global const FLOAT *input,   // NC4HW4
+                 __global FLOAT *col,           // [K = C*9][M]
+                 __private const int in_channels,
+                 __private const int batch,
+                 __private const int height,
+                 __private const int width) {
+    const int mq_idx  = get_global_id(0);   // 4 output pixels per thread
+    const int cbt_idx = get_global_id(1);   // channel_block * 9 + tap
+    DEAL_NON_UNIFORM_DIM2(mq_idx, cbt_idx);
+
+    const int plane = height * width;
+    const int M = batch * plane;
+    const int m0 = mq_idx << 2;
+    if (m0 >= M) return;
+
+    const int cb  = cbt_idx / 9;
+    const int tap = cbt_idx % 9;
+    const int kh = tap / 3, kw = tap % 3;
+
+    const int b   = m0 / plane;
+    const int rem = m0 % plane;
+    const int y   = rem / width;
+    const int x0  = rem % width;
+
+    const int iy = y + kh - 1;
+    const int K  = in_channels * 9;
+
+    COMPUTE_FLOAT4 v[4];
+    if (iy < 0 || iy >= height) {
+        v[0] = v[1] = v[2] = v[3] = (COMPUTE_FLOAT4)0;
+    } else {
+        const int rowbase = (((cb * batch + b) * height + iy) * width) << 2;
+        for (int i = 0; i < 4; i++) {
+            const int ix = x0 + i + kw - 1;
+            v[i] = (ix >= 0 && ix < width) ? CONVERT_COMPUTE_FLOAT4(vload4(0, input + rowbase + (ix << 2)))
+                                           : (COMPUTE_FLOAT4)0;
+        }
+    }
+    // scatter: lane L of the float4 is channel cb*4+L, i.e. column row (cb*4+L)*9 + tap
+    for (int lane = 0; lane < 4; lane++) {
+        const int c = (cb << 2) + lane;
+        if (c >= in_channels) break;
+        const int k = c * 9 + tap;
+        if (k >= K) break;
+        __global FLOAT *dst = col + (size_t)k * M + m0;
+        COMPUTE_FLOAT4 out4 = (COMPUTE_FLOAT4)(
+            (lane == 0 ? v[0].x : lane == 1 ? v[0].y : lane == 2 ? v[0].z : v[0].w),
+            (lane == 0 ? v[1].x : lane == 1 ? v[1].y : lane == 2 ? v[1].z : v[1].w),
+            (lane == 0 ? v[2].x : lane == 1 ? v[2].y : lane == 2 ? v[2].z : v[2].w),
+            (lane == 0 ? v[3].x : lane == 1 ? v[3].y : lane == 2 ? v[3].z : v[3].w));
+        vstore4(CONVERT_FLOAT4(out4), 0, dst);
+    }
+}
+
+// GEMM: [OC, K] x [K, M] -> [OC, M] == NCHW output. 4 output channels x 8 pixels per thread = 8
+// float4 accumulators, deliberately the same register class as conv_2d_c4h4w2 (§H.22's optimum).
+// Weights are pre-packed [ocb][k][4oc] so one k is one aligned float4 load covering 4 channels.
+__kernel
+void gemm_nchw_c4m8(GLOBAL_SIZE_2_DIMS
+                    __global const FLOAT *col,      // [K][M]
+                    __global const FLOAT *weight,   // [ocb][k][4]
+                    __global const FLOAT *bias,
+                    __global FLOAT *output,         // NCHW, channel stride padded to 4
+                    __private const int K,
+                    __private const int out_channels,
+                    __private const int batch,
+                    __private const int height,
+                    __private const int width
+                    #ifdef PRELU
+                    ,__global const FLOAT *slope_ptr
+                    #endif
+) {
+    const int mq_idx = get_global_id(0);   // 8 pixels per thread
+    const int ocb    = get_global_id(1);
+    DEAL_NON_UNIFORM_DIM2(mq_idx, ocb);
+
+    const int plane = height * width;
+    const int M = batch * plane;
+    const int m0 = mq_idx << 3;
+    if (m0 >= M) return;
+    const int oc0 = ocb << 2;
+    if (oc0 >= out_channels) return;
+
+    COMPUTE_FLOAT4 bv = CONVERT_COMPUTE_FLOAT4(vload4(ocb, bias));
+    COMPUTE_FLOAT4 a0=bv,a1=bv,a2=bv,a3=bv,a4=bv,a5=bv,a6=bv,a7=bv;
+
+    const int wbase = ocb * K;
+    for (int k = 0; k < K; k++) {
+        COMPUTE_FLOAT4 wv = CONVERT_COMPUTE_FLOAT4(vload4(wbase + k, weight));
+        __global const FLOAT *c = col + (size_t)k * M + m0;
+        COMPUTE_FLOAT4 c0 = CONVERT_COMPUTE_FLOAT4(vload4(0, c));
+        COMPUTE_FLOAT4 c1 = CONVERT_COMPUTE_FLOAT4(vload4(0, c + 4));
+        a0 = mad(wv, (COMPUTE_FLOAT4)(c0.x), a0);
+        a1 = mad(wv, (COMPUTE_FLOAT4)(c0.y), a1);
+        a2 = mad(wv, (COMPUTE_FLOAT4)(c0.z), a2);
+        a3 = mad(wv, (COMPUTE_FLOAT4)(c0.w), a3);
+        a4 = mad(wv, (COMPUTE_FLOAT4)(c1.x), a4);
+        a5 = mad(wv, (COMPUTE_FLOAT4)(c1.y), a5);
+        a6 = mad(wv, (COMPUTE_FLOAT4)(c1.z), a6);
+        a7 = mad(wv, (COMPUTE_FLOAT4)(c1.w), a7);
+    }
+
+#ifdef RELU
+    a0=fmax(a0,(COMPUTE_FLOAT4)0); a1=fmax(a1,(COMPUTE_FLOAT4)0);
+    a2=fmax(a2,(COMPUTE_FLOAT4)0); a3=fmax(a3,(COMPUTE_FLOAT4)0);
+    a4=fmax(a4,(COMPUTE_FLOAT4)0); a5=fmax(a5,(COMPUTE_FLOAT4)0);
+    a6=fmax(a6,(COMPUTE_FLOAT4)0); a7=fmax(a7,(COMPUTE_FLOAT4)0);
+#endif
+#ifdef RELU6
+    a0=clamp(a0,(COMPUTE_FLOAT4)0,(COMPUTE_FLOAT4)6); a1=clamp(a1,(COMPUTE_FLOAT4)0,(COMPUTE_FLOAT4)6);
+    a2=clamp(a2,(COMPUTE_FLOAT4)0,(COMPUTE_FLOAT4)6); a3=clamp(a3,(COMPUTE_FLOAT4)0,(COMPUTE_FLOAT4)6);
+    a4=clamp(a4,(COMPUTE_FLOAT4)0,(COMPUTE_FLOAT4)6); a5=clamp(a5,(COMPUTE_FLOAT4)0,(COMPUTE_FLOAT4)6);
+    a6=clamp(a6,(COMPUTE_FLOAT4)0,(COMPUTE_FLOAT4)6); a7=clamp(a7,(COMPUTE_FLOAT4)0,(COMPUTE_FLOAT4)6);
+#endif
+#ifdef PRELU
+    { COMPUTE_FLOAT4 sv = CONVERT_COMPUTE_FLOAT4(vload4(ocb, slope_ptr));
+      a0=select(a0*sv,a0,a0>=0); a1=select(a1*sv,a1,a1>=0);
+      a2=select(a2*sv,a2,a2>=0); a3=select(a3*sv,a3,a3>=0);
+      a4=select(a4*sv,a4,a4>=0); a5=select(a5*sv,a5,a5>=0);
+      a6=select(a6*sv,a6,a6>=0); a7=select(a7*sv,a7,a7>=0);
+    }
+#endif
+
+    const int b    = m0 / plane;
+    const int rem  = m0 % plane;
+    const int ocst = (out_channels + 3) & ~3;
+    __global FLOAT *o = output + ((size_t)b * ocst + oc0) * plane + rem;
+    #define GEMM_ST(I, A) { o[(I)] = (FLOAT)(A).x; o[(I)+plane] = (FLOAT)(A).y; \
+                            o[(I)+2*plane] = (FLOAT)(A).z; o[(I)+3*plane] = (FLOAT)(A).w; }
+    GEMM_ST(0,a0) GEMM_ST(1,a1) GEMM_ST(2,a2) GEMM_ST(3,a3)
+    GEMM_ST(4,a4) GEMM_ST(5,a5) GEMM_ST(6,a6) GEMM_ST(7,a7)
+    #undef GEMM_ST
+}
+
+// ---------------------------------------------------------------------------------------------
+// conv_2d_nchw_s2_c4w8 — NCHW 3x3 STRIDE-2 convolution (env MNN_CONV_NCHW=1 on a stride-2 conv).
+//
+// This is the case the model actually cares about: its stride-2 heads are 18->16 and 34->32, i.e.
+// UNALIGNED input channel counts, which is exactly where NC4HW4 pays its padding tax (Cin 18 is
+// computed as 20, Cin 34 as 36). The stride-1 sweep measured NCHW ahead by 4.7% at C=18 and 26.9%
+// at C=34, so the heads are the shapes where NCHW should look best -- and until now the NCHW path
+// was stride-1 only, so it had never been tried on them.
+//
+// One thread owns 4 output channels x 8 adjacent OUTPUT pixels = 8 float4 accumulators (same
+// register class as the stride-1 variant and as conv_2d_c4h4w2). Output pixel ox needs input
+// columns 2*ox-1 .. 2*ox+1, so 8 outputs span input columns 2*x0-1 .. 2*x0+15 -- covered by 5
+// ALIGNED float4 loads (x0 is a multiple of 8, so 2*x0 is a multiple of 16).
+// Requires 3x3, stride 2, dilation 1, pad 1, out_w % 8 == 0.
+__kernel
+void conv_2d_nchw_s2_c4w8(GLOBAL_SIZE_2_DIMS
+                          __global const FLOAT *input,    // NCHW
+                          __global const FLOAT *weight,   // [ocb][ic][kh][kw][4]
+                          __global const FLOAT *bias,
+                          __global FLOAT *output,         // NCHW
+                          __private const int in_channels,
+                          __private const int out_channels,
+                          __private const int batch,
+                          __private const int in_h,
+                          __private const int in_w,
+                          __private const int out_h,
+                          __private const int out_w
+                          #ifdef PRELU
+                          ,__global const FLOAT *slope_ptr
+                          #endif
+) {
+    const int ocw_idx = get_global_id(0);
+    const int bh_idx  = get_global_id(1);
+    DEAL_NON_UNIFORM_DIM2(ocw_idx, bh_idx);
+
+    const int w_blocks = NC_OUTW >> 3;
+    const int ocb = ocw_idx / w_blocks;
+    const int x0  = (ocw_idx % w_blocks) << 3;      // first OUTPUT column
+    const int b   = bh_idx / NC_OUTH;
+    const int y   = bh_idx % NC_OUTH;               // OUTPUT row
+    const int oc0 = ocb << 2;
+    if (oc0 >= NC_OC) return;
+
+    COMPUTE_FLOAT4 bv = CONVERT_COMPUTE_FLOAT4(vload4(ocb, bias));
+    COMPUTE_FLOAT4 a0=bv,a1=bv,a2=bv,a3=bv,a4=bv,a5=bv,a6=bv,a7=bv;
+
+    const int ix0 = x0 << 1;                        // input column of output column x0
+    const int in_cstride = (NC_IC + 3) & ~3;
+    const int wbase_ocb = ocb * NC_IC * 9;
+
+    for (int ic = 0; ic < NC_IC; ic++) {
+        const int wbase_ic = wbase_ocb + ic * 9;
+        for (int kh = 0; kh < 3; kh++) {
+            const int iy = (y << 1) + kh - 1;
+            if (iy < 0 || iy >= NC_INH) continue;
+            __global const FLOAT *row = input + ((b * in_cstride + ic) * NC_INH + iy) * NC_INW;
+
+            // aligned window ix0-4 .. ix0+15; only ix0-1 .. ix0+15 are consumed
+            COMPUTE_FLOAT4 vm = (ix0 >= 4) ? CONVERT_COMPUTE_FLOAT4(vload4((ix0 >> 2) - 1, row))
+                                           : (COMPUTE_FLOAT4)0;
+            COMPUTE_FLOAT4 v0 = CONVERT_COMPUTE_FLOAT4(vload4((ix0 >> 2),     row));
+            COMPUTE_FLOAT4 v1 = CONVERT_COMPUTE_FLOAT4(vload4((ix0 >> 2) + 1, row));
+            COMPUTE_FLOAT4 v2 = (ix0 +  8 < NC_INW) ? CONVERT_COMPUTE_FLOAT4(vload4((ix0 >> 2) + 2, row)) : (COMPUTE_FLOAT4)0;
+            COMPUTE_FLOAT4 v3 = (ix0 + 12 < NC_INW) ? CONVERT_COMPUTE_FLOAT4(vload4((ix0 >> 2) + 3, row)) : (COMPUTE_FLOAT4)0;
+            const COMPUTE_FLOAT rm1 = (ix0 >= 1) ? vm.w : (COMPUTE_FLOAT)0;
+
+            // offset o (from ix0) -> value; o runs -1..15 across the three taps
+            #define NCS2_V(O) ((O) < 0 ? rm1 : (O) < 4 ? ((O)==0?v0.x:(O)==1?v0.y:(O)==2?v0.z:v0.w) \
+                                             : (O) < 8 ? ((O)==4?v1.x:(O)==5?v1.y:(O)==6?v1.z:v1.w) \
+                                             : (O) <12 ? ((O)==8?v2.x:(O)==9?v2.y:(O)==10?v2.z:v2.w) \
+                                                       : ((O)==12?v3.x:(O)==13?v3.y:(O)==14?v3.z:v3.w))
+            #define NCS2_TAP(KW)                                                                  \
+                { COMPUTE_FLOAT4 wv = CONVERT_COMPUTE_FLOAT4(vload4(wbase_ic + kh*3 + (KW), weight)); \
+                  a0 = mad(wv, (COMPUTE_FLOAT4)(NCS2_V( 0 + (KW) - 1)), a0);                      \
+                  a1 = mad(wv, (COMPUTE_FLOAT4)(NCS2_V( 2 + (KW) - 1)), a1);                      \
+                  a2 = mad(wv, (COMPUTE_FLOAT4)(NCS2_V( 4 + (KW) - 1)), a2);                      \
+                  a3 = mad(wv, (COMPUTE_FLOAT4)(NCS2_V( 6 + (KW) - 1)), a3);                      \
+                  a4 = mad(wv, (COMPUTE_FLOAT4)(NCS2_V( 8 + (KW) - 1)), a4);                      \
+                  a5 = mad(wv, (COMPUTE_FLOAT4)(NCS2_V(10 + (KW) - 1)), a5);                      \
+                  a6 = mad(wv, (COMPUTE_FLOAT4)(NCS2_V(12 + (KW) - 1)), a6);                      \
+                  a7 = mad(wv, (COMPUTE_FLOAT4)(NCS2_V(14 + (KW) - 1)), a7); }
+            NCS2_TAP(0)
+            NCS2_TAP(1)
+            NCS2_TAP(2)
+            #undef NCS2_TAP
+            #undef NCS2_V
+        }
+    }
+
+#ifdef RELU
+    a0=fmax(a0,(COMPUTE_FLOAT4)0); a1=fmax(a1,(COMPUTE_FLOAT4)0);
+    a2=fmax(a2,(COMPUTE_FLOAT4)0); a3=fmax(a3,(COMPUTE_FLOAT4)0);
+    a4=fmax(a4,(COMPUTE_FLOAT4)0); a5=fmax(a5,(COMPUTE_FLOAT4)0);
+    a6=fmax(a6,(COMPUTE_FLOAT4)0); a7=fmax(a7,(COMPUTE_FLOAT4)0);
+#endif
+#ifdef RELU6
+    a0=clamp(a0,(COMPUTE_FLOAT4)0,(COMPUTE_FLOAT4)6); a1=clamp(a1,(COMPUTE_FLOAT4)0,(COMPUTE_FLOAT4)6);
+    a2=clamp(a2,(COMPUTE_FLOAT4)0,(COMPUTE_FLOAT4)6); a3=clamp(a3,(COMPUTE_FLOAT4)0,(COMPUTE_FLOAT4)6);
+    a4=clamp(a4,(COMPUTE_FLOAT4)0,(COMPUTE_FLOAT4)6); a5=clamp(a5,(COMPUTE_FLOAT4)0,(COMPUTE_FLOAT4)6);
+    a6=clamp(a6,(COMPUTE_FLOAT4)0,(COMPUTE_FLOAT4)6); a7=clamp(a7,(COMPUTE_FLOAT4)0,(COMPUTE_FLOAT4)6);
+#endif
+#ifdef PRELU
+    { COMPUTE_FLOAT4 sv = CONVERT_COMPUTE_FLOAT4(vload4(ocb, slope_ptr));
+      a0=select(a0*sv,a0,a0>=0); a1=select(a1*sv,a1,a1>=0);
+      a2=select(a2*sv,a2,a2>=0); a3=select(a3*sv,a3,a3>=0);
+      a4=select(a4*sv,a4,a4>=0); a5=select(a5*sv,a5,a5>=0);
+      a6=select(a6*sv,a6,a6>=0); a7=select(a7*sv,a7,a7>=0);
+    }
+#endif
+
+    const int plane = NC_OUTH * NC_OUTW;
+    const int out_cstride = (NC_OC + 3) & ~3;
+    __global FLOAT *o = output + ((b * out_cstride + oc0) * NC_OUTH + y) * NC_OUTW + x0;
+    #define NCS2_ST(I, A) { o[(I)] = (FLOAT)(A).x; o[(I)+plane] = (FLOAT)(A).y; \
+                            o[(I)+2*plane] = (FLOAT)(A).z; o[(I)+3*plane] = (FLOAT)(A).w; }
+    NCS2_ST(0,a0) NCS2_ST(1,a1) NCS2_ST(2,a2) NCS2_ST(3,a3)
+    NCS2_ST(4,a4) NCS2_ST(5,a5) NCS2_ST(6,a6) NCS2_ST(7,a7)
+    #undef NCS2_ST
+}
+
+// ---------------------------------------------------------------------------------------------
+// conv_2d_nchw_fused2 — TWO chained 3x3 convs in one NCHW kernel (env MNN_CONV_NCHW_FUSE2=1).
+//
+// The NCHW counterpart of conv_2d_3x3s1_fused2, built to close by MEASUREMENT what had only been
+// closed by argument: whether fusing consecutive convs behaves differently once the activations
+// are NCHW. Like the NC4HW4 original it applies the SAME weights twice, so it fits inside one conv
+// Execution and is validated against a numpy conv(conv(x)) reference.
+//
+// One workgroup owns a FUSE_T x FUSE_T output tile. conv2 over that tile needs conv1's output over
+// a (FUSE_T+2)^2 halo for ALL channels, which is staged in __local. Note the halo is the reason
+// fusion costs arithmetic: the workgroup computes (T+2)^2 mid-layer pixels to produce T^2 outputs,
+// so conv1 is recomputed ((T+2)/T)^2 times -- 1.78x at T=6.
+//
+// Register/LDS note: the intermediate needs (T+2)^2 * C values in EITHER layout (NC4HW4 stores
+// them as (T+2)^2 * C/4 float4, the same scalar count), so NCHW does not relax the capacity
+// bound that §H.25 identified -- only the addressing changes.
+#ifndef FUSE_T
+#define FUSE_T 6
+#endif
+#ifndef FUSE_C
+#define FUSE_C 32
+#endif
+#define FT2 (FUSE_T + 2)
+#define FUSE_CS ((FUSE_C + 3) & ~3)          /* padded channel stride of the NCHW scratch planes */
+#define FW(OC, IC, T) weight[((((OC) >> 2) * FUSE_C + (IC)) * 9 + (T)) * 4 + ((OC) & 3)]
+
+__kernel __attribute__((reqd_work_group_size(FUSE_T, FUSE_T, 1)))
+void conv_2d_nchw_fused2(GLOBAL_SIZE_2_DIMS
+                         __global const FLOAT *input,    // NCHW
+                         __global const FLOAT *weight,   // [ocb][ic][9][4]
+                         __global const FLOAT *bias,
+                         __global FLOAT *output,         // NCHW
+                         __private const int batch,
+                         __private const int height,
+                         __private const int width) {
+    __local COMPUTE_FLOAT mid[FUSE_C * FT2 * FT2];
+
+    const int out_x = get_global_id(0);
+    const int bh    = get_global_id(1);
+    const int lx = get_local_id(0), ly = get_local_id(1);
+    // gws is an exact multiple of lws, so there are no partial workgroups and no early return --
+    // an early return here would leave threads out of the barrier below and hang the group.
+    const int b     = bh / height;
+    const int out_y = bh % height;
+
+    const int mx0 = (out_x - lx) - 1;         // halo origin of the intermediate tile
+    const int my0 = (out_y - ly) - 1;
+    const int lid = ly * FUSE_T + lx, nthreads = FUSE_T * FUSE_T;
+    const int plane = height * width;
+
+    // ---- phase 1: conv1 over the (T+2)^2 halo, every channel, into LDS
+    for (int p = lid; p < FT2 * FT2; p += nthreads) {
+        const int ty = p / FT2, tx = p % FT2;
+        const int my = my0 + ty, mx = mx0 + tx;
+        // outside the image the intermediate is the zero pad conv2 will read
+        const bool inside = (my >= 0 && my < height && mx >= 0 && mx < width);
+        for (int oc0 = 0; oc0 < FUSE_C; oc0 += 4) {
+            COMPUTE_FLOAT a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+            if (inside) {
+                a0 = (COMPUTE_FLOAT)bias[oc0 + 0]; a1 = (COMPUTE_FLOAT)bias[oc0 + 1];
+                a2 = (COMPUTE_FLOAT)bias[oc0 + 2]; a3 = (COMPUTE_FLOAT)bias[oc0 + 3];
+                for (int ic = 0; ic < FUSE_C; ic++) {
+                    for (int kh = 0; kh < 3; kh++) {
+                        const int iy = my + kh - 1;
+                        if (iy < 0 || iy >= height) continue;
+                        __global const FLOAT *row = input + ((b * FUSE_CS + ic) * height + iy) * width;
+                        for (int kw = 0; kw < 3; kw++) {
+                            const int ix = mx + kw - 1;
+                            if (ix < 0 || ix >= width) continue;
+                            const COMPUTE_FLOAT v = (COMPUTE_FLOAT)row[ix];
+                            const int t = kh * 3 + kw;
+                            a0 = mad(v, (COMPUTE_FLOAT)FW(oc0 + 0, ic, t), a0);
+                            a1 = mad(v, (COMPUTE_FLOAT)FW(oc0 + 1, ic, t), a1);
+                            a2 = mad(v, (COMPUTE_FLOAT)FW(oc0 + 2, ic, t), a2);
+                            a3 = mad(v, (COMPUTE_FLOAT)FW(oc0 + 3, ic, t), a3);
+                        }
+                    }
+                }
+            }
+            mid[((oc0 + 0) * FT2 + ty) * FT2 + tx] = a0;
+            mid[((oc0 + 1) * FT2 + ty) * FT2 + tx] = a1;
+            mid[((oc0 + 2) * FT2 + ty) * FT2 + tx] = a2;
+            mid[((oc0 + 3) * FT2 + ty) * FT2 + tx] = a3;
+        }
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    // ---- phase 2: conv2 for this thread's pixel, reading the intermediate from LDS
+    for (int oc0 = 0; oc0 < FUSE_C; oc0 += 4) {
+        COMPUTE_FLOAT a0 = (COMPUTE_FLOAT)bias[oc0 + 0], a1 = (COMPUTE_FLOAT)bias[oc0 + 1];
+        COMPUTE_FLOAT a2 = (COMPUTE_FLOAT)bias[oc0 + 2], a3 = (COMPUTE_FLOAT)bias[oc0 + 3];
+        for (int mc = 0; mc < FUSE_C; mc++) {
+            for (int kh = 0; kh < 3; kh++) {
+                for (int kw = 0; kw < 3; kw++) {
+                    const COMPUTE_FLOAT v = mid[(mc * FT2 + ly + kh) * FT2 + lx + kw];
+                    const int t = kh * 3 + kw;
+                    a0 = mad(v, (COMPUTE_FLOAT)FW(oc0 + 0, mc, t), a0);
+                    a1 = mad(v, (COMPUTE_FLOAT)FW(oc0 + 1, mc, t), a1);
+                    a2 = mad(v, (COMPUTE_FLOAT)FW(oc0 + 2, mc, t), a2);
+                    a3 = mad(v, (COMPUTE_FLOAT)FW(oc0 + 3, mc, t), a3);
+                }
+            }
+        }
+        __global FLOAT *o = output + ((b * FUSE_CS + oc0) * height + out_y) * width + out_x;
+        o[0]         = (FLOAT)a0;
+        o[plane]     = (FLOAT)a1;
+        o[2 * plane] = (FLOAT)a2;
+        o[3 * plane] = (FLOAT)a3;
     }
 }
