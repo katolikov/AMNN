@@ -46,6 +46,9 @@ SPEC_ONLY = ["conv_2d_c8h8w1", "conv_2d_c8h4w1_pa", "conv_2d_c8h1w1", "conv_2d_c
              "conv_2d_c4h4w2", "conv_2d_c4h2w2", "conv_2d_c4h2w4", "conv_2d_c4h4w4"]
 # these hardcode stride 1; forcing them on a stride-2 conv silently measures the default instead
 STRIDE1_ONLY = ["conv_2d_c4h4w2", "conv_2d_c4h2w2", "conv_2d_c4h2w4", "conv_2d_c4h4w4"]
+# kernels that read the HC_* compile-time constants, i.e. respond to MNN_CONV_HARD=1.
+# Keep in sync with the .cl: a kernel listed here but not using the macros just measures twice.
+HARD_CAPABLE = ["conv_2d_c4h4w2", "conv_2d_c4h2w2", "conv_2d_c4h2w4", "conv_2d_c4h4w4"]
 LDS_TILES = ["16x4", "48x4", "16x12", "8x4", "24x4", "16x2"]
 
 
@@ -104,6 +107,7 @@ def main():
         print(f"   {f.name}  {(OUT/'bin'/f.name).stat().st_size/1e6:.1f} MB")
 
     man = {"variants": VARIANTS, "spec_only": SPEC_ONLY, "stride1_only": STRIDE1_ONLY,
+           "hard_capable": HARD_CAPABLE,
            "lds_tiles": LDS_TILES,
            "cores": [], "heads": [], "blocks": [], "correctness": {}}
 

@@ -203,6 +203,7 @@ def main(argv=None):
     variants = man["variants"]     # [kernel names]
     spec_only = set(man["spec_only"])
     stride1_only = set(man.get("stride1_only", []))
+    hard_capable = [v for v in man.get("hard_capable", []) if v in variants]
     tiles = man["lds_tiles"][:3] if a.quick else man["lds_tiles"]
     out_path = Path(a.out) if a.out else HERE / f"report_{serial}.md"
 
@@ -256,7 +257,7 @@ def main(argv=None):
         say(f"\n> This device **throttles under prolonged load** (observed dropping from 980 to "
             "~400-550 MHz after minutes of continuous GPU work). Mitigations used here: every A/B\n"
             "> comparison is **interleaved** (arms alternate, so drift hits both equally) and there are\n"
-            "> **cooldown pauses** between heavy sections. §14 re-measures the clock at the end — if it\n"
+            "> **cooldown pauses** between heavy sections. §15 re-measures the clock at the end — if it\n"
             "> dropped, sections are not comparable across time and should be re-run individually.\n")
     else:
         say("- could not read `/sys/kernel/gpu/gpu_clock` (timings unvalidated)\n")
@@ -313,8 +314,39 @@ def main(argv=None):
         say(f"- **{c['label']}** → default `{base:.1f}µs`, best strategy **`{best}` `{cand[best]:.1f}µs`** {verdict}")
     say("")
 
-    # ---- 5. stride-2 head pairs (per conv)
-    say("## 5. Stride-2 head pairs (per-conv µs, lower is better)\n")
+    # ---- 5. shape hardcoding
+    say("## 5. Shape hardcoding (MNN_CONV_HARD=1)\n")
+    if not hard_capable:
+        say("_(this bundle has no kernels that read the HC_* constants)_\n")
+    else:
+        say("> `MNN_CONV_HARD=1` passes the shape (in/out H,W, channel blocks, stride, pad, dilation)\n"
+            "> as **compile-time constants**, so index arithmetic folds and halo bounds collapse. Costs\n"
+            "> one cached program build per distinct shape. Only the kernels below read them.\n")
+        cols = ["MNN default"] + [x for v in hard_capable for x in (v, v + "+HARD")]
+        say("| shape | " + " | ".join(c.replace("conv_2d_", "") for c in cols) + " | best |")
+        say("|" + "---|" * (len(cols) + 2))
+        for c in cores:
+            cooldown(d, cool_s)
+            m, shp, dep = c["model"], c["shape"], c["depth"]
+            fns = {"MNN default": lambda i, m=m, shp=shp, c=c: conv_us(
+                run_model(d, m, shp, 120, cache=f"hd{c['key']}{i}.bin")[0], dep)}
+            for v in hard_capable:
+                base = ("MNN_CONV_SPEC=1 " if v in spec_only else "") + f"MNN_CONV_FORCE={v}"
+                fns[v] = (lambda i, e=base, v=v, m=m, shp=shp, c=c: conv_us(
+                    run_model(d, m, shp, 120, env=e, cache=f"hp{c['key']}{v[-5:]}{i}.bin")[0], dep))
+                fns[v + "+HARD"] = (lambda i, e="MNN_CONV_HARD=1 " + base, v=v, m=m, shp=shp, c=c: conv_us(
+                    run_model(d, m, shp, 120, env=e, cache=f"hh{c['key']}{v[-5:]}{i}.bin")[0], dep))
+            row = interleaved(fns, reps)
+            cand = {k: t for k, t in row.items() if t}
+            best = min(cand, key=lambda k: cand[k]) if cand else "-"
+            D.setdefault("hardcoding", {})[c["key"]] = dict(row)
+            say(f"| {c['label']} | " + " | ".join(f"{row[k]:.0f}" if row.get(k) else "-" for k in cols)
+                + f" | **{best.replace('conv_2d_','')}** |")
+        say("\n> If a `+HARD` column beats its plain twin, ship that kernel with the flag on. On the\n"
+            "> reference device this was worth an extra ~11 percentage points on the main core.\n")
+
+    # ---- 6. stride-2 head pairs (per conv)
+    say("## 6. Stride-2 head pairs (per-conv µs, lower is better)\n")
     heads = man.get("heads", [])
     if not heads:
         say("_(no head blocks in this bundle)_\n")
@@ -359,8 +391,8 @@ def main(argv=None):
                 "convs": {c["label"]: {k: row[k][c["tag"]] for k in head_vars} for c in h["convs"]}}
         say("")
 
-    # ---- 6. LDS tiles
-    say("## 6. LDS tile sweep\n")
+    # ---- 7. LDS tiles
+    say("## 7. LDS tile sweep\n")
     say("| shape | " + " | ".join(tiles) + " | best LDS | vs MNN default |")
     say("|" + "---|" * (len(tiles) + 3))
     for c in cores:
@@ -375,7 +407,7 @@ def main(argv=None):
     say("")
 
     # ---- 6. im2col + GEMM
-    say("## 7. im2col + GEMM (and implicit-GEMM headroom)\n")
+    say("## 8. im2col + GEMM (and implicit-GEMM headroom)\n")
     say("| shape | im2col | GEMM | total | MNN default | explicit verdict | **GEMM vs default** |")
     say("|---|---|---|---|---|---|---|")
     for c in cores:
@@ -398,7 +430,7 @@ def main(argv=None):
         "> straightforward if `sub_group_shuffle` is available (§3).\n")
 
     # ---- 7. Winograd: is it even selected, and does disabling it help?
-    say("## 8. Winograd vs direct\n")
+    say("## 9. Winograd vs direct\n")
     say("| shape | path MNN chose | default | Winograd OFF | verdict |")
     say("|---|---|---|---|---|")
     for c in cores:
@@ -427,7 +459,7 @@ def main(argv=None):
         "> GPU clock is LOW and memory is fast (arithmetic becomes the scarce resource).\n")
 
     # ---- 8. fused megakernel
-    say("## 9. Fused 2-layer megakernel\n")
+    say("## 10. Fused 2-layer megakernel\n")
     say("| shape | fused (2 layers) | 2x single conv | verdict |")
     say("|---|---|---|---|")
     for c in cores:
@@ -444,7 +476,7 @@ def main(argv=None):
     say("")
 
     # ---- 8. real blocks
-    say("## 10. Real model blocks (deployment numbers)\n")
+    say("## 11. Real model blocks (deployment numbers)\n")
     say("| block | plain | PReLU-fused | saving |")
     say("|---|---|---|---|")
     for b in man["blocks"]:
@@ -462,7 +494,7 @@ def main(argv=None):
     say("")
 
     # ---- 9. concurrency
-    say("## 11. Concurrency (2 independent streams)\n")
+    say("## 12. Concurrency (2 independent streams)\n")
     MIN = re.compile(r"min= ([\d.]+) ms")
     m0, shp0 = cores[0]["model"], cores[0]["shape"]
     def solo():
@@ -488,7 +520,7 @@ def main(argv=None):
         say("- probe failed\n")
 
     # ---- 10. correctness
-    say("## 12. Correctness (custom kernels vs MNN default output)\n")
+    say("## 13. Correctness (custom kernels vs MNN default output)\n")
     cc = man["correctness"]
     d.push(REFD / "cc_input.txt", f"{DEV}/tdir/input.txt")
     _, base_out = run_model(d, cc["model"], cc["shape"], 1, cache="k0.bin", pull=True)
@@ -512,7 +544,7 @@ def main(argv=None):
     say("")
 
     # ---- 11. what to do on this device
-    say("## 13. Recommendations for THIS device\n")
+    say("## 14. Recommendations for THIS device\n")
     recs = []
     for c in cores:
         if c["key"] in summary:
@@ -532,11 +564,11 @@ def main(argv=None):
         recs.append(f"📈 **{cu} compute units** — more occupancy headroom than the 8-CU reference; "
                     "wider/deeper tiles (c8h8w1) and fusion deserve a re-test here, they lost on "
                     "occupancy before.")
-    recs.append("⚙️ **PReLU fusion** (§10) is free and applies to every conv — keep it on.")
+    recs.append("⚙️ **PReLU fusion** (§11) is free and applies to every conv — keep it on.")
     for r in recs: say(f"- {r}")
 
     # ---- 12. clock re-check: did the device throttle over the run?
-    say("\n## 14. GPU clock at END of run (thermal validity check)\n")
+    say("\n## 15. GPU clock at END of run (thermal validity check)\n")
     cooldown(d, cool_s)
     s2c, _ = sample_clock(d, cores[0]["model"], cores[0]["shape"])
     clk_end = max(s2c) if s2c else 0
