@@ -178,6 +178,18 @@ static bool GemmlocalWSTune(const std::map<std::string, std::vector<TuneInfo>> &
     return true;
 }
     
+// MNN_GEMM_DEBUG=1 prints the GEMM problem size and the tile parameters actually selected.
+// Needed because nothing else identifies which XgemmBatched configuration ran: a shape whose N is
+// not divisible by any candidate NWG silently falls back to the 16x16 params_prefer tile, which
+// costs ~2x and looks identical in the profiler (FINDINGS §H.52).
+static void dumpGemmChoice(const char *why, const std::vector<uint32_t> &g, const std::vector<uint32_t> &p) {
+    if (nullptr == getenv("MNN_GEMM_DEBUG")) return;
+    MNN_PRINT("[GEMM] M=%u N=%u K=%u batch=%u -> %s | MWG=%u NWG=%u KWG=%u MDIMC=%u NDIMC=%u "
+              "VWM=%u VWN=%u SA=%u SB=%u  (threads/group=%u)\n",
+              g[0], g[1], g[2], g[4], why, p[4], p[7], p[0], p[3], p[6], p[12], p[13], p[8], p[9],
+              p[3] * p[6]);
+}
+
 std::vector<uint32_t> getGemmParams(const std::vector<uint32_t> &gemmSize, const std::vector<cl::Buffer> tensorMemory,
                                        OpenCLRuntime *runtime, int precision, int tuneLevel) {
     MNN_ASSERT(gemmSize.size() == 6); // M, N, K, Layout+Precision, Batch, Bias+GroupSize
@@ -201,6 +213,7 @@ std::vector<uint32_t> getGemmParams(const std::vector<uint32_t> &gemmSize, const
     info.emplace_back(precisionType);
     
     if (tunedGemmParams.find(info) != tunedGemmParams.end()) {
+        dumpGemmChoice("cached", gemmSize, tunedGemmParams[info]);
         return tunedGemmParams[info];
     }
     
@@ -236,7 +249,8 @@ std::vector<uint32_t> getGemmParams(const std::vector<uint32_t> &gemmSize, const
             params_prefer[5] = maxDivsorN / 4;
             params_prefer[6] = maxDivsorN / 4;
             params_prefer[7] = maxDivsorN;
-                
+
+            dumpGemmChoice("medium-prefer", gemmSize, params_prefer);
             return params_prefer;
         }
     }
@@ -263,6 +277,7 @@ std::vector<uint32_t> getGemmParams(const std::vector<uint32_t> &gemmSize, const
     }
     std::vector<uint32_t> tuneLwsRes;
     if(GemmlocalWSTune(tuneLws, gemmSize, tuneLwsRes, runtime, precision)){
+        dumpGemmChoice("tuneLws", gemmSize, tuneLwsRes);
         return tuneLwsRes;
     }
     
@@ -298,6 +313,7 @@ std::vector<uint32_t> getGemmParams(const std::vector<uint32_t> &gemmSize, const
                 return {16, 2, 8, 8, 64, 8, 8, 64, 0, 0, 1, 0, 4, 4};
             }
         }
+        dumpGemmChoice("tuneNone-prefer", gemmSize, params_prefer);
         return params_prefer;
     }
 
@@ -321,6 +337,24 @@ std::vector<uint32_t> getGemmParams(const std::vector<uint32_t> &gemmSize, const
         totalCombinations.push_back({16, 2, 8 , 8 , 16 , 8 , 8 , 128, 0, 0, 0, 0, 2, 8});
         totalCombinations.push_back({16, 2, 4, 4, 32, 8, 8, 32, 0, 0, 0, 0, 8, 2});
         totalCombinations.push_back({16, 2, 4, 4, 16, 8, 8, 32, 0, 0, 0, 0, 4, 2});
+
+        // --- tall-skinny GEMM (large M, small N): Winograd batchgemm at low output-channel counts.
+        // isCandidateValid() requires NWG to DIVIDE N exactly, and every stock candidate pairs a
+        // small NWG only with a small MWG. So any N that is an odd multiple of 16 (48, 80, 112...)
+        // rejects every NWG in {32,64,128} and falls back to params_prefer's 16x16 tile with just
+        // 16 threads per workgroup -- measured 1.83x off at equal FLOPs (FINDINGS §H.52).
+        // These keep 64-128 threads per group while respecting NWG|N. NWG=48 covers N=48/96/144
+        // exactly, with no padding waste.
+        // MNN_GEMM_NO_TALLSKINNY=1 removes them again, so the before/after arms can be interleaved
+        // in ONE binary on ONE cooled device (the only fair comparison here -- trap 6).
+        if (nullptr == getenv("MNN_GEMM_NO_TALLSKINNY")) {
+        totalCombinations.push_back({16, 2, 16, 16, 64 , 8 , 8 , 16 , 0, 0, 0, 0, 4, 2});
+        totalCombinations.push_back({16, 2, 16, 16, 128, 8 , 8 , 16 , 0, 0, 0, 0, 8, 2});
+        totalCombinations.push_back({16, 2, 8 , 8 , 32 , 8 , 8 , 16 , 0, 0, 0, 0, 4, 2});
+        totalCombinations.push_back({16, 2, 16, 16, 64 , 8 , 8 , 48 , 0, 0, 0, 0, 4, 2});
+        totalCombinations.push_back({16, 2, 16, 16, 32 , 8 , 8 , 48 , 0, 0, 0, 0, 2, 2});
+        totalCombinations.push_back({16, 2, 8 , 8 , 64 , 8 , 8 , 48 , 0, 0, 0, 0, 8, 2});
+        }
 
         if(tuneLevel < Fast) {
             totalCombinations.push_back({16, 2, 16, 16, 128, 8 , 8 , 64 , 0, 0, 1, 0, 8, 8});//4
@@ -357,10 +391,10 @@ std::vector<uint32_t> getGemmParams(const std::vector<uint32_t> &gemmSize, const
             {2},              // KWI
             {4, 8, 16},          // MDIMA
             {4, 8, 16},          // MDIMC
-            {16, 32, 64, 128}, // MWG
+            {16, 32, 48, 64, 128}, // MWG (48: odd-multiple-of-16 problem sizes, see §H.52)
             {8, 16},          // NDIMB
             {8, 16},          // NDIMC
-            {16, 32, 64, 128}, // NWG
+            {16, 32, 48, 64, 128}, // NWG
             {0},              // SA
             {0},              // SB
             {0, 1},           // STRM
@@ -555,6 +589,7 @@ std::vector<uint32_t> getGemmParams(const std::vector<uint32_t> &gemmSize, const
         tunedGemmParams.insert(std::make_pair(info, params_prefer));
     }
 
+    dumpGemmChoice("tuned", gemmSize, params_prefer);
     return params_prefer;
 }
 
