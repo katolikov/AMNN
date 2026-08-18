@@ -1596,3 +1596,114 @@ than NC4HW4's stride-4 scalar read, but both funnel through the same LDS bottlen
 cut LDS accesses per mad from ~1.1 to ~0.75 at the same 8-float4 register budget. That is ~1.5× on
 the binding resource against a 3.1× gap, so it is very unlikely to flip the result, but it is the one
 variant not built.
+
+### §H.47 — Literature review, and the biggest miss it exposed: IMAGE (texture) memory mode
+Searched the mobile-GPU conv literature for anything untried. The strongest and most repeated claim
+is one this investigation had structurally excluded: **mobile GPUs have a texture/L1 cache that is
+substantially faster than local memory, and image objects are the way to reach it.** Adreno's OpenCL
+best-practices paper reports local memory achieving only about half the performance of the texture
+cache for convolution; TMModel (ICS'25) reports **1.48–3.61x on individual kernels** purely from
+modelling 2D texture memory; TFLite's OpenCL backend and MNN both pack tensors into 4 channels
+specifically to match the image format.
+
+**Why we never tested it:** an earlier session hit `Alloc Image -40` and a device REBOOT on tensors
+wider than the max 2D image size, and buffer mode was mandated globally from then on. That was a
+correct response to a *wide-tensor* failure that was then over-generalised — the conv_bench cores are
+tiny in image terms (<=768x72) and never re-tested. **The entire investigation ran in buffer mode on
+an assumption.**
+
+**Measured, fair comparison** (single conv, `act=none`, so identical work in both modes; both
+verified bit-exact against the CPU backend, cosine 1.000000; median of 3, cooled):
+| core | buffer | **image** | |
+|---|---|---|---|
+| 32→32@72×96 | **119.0** | 147.5 | +24.0% |
+| **48→48@36×48** | 100.0 | **67.3** | **−32.7%** |
+| 96→96@18×24 | 56.0 | 54.5 | −2.8% |
+
+**−32.7% on the 48-core is the largest single win found in this entire investigation** — larger than
+forced Winograd (−13%) and than c4h4w2+HARD on its best shape (−18.7%). Image mode runs the conv as a
+3-kernel decomposition (`Convolution0/1/2`, ~70 us/conv total) rather than one direct kernel.
+
+**Two caveats, both important, neither fatal:**
+1. **Image mode silently DROPS the fused PReLU.** On the PReLU-fused core models, image output
+   disagrees with buffer (cosine 0.457) while matching the CPU backend (0.999995) — because CPU and
+   the image backend both ignore `leakyReluSlope`, which only the buffer conv implements (§E). The
+   first image-mode measurement was therefore an artifact: it was doing less work. Anyone adopting
+   image mode must either port the PReLU fusion to the image backend or pay an unfused PReLU kernel
+   (estimated ~6 us at this output size, so the win would survive at roughly −28% — ESTIMATE, not
+   measured).
+2. The win is shape-dependent in the opposite direction to Winograd: image wins the 48-core and
+   loses the 32-core, where forced Winograd also loses. The two levers cover different shapes.
+
+**Process note.** This was nearly recorded twice as a wrong result: first as a −34.5% win that was
+really an unfused PReLU, then very nearly as "image mode is broken" when the true reading was that
+image agrees with CPU and *buffer* is the one applying an extra (correct) activation. Comparing a new
+arm against the previous GPU arm was not enough; only the CPU backend as an independent ground truth
+separated the two explanations.
+
+### §H.48 — Remaining untried strategies, ranked from the literature
+| rank | strategy | evidence | why it is still open here |
+|---|---|---|---|
+| 1 | **Image/texture memory** (above) | 1.48–3.61x (TMModel); Adreno guide | measured **−32.7%** on the 48-core; needs the PReLU fusion ported |
+| 2 | **INT8 + `cl_khr_integer_dot_product`** | 1.67x GEMM, **2.45x** with INT8 Winograd on Mali G52 | the extension **is exposed on this device** and completely unused; needs a quantised model, so it is an accuracy trade |
+| 3 | **Winograd F(4,3)** | 4x FLOP cut vs F(2,3)'s 2.25x, at 2.25x memory | §H.35 measured memory as ~free here, which is exactly the trade F(4,3) wants; risk is fp16 numerics, which are genuinely worse for F(4,3) |
+| 4 | **Command batching / fewer flushes** | mobile queues hold ~2 outstanding entries, so the CPU feeds the GPU continuously | attacks the ~915 us fixed submission cost (§H.32), not kernel time; MNN's record/replay queue is the vehicle |
+| 5 | Constant memory for weights | TFLite reports it helps "very thin layers" | small channel counts are exactly that case; MNN buffer path does not use `__constant` |
+
+Items 1 and 2 are the only ones with measured multi-x evidence behind them. Item 1 is already
+half-confirmed on this device.
+
+### §H.49 — Idea 5, constant-memory weights: no effect in EITHER layout (and the reason is clear)
+Added a `WEIGHT_AS` address-space macro so the conv weight pointer can live in `__constant`
+(`-DWEIGHT_AS=__constant`), wired to `MNN_CONV_CONSTW=1` with a host-side size gate against
+`CL_DEVICE_MAX_CONSTANT_BUFFER_SIZE` (new `OpenCLRuntime::getMaxConstantBufferSize()`). Applied to
+**both layouts**: `conv_2d_c4h4w2` (NC4HW4) and `conv_2d_nchw_c4w8` (NCHW). All arms correct
+(cosine 1.000000 / 0.99998+).
+
+| core | weights | c4h4w2 | +constW | NCHW | +constW |
+|---|---|---|---|---|---|
+| 32→32@72×96 | 18 KB | 110.0 | 110.0 | 113.0 | 111.0 |
+| 48→48@36×48 | 40 KB | 114.0 | 114.0 | 127.0 | 127.0 |
+| 96→96@18×24 | 162 KB | 52.0 | 52.0 | 50.0 | 49.0 |
+
+**Nothing, to the digit, on the NC4HW4 kernel; ≤2% on NCHW, inside noise.**
+
+**Why — and it is diagnosable from the device, not guessed.** ANGLE reports
+`CL_DEVICE_MAX_CONSTANT_BUFFER_SIZE = 1073741824` (1 GB). A real dedicated constant cache is on the
+order of 64 KB; a 1 GB "limit" means `__constant` is simply backed by the same storage as `__global`
+on this stack. The corroborating evidence is that the **162 KB** weight set at C=96 was accepted
+without complaint — a genuine constant buffer would have rejected it. The TFLite result that
+motivated this is specific to **Qualcomm Adreno's physical constant memory**, which this
+ANGLE→Vulkan→RDNA path does not expose.
+
+⇒ **Idea 5 falsified, cheaply, and it does not generalise off Adreno.** Kept env-gated (default off)
+because the macro is one line per kernel and a device with real constant memory would benefit.
+
+**Bug found on the way (worth recording — it broke ALL arms, not just the new one).** The
+`#ifndef WEIGHT_AS` block was first placed next to the NCHW macros, ~3000 lines *after*
+`conv_2d_c4h4w2`, so the token was unexpanded at its first use and every program using that kernel
+failed to build — presenting as `NO OUTPUT` on two of three cores while the third still passed from
+a cached binary. In a single `.cl` translation unit a macro must precede its first use, and the
+obvious fix (put it at the top) is wrong here because the first `__kernel` sits inside
+`#ifdef CONV_LOCAL_SIZE` (trap 4). It now lives immediately before the HC macro block, which is
+unconditional and precedes every kernel that uses it. Trap 3 (a `"` in a comment) also struck again.
+
+### §H.50 — Idea 3, Winograd F(4,3): scoped, NOT yet built
+MNN ships **only** the `2_3_1` transforms — `winoTransSrcBuf2_3_1`, `winoTransDstBuf2_3_1`,
+`winoTransWeightBuf2_3_1` — in both the buffer and image paths. There is no F(4,3) anywhere in the
+codebase to enable, so this is a from-scratch build, not a flag:
+- a new 6×6 **source** transform (`B^T d B`),
+- a new 6×6→4×4 **dest** transform (`A^T m A`),
+- host wiring for `UNIT=4` (`Math::WinogradGenerater` is already generic in `computeUnit`, so the
+  weight transform itself is free — only the GPU layout kernel is unit-named).
+
+**The correctness risk is the matrices, not the code.** The GPU source/dest transforms must use
+exactly the interpolation points `WinogradGenerater(4, 3, interp)` produces, or the result is subtly
+wrong rather than obviously broken; they have to be extracted from the host generator and hardcoded,
+not taken from a paper. Additionally F(4,3) is numerically worse than F(2,3), and this engine runs
+**fp16** — so an accuracy gate against the CPU backend is mandatory, not optional.
+
+**Status: designed and scoped, not implemented.** Recorded rather than half-built. Note the standing
+rejection of F(4,3) in §F is a *cost model*, not a measurement, and it was computed for the hero conv
+(batch 8, 96ch, 64×64) — not for these cores, and not on a device where §H.35 has since measured
+memory traffic as free, which is precisely the trade F(4,3) makes.

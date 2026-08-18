@@ -721,6 +721,23 @@ ErrorCode ConvBufExecution::onResize(const std::vector<Tensor *> &inputs, const 
         // converts out, so the result is CORRECT and the conv kernel is directly comparable; the two
         // conversion kernels are timed separately (they are the cost this experiment is told to
         // ignore). 3x3 / stride 1 / dilation 1 / pad 1 only.
+        // MNN_CONV_CONSTW=1: put the conv weights in __constant. Only legal when they actually
+        // fit in the device's constant buffer, so the size is checked here rather than discovered
+        // as a build failure. 3x3 fp16 weights are icNum*ocNum*9*2 bytes: 18 KB at C=32, 40 KB at
+        // C=48, 162 KB at C=96 -- so on a 64 KB limit the 96-channel core cannot use this at all.
+        bool useConstW = false;
+        if (nullptr != getenv("MNN_CONV_CONSTW")) {
+            const size_t elemSize = (mOpenCLBackend->getPrecision() != BackendConfig::Precision_High)
+                                    ? sizeof(half_float::half) : sizeof(float);
+            const size_t wBytes = (size_t)inputChannels * outChannel
+                                  * mResource->mKernelWidth * mResource->mKernelHeight * elemSize;
+            const size_t limit = (size_t)mOpenCLBackend->getOpenCLRuntime()->getMaxConstantBufferSize();
+            useConstW = (limit > 0 && wBytes <= limit);
+            if (nullptr != getenv("MNN_CONV_NCHW_DEBUG")) {
+                MNN_PRINT("[CONSTW] weights=%zu B limit=%zu B -> %d\n", wBytes, limit, (int)useConstW);
+            }
+        }
+
         // MNN_CONV_IGEMM=1 (NC4HW4) or =nchw : LDS-tiled implicit GEMM. In NC4HW4 mode it reads
         // and writes MNN's native layout directly, so it needs no conversion kernels at all; in
         // nchw mode it borrows the existing NCHW conversion pair. Layout is the ONLY difference
@@ -1000,6 +1017,7 @@ ErrorCode ConvBufExecution::onResize(const std::vector<Tensor *> &inputs, const 
                 ncPut("NC_BATCH","batch",batch);
                 ncPut("NC_INH","in_h",inputHeight);      ncPut("NC_INW","in_w",inputWidth);
                 ncPut("NC_OUTH","out_h",height);         ncPut("NC_OUTW","out_w",width);
+                if (useConstW) { buildOption.emplace("-DWEIGHT_AS=__constant"); }
                 // §H.34 lesson: a build option that silently fails to reach the kernel looks like
                 // "the lever does not help", not like an error. Make it observable.
                 if (nullptr != getenv("MNN_CONV_NCHW_DEBUG")) {
@@ -1361,6 +1379,7 @@ ErrorCode ConvBufExecution::onResize(const std::vector<Tensor *> &inputs, const 
                 hcPut("HCWB","out_w_blocks",UP_DIV(width, itemW[knl_idx]));
                 hcPut("HCHB","out_h_blocks",UP_DIV(height, itemH[knl_idx]));
             }
+            if (useConstW) { buildOption.emplace("-DWEIGHT_AS=__constant"); }
             if(outputShape.at(3) % itemC[knl_idx] != 0){
                 buildOption.emplace("-DCHANNEL_BOUNDARY_PROTECT");
             }

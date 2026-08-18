@@ -2480,6 +2480,16 @@ void conv_2d_3x3s2_lds(GLOBAL_SIZE_2_DIMS
 }
 
 
+// ---- weight address space: __global by default, __constant under MNN_CONV_CONSTW ----
+// Mobile GPUs keep a small dedicated constant/uniform cache that is cheaper to hit than the general
+// L1 path. TFLite's OpenCL backend reports it helping specifically for very thin layers, which is
+// exactly this model's regime, and MNN's IMAGE-mode conv kernels already use __constant while the
+// BUFFER path never does. The host only selects it when the weights actually fit in
+// CL_DEVICE_MAX_CONSTANT_BUFFER_SIZE -- otherwise the build silently falls back or fails.
+#ifndef WEIGHT_AS
+  #define WEIGHT_AS __global
+#endif
+
 // ---- shape access: runtime args by default, compile-time constants under MNN_CONV_HARD ----
 //
 // The HOST supplies every HC* name as a -D build option (ConvBufExecution's hcPut): the runtime
@@ -2531,7 +2541,7 @@ void conv_2d_3x3s2_lds(GLOBAL_SIZE_2_DIMS
 // checks collapse wherever the tile is provably interior. Costs one program build per shape.
 __kernel
 void conv_2d_c4h4w2(GLOBAL_SIZE_2_DIMS
-                      __global const FLOAT *input, __global const FLOAT *weight,
+                      __global const FLOAT *input, WEIGHT_AS const FLOAT *weight,
                       __global const FLOAT *bias, __global FLOAT *output,
                       __private const int2 in_hw, __private const int inChannel,
                       __private const int in_c_blocks, __private const int batch,
@@ -5681,7 +5691,7 @@ void cvt_nchw_to_nc4hw4(GLOBAL_SIZE_2_DIMS
 __kernel
 void conv_2d_nchw_c4w8(GLOBAL_SIZE_2_DIMS
                        __global const FLOAT *input,    // NCHW
-                       __global const FLOAT *weight,   // [ocb][ic][kh][kw][4]
+                       WEIGHT_AS const FLOAT *weight,  // [ocb][ic][kh][kw][4]
                        __global const FLOAT *bias,
                        __global FLOAT *output,         // NCHW
                        __private const int in_channels,

@@ -105,6 +105,7 @@ public:
     uint64_t GetKernelWaveSize(std::shared_ptr<KernelWrap> kernel);
     std::vector<uint32_t> getMaxWorkItemSizes();
     uint64_t getMaxLocalMem() const;
+    uint64_t getMaxConstantBufferSize() const;   /* CL_DEVICE_MAX_CONSTANT_BUFFER_SIZE */
     uint32_t getUseRecordableQueueSize(){
         return mUseRecordableQueueSize;
     }
@@ -208,6 +209,7 @@ private:
     uint32_t mGPUComputeUnits;
     uint32_t mMaxFreq;
     uint64_t mMaxMemAllocSize;
+    uint64_t mMaxConstantBufferSize = 0;
     uint64_t mMaxLocalMemSize;
     uint32_t mMaxThreadsPerDevice;
     uint32_t mMaxWorkGroupSize;

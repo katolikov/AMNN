@@ -284,6 +284,7 @@ OpenCLRuntime::OpenCLRuntime(int platformSize, int platformId, int deviceId, voi
             mFirstGPUDevicePtr->getInfo(CL_DEVICE_MAX_CLOCK_FREQUENCY, &mMaxFreq);
             mFirstGPUDevicePtr->getInfo(CL_DEVICE_MAX_MEM_ALLOC_SIZE, &mMaxMemAllocSize);
             mFirstGPUDevicePtr->getInfo(CL_DEVICE_LOCAL_MEM_SIZE, &mMaxLocalMemSize);
+            mFirstGPUDevicePtr->getInfo(CL_DEVICE_MAX_CONSTANT_BUFFER_SIZE, &mMaxConstantBufferSize);
             mMaxWorkGroupSize = mFirstGPUDevicePtr->getInfo<CL_DEVICE_MAX_WORK_GROUP_SIZE>();
 
 
@@ -755,6 +756,10 @@ std::vector<uint32_t> OpenCLRuntime::getMaxWorkItemSizes() {
 
 uint64_t OpenCLRuntime::getMaxLocalMem() const {
     return mMaxLocalMemSize;
+}
+
+uint64_t OpenCLRuntime::getMaxConstantBufferSize() const {
+    return mMaxConstantBufferSize;
 }
 double OpenCLRuntime::getCostTime(const cl::Event *event){
     //cl_int res = mCommandQueuePtr->finish();
