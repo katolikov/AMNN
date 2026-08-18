@@ -215,6 +215,10 @@ OpenCLRuntime::OpenCLRuntime(int platformSize, int platformId, int deviceId, voi
                 MNN_PRINT("[HWINFO] global_mem_bytes=%llu\n", (unsigned long long)_d.getInfo<CL_DEVICE_GLOBAL_MEM_SIZE>());
                 MNN_PRINT("[HWINFO] pref_vec_half=%u native_vec_half=%u\n", (unsigned)_d.getInfo<CL_DEVICE_PREFERRED_VECTOR_WIDTH_HALF>(), (unsigned)_d.getInfo<CL_DEVICE_NATIVE_VECTOR_WIDTH_HALF>());
                 MNN_PRINT("[HWINFO] pref_vec_float=%u\n", (unsigned)_d.getInfo<CL_DEVICE_PREFERRED_VECTOR_WIDTH_FLOAT>());
+                MNN_PRINT("[HWINFO] image2d_max_width=%zu image2d_max_height=%zu\n",
+                          (size_t)_d.getInfo<CL_DEVICE_IMAGE2D_MAX_WIDTH>(), (size_t)_d.getInfo<CL_DEVICE_IMAGE2D_MAX_HEIGHT>());
+                MNN_PRINT("[HWINFO] image_support=%d max_read_image_args=%u\n",
+                          (int)_d.getInfo<CL_DEVICE_IMAGE_SUPPORT>(), (unsigned)_d.getInfo<CL_DEVICE_MAX_READ_IMAGE_ARGS>());
                 MNN_PRINT("[CL_EXT] %s\n", deviceextensions.c_str());
                 MNN_PRINT("[CL_EXT] has_subgroup_shuffle=%d\n", (int)(deviceextensions.find("cl_khr_subgroup_shuffle")!=std::string::npos));
             }

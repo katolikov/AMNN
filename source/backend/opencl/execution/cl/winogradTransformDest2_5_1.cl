@@ -7,13 +7,20 @@ __kernel void winogradTransformDest(__read_only image2d_t uInput, // 0
                                     __private const int unitWidth, // 3
                                     __private const int unitHeight, __private const int dstWidth,
                                     __private const int dstHeight, // 6
-                                    __private const int dstChannelC4, __private const int batchOffset) {
+                                    __private const int dstChannelC4, __private const int batchOffset
+#ifdef PRELU
+                                    , __read_only image2d_t uSlope
+#endif
+) {
     int2 pos = (int2)(get_global_id(0), get_global_id(1)); 
     if (pos.x < unitWidth*unitHeight && pos.y < dstChannelC4) {
         int unitWidth_idx = pos.x % unitWidth;
         int unitHeight_idx = pos.x / unitWidth;
         int srcY       = pos.y * unitHeight + unitHeight_idx;
         FLOAT4 bias    = RI_F(uBias, SAMPLER, (int2)(pos.y, 0));
+#ifdef PRELU
+        FLOAT4 slope   = RI_F(uSlope, SAMPLER, (int2)(pos.y, 0));
+#endif
         
         {
             int oyStart = unitHeight_idx * 2;
@@ -79,6 +86,9 @@ __kernel void winogradTransformDest(__read_only image2d_t uInput, // 0
 #ifdef RELU6
                     res = clamp(res, (FLOAT4)(0), (FLOAT4)(6));
 #endif
+#ifdef PRELU
+                    res = fmax(res, (FLOAT4)(0)) + slope * fmin(res, (FLOAT4)(0));
+#endif
                     WI_F(uOutput, (int2)(imageOx, imageOy), res);
                 }
             }
@@ -94,6 +104,9 @@ __kernel void winogradTransformDest(__read_only image2d_t uInput, // 0
 #endif
 #ifdef RELU6
                     res = clamp(res, (FLOAT4)(0), (FLOAT4)(6));
+#endif
+#ifdef PRELU
+                    res = fmax(res, (FLOAT4)(0)) + slope * fmin(res, (FLOAT4)(0));
 #endif
                     WI_F(uOutput, (int2)(imageOx, imageOy), res);
                 }
@@ -111,6 +124,9 @@ __kernel void winogradTransformDest(__read_only image2d_t uInput, // 0
 #ifdef RELU6
                     res = clamp(res, (FLOAT4)(0), (FLOAT4)(6));
 #endif
+#ifdef PRELU
+                    res = fmax(res, (FLOAT4)(0)) + slope * fmin(res, (FLOAT4)(0));
+#endif
                     WI_F(uOutput, (int2)(imageOx, imageOy), res);
                 }
             }
@@ -126,6 +142,9 @@ __kernel void winogradTransformDest(__read_only image2d_t uInput, // 0
 #endif
 #ifdef RELU6
                     res = clamp(res, (FLOAT4)(0), (FLOAT4)(6));
+#endif
+#ifdef PRELU
+                    res = fmax(res, (FLOAT4)(0)) + slope * fmin(res, (FLOAT4)(0));
 #endif
                     WI_F(uOutput, (int2)(imageOx, imageOy), res);
                 }

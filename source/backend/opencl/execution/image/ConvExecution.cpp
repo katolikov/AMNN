@@ -75,6 +75,33 @@ ConvCommonExecution::ConvCommonExecution(const Op *op, Backend *backend, bool is
     }
     copyBufferToImage(runtime, biasBuffer, openCLImage(mResource->mBias.get()), UP_DIV(biasSize, 4), 1, mOpenCLBackend->getPrecision());
 
+    // Fused per-channel PReLU written by the converter into Convolution2DCommon.leakyReluSlope
+    // (pass gated on MNN_FUSE_CONV_PRELU). The kernels in conv_2d.cl already implement -DPRELU
+    // with the slope as an image indexed by out_channel_block_idx; only this upload was missing.
+    auto slopeVec = conv2dParams->common()->leakyReluSlope();
+    bool hasFusedSlope = (!isExtra && slopeVec != nullptr && slopeVec->size() >= (size_t)biasSize);
+    if(hasFusedSlope){
+        cl::Buffer slopeBuffer(runtime->context(), CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR, buffer_size);
+        cl_int slopeErr;
+        auto slopePtrCL = runtime->commandQueue().enqueueMapBuffer(
+            slopeBuffer, true, CL_MAP_WRITE, 0, buffer_size, nullptr, nullptr, &slopeErr);
+        if(slopePtrCL != nullptr && slopeErr == CL_SUCCESS){
+            ::memset(slopePtrCL, 0, ALIGN_UP8(biasSize) * sizeof(float));
+            ::memcpy(slopePtrCL, slopeVec->data(), biasSize * sizeof(float));
+        }else{
+            MNN_ERROR("Map error slopePtrCL == nullptr \n");
+        }
+        runtime->commandQueue().enqueueUnmapMemObject(slopeBuffer, slopePtrCL);
+        mResource->mSlope.reset(Tensor::createDevice<float>({1, 1, 1, biasSize}));
+        if (!(backend->onAcquireBuffer(mResource->mSlope.get(), Backend::STATIC))) {
+            mConvComValid = false;
+            return;
+        }
+        copyBufferToImage(runtime, slopeBuffer, openCLImage(mResource->mSlope.get()),
+                          UP_DIV(biasSize, 4), 1, mOpenCLBackend->getPrecision());
+        mResource->mPrelu = true;
+    }
+
     if(isExtra){
         const PRelu* preluParam = flatbuffers::GetRoot<PRelu>(op->main_as_Extra()->attr()->GetAs<Attribute>(1)->tensor()->uint8s()->data());
         const float *slopeDataPtr = preluParam->slope()->data();
