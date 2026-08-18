@@ -1707,3 +1707,401 @@ not taken from a paper. Additionally F(4,3) is numerically worse than F(2,3), an
 rejection of F(4,3) in §F is a *cost model*, not a measurement, and it was computed for the hero conv
 (batch 8, 96ch, 64×64) — not for these cores, and not on a device where §H.35 has since measured
 memory traffic as free, which is precisely the trade F(4,3) makes.
+
+---
+
+# Session C — IMAGE (texture) memory mode: audited, unblocked, and measured across the shape space
+
+### §H.51 — Image mode: the PReLU blocker is fixed, and the win is REAL but shape-gated (two mechanisms)
+
+**Scope decisions for this session** (agreed up front): mechanism-and-boundary before kernel ports;
+PReLU fusion must be ported so fused models keep working; `conv_bench` shapes only (no `pipeline/`
+wide tensors); and **no accuracy regression anywhere** — every arm gated against the CPU backend.
+
+#### 0. Device image limits, queried FIRST (trap 5)
+Added to the existing `MNN_DUMP_CL_EXT=1` HWINFO block in `OpenCLRuntime.cpp`:
+```
+[HWINFO] image2d_max_width=16384 image2d_max_height=16384
+[HWINFO] image_support=1 max_read_image_args=128
+```
+MNN maps an NC4HW4 tensor to an image of `W*ceil(C/4)` x `N*H`. The whole conv_bench suite is
+under 5% of the limit (worst: 32-core at 768x72; worst winograd intermediate 3072x576).
+`pipeline/`'s 1920-wide tensors are safe only to C=32 (15360); at C=64 they need 30720 and are the
+reboot case. **The limit is on `W*ceil(C/4)`, not on W** — that is why it bites wide tensors so
+suddenly as channels grow. The report now checks every shape against it and SKIPS over-limit ones.
+
+#### 1. §H.47's headline was partly a Winograd-gate confound — now separated
+The two backends select Winograd differently:
+```c
+// ConvBufWinograd::valid  (buffer)   ic>=32 && oc>=32 && input->width() < output->channel()
+// ConvWinograd::valid     (image)    ic>=32 && oc>=32                    // no width clause
+```
+`48->48@36x48` has `in_w=48, out_c=48`, so `48<48` is false: **buffer refuses Winograd, image takes
+it.** §H.47 therefore compared buffer-DIRECT against image-WINOGRAD. Re-measured on `single_*.mnn`
+(`act=none`, identical work), all arms cosine **1.000000** vs the CPU backend:
+
+| core | buffer default | buffer forced-wino | image | **image vs buffer @ matched algorithm** |
+|---|---|---|---|---|
+| 32->32@72x96 | 125.0 | 149.0 | 147.5 | **-1.0%** |
+| 48->48@36x48 | 99.0 | 89.0 | **67.3** | **-24.4%** |
+| 96->96@18x24 | 54.0 | 51.9 | 56.4 | **+8.7%** |
+
+⇒ the 48-core's -32% is **~10 points Winograd gate + ~24 points image path**. Both real; the gate
+part is reachable in buffer mode with `MNN_FORCE_WINOGRAD=1` and needs no mode switch.
+
+#### 2. The PReLU blocker: SMALLER than briefed, in a different file, and now FIXED
+The brief assumed the fusion had to be ported to "the image conv kernels". Actual state:
+- `conv_2d.cl` (image **direct** path) **already implements** per-channel PReLU — `#ifdef PRELU`,
+  slope as an `image2d_t` indexed by `out_channel_block_idx`, in every variant. It was simply
+  unreachable: `ConvExecution` sets `mPrelu` only from the `Extra`-op path and never read
+  `common()->leakyReluSlope()`.
+- `ConvWinograd` + `winogradTransformDest2_3_1.cl` had **no PReLU at all** — and that is the path
+  all three cores actually take in image mode.
+
+**Ported (mirrors the shipped buffer patch of §E):**
+- `cl/winogradTransformDest2_3_1.cl` **and** `2_5_1` — trailing `#ifdef PRELU __read_only image2d_t
+  uSlope`, slope read beside the bias, `res = fmax(res,0) + slope*fmin(res,0)` at all 4 outputs.
+  (Both files: `buildOptions` are shared by `formatStr`, so patching only 2_3_1 would break 5x5.)
+- `image/ConvWinograd.{hpp,cpp}` — `mSlope` image + `mHasPRelu` on the shared resource, slope upload
+  mirroring the bias image, `-DPRELU`, trailing `setArg(9)`.
+- `image/ConvExecution.cpp` — upload the slope and set `mPrelu` when `leakyReluSlope()` is present,
+  so the already-written direct-path kernels finally engage.
+
+**Correctness gate — note the design, it is the whole point.** CPU *ignores* `leakyReluSlope`, so
+the fused model on CPU is the WRONG answer. Ground truth = **CPU on the UNFUSED model**:
+
+| arm | Block1 | Block2 |
+|---|---|---|
+| buffer, fused (shipped reference) | 0.999989 | 0.999991 |
+| **image, fused (this port)** | **1.000000** | **0.999999** |
+| image, unfused (control) | 1.000000 | 0.999999 |
+| *CPU, fused* — shows the bug the gate must catch | *0.740910* | *0.651223* |
+
+The failure mode is loud (0.65–0.74), so this gate cannot silently pass a missing port.
+
+**Cost of the fusion in image mode: ZERO, measured.** core_48 image was **67.9 µs before the port
+and 67.9 µs after** (median of 3, identical raws). §H.47's estimate — "~6 µs, so the win drops to
+about -28%" — was pessimistic; the slope is absorbed into an already memory-bound store, exactly as
+in the buffer winograd dest kernel. **The -32.8% survives the port intact.**
+
+#### 3. Mechanism: it is NOT "texture memory is faster". It is TWO specific kernel facts.
+Per-stage decomposition of the Winograd pipeline (`Convolution0`=source, `1`=gemm, `2`=dest):
+
+| core | buffer gemm | buffer transforms | image gemm | image transforms |
+|---|---|---|---|---|
+| 32->32@72x96 | 66.0 | 72.0 | 63.0 | **86.5** |
+| 48->48@36x48 | **55.0** | 34.0 | **31.5** | 36.4 |
+| 96->96@18x24 | 30.0 | 20.0 | 33.5 | 21.7 |
+
+**The 48-core win is entirely in the GEMM stage; the 32-core loss is entirely in the transforms.**
+The decisive detail: `m432*n48*k48` and `m108*n96*k96` are **both 995k MACs — identical work** — yet
+buffer takes 55.0 vs 30.0 µs (1.83x worse on the tall-skinny one) while image is flat at 31.5/33.5.
+
+*Why:* buffer runs a general CLBlast-style `XgemmBatched` (`matmul_params_buf.cl`, tile params from
+`getGemmParams`); image runs a Winograd-specialised `gemmWinograd`/`gemmWinogradW2` pair autotuned
+over `itemW` = 4 or 8. The general GEMM degrades on tall-skinny (large m, small n=out-channels); the
+specialised one does not. Image's transforms are the weaker half, and their penalty scales with
+spatial size.
+
+**A second, independent win exists on the DIRECT path.** At C=16/24 the image gate falls through to
+`(oc*oh*ow)/(ic*kh) <= 5`, which fails, so image runs a **single** kernel — verified from the
+profiler (`Convolution0` alone, vs `Convolution0/1/2` at C=48). There, image direct beats buffer
+direct by **-24.7% / -30.5%** with no Winograd involved at all. That is the texture-cache effect the
+literature actually predicts, and it was invisible in the 3-core set.
+
+#### 4. Boundary sweep — image wins 7 of 14 shapes, and the rule is channel-count
+PReLU-fused 6-deep chains, cooled + interleaved, `conv_all_us`, 3 reps:
+
+| shape | buffer default | buffer forced-wino | **image** | image vs default | image vs best buffer |
+|---|---|---|---|---|---|
+| 16->16@72x96 | 45.0 | 74.9 | **33.9** | **-24.7%** | -24.7% |
+| 24->24@72x96 | 85.0 | 128.0 | **59.1** | **-30.5%** | -30.5% |
+| 32->32@72x96 | 118.7 | 141.0 | 148.2 | +24.9% | +24.9% |
+| 48->48@72x96 | 264.3 | 293.0 | **215.9** | **-18.3%** | -18.3% |
+| 64->64@72x96 | 281.0 | 287.0 | 303.0 | +7.8% | +7.8% |
+| 16->16@36x48 | 25.0 | 33.0 | **23.2** | -7.0% | -7.0% |
+| 32->32@36x48 | 58.0 | 48.0 | **47.5** | -18.2% | -1.1% |
+| **48->48@36x48** | 101.0 | 87.8 | **67.8** | **-32.9%** | **-22.9%** |
+| 64->64@36x48 | 82.9 | 83.9 | 92.0 | +11.0% | +11.0% |
+| 96->96@36x48 | 126.8 | 123.8 | 155.0 | +22.2% | +25.2% |
+| 32->32@18x24 | 30.0 | 30.0 | **22.3** | **-25.8%** | -25.8% |
+| 48->48@18x24 | 40.0 | 40.9 | **30.0** | **-24.9%** | -24.9% |
+| 96->96@18x24 | 51.0 | 52.0 | 55.1 | +8.1% | +8.1% |
+| 32->32@144x192 | 380.0 | 583.0 | 544.8 | +43.4% | +43.4% |
+
+**The rule: image wins at C <= 48 and loses at C >= 64**, with one spatial correction — at C=32 it
+flips with spatial size (wins 18x24 and 36x48, loses 72x96 and 144x192), because that is where the
+transform penalty overtakes the gemm gain. Both mechanisms in §3 point the same way: the gemm
+advantage is a *small-n* effect, so it decays exactly as channels grow.
+
+This directly contradicts the natural reading of the 3-core set, which suggested a single lucky
+shape. It is a **region**, and it covers the low-channel convs that this model is full of.
+
+#### 5. Deployment numbers — the real blocks
+PReLU-fused, whole-graph kernel time and conv-only, 3 reps interleaved:
+
+| block | metric | buffer default | buffer forced-wino | **image** |
+|---|---|---|---|---|
+| Block1 `1x18x288x384` | whole graph | **1404** | 1577 (+12.3%) | 1537 (+9.5%) |
+| | conv only | **927** | 1071 (+15.5%) | 951 (+2.5%) |
+| **Block2** `1x34x144x192` | whole graph | 1059 | 1017 (-4.0%) | **800 (-24.5%)** |
+| | conv only | 825 | 776 (-5.9%) | **457 (-44.6%)** |
+
+**Block2 at -24.5% whole-graph is the largest end-to-end win found in this entire investigation** —
+against PReLU fusion's -8/9% per block and forced Winograd's -4%. Block1 regresses 9.5% and must
+stay on buffer. Since `gpuMode` is per-Interpreter, a split pipeline can choose **per model**, so
+this is directly usable, not a global trade.
+
+#### 6. Audit of §B–§H.50 against image mode
+Full table in `conv_bench/IMAGE_MODE_PLAN.md`. Summary: **1 blocker ported (PReLU)**, **2 real ports
+remaining** (shape hardcoding; `c4h4w2` into the image direct family, which has only
+`c4h1w4`/`c8h4w1`/`c4h4w1`), **1 untested mechanism now identified** (`mWeightUseBuffer` is Mali-only,
+so on this device image mode puts **weights in a texture** — distinct from the `__constant` idea
+§H.49 falsified), **1 meaningless** (NCHW — image storage *is* NC4HW4 by construction), and
+**12 already closed for layout-independent reasons** (im2col, implicit GEMM, layer fusion, LLC,
+cross-layer, 16-acc tiles, space2depth, subgroup, `__constant`, LDS, split-K, F(4,3) unbuilt).
+Notably, image mode ships `winogradTransform{Source,Dest}2_5_1` — a 5x5 Winograd the buffer path
+does not have.
+
+#### 7. What to do
+1. **Ship image mode for low-channel convs / models.** On this device: `C <= 48`, spatial at or
+   below 72x96 for C=32. Block2 gets -24.5% for a config-file change.
+2. **Keep buffer for C >= 64 and for large-spatial C=32.** Block1 regresses in image mode.
+3. **The real prize is not the mode switch.** §3 localises the win to buffer's `XgemmBatched` being
+   1.83x off on tall-skinny GEMM at equal FLOPs. Fixing *that* would give buffer mode the gemm win
+   while keeping its better transforms — plausibly beating both current modes. That is the highest-
+   value follow-up this session produced, and it is a buffer-path fix, not an image-path one.
+
+#### 8. Harness / reproducibility
+- `session_measure.run()` and `bundle_run_report.run_model()` now take `mode=` (68 buffer / 132
+  image) and `ftype=` (3 OpenCL / 0 CPU).
+- New report **§17 "Memory mode: buffer vs IMAGE (texture)"** — per shape: image dims vs the queried
+  device limit (over-limit shapes are SKIPPED, not run), buffer default, buffer forced-wino
+  (**the matched-algorithm control**), image, and a **CPU correctness gate** whose mismatch means the
+  PReLU port is missing from the build under test. §1 now reports `image2d_max_*`.
+- **Build note:** no second build tree is needed or wanted. `execution/buffer/` and `execution/image/`
+  are GLOBbed into the *same* `libMNN_CL.so`; mode is purely runtime. With `MNN_SEP_BUILD=ON` an
+  OpenCL edit relinks in **2.05 s** measured. Two trees would also break the interleaving discipline
+  (trap 6) that every fair comparison here depends on.
+
+### §H.52 — The tall-skinny GEMM defect in `XgemmBatched`: root-caused, FIXED, and measured
+
+§H.51 localised image mode's win to the GEMM stage and predicted the fix belonged in the **buffer**
+path. It does. This is a selection bug, not a kernel bug.
+
+#### Root cause — one divisibility rule, instrumented not inferred
+`OpenCLGemmTune.cpp::isCandidateValid` opens with:
+```c
+if(gemmSize[0] % mwg != 0 || gemmSize[1] % nwg != 0) return false;   // MWG|M and NWG|N, exactly
+```
+Every stock candidate offers `NWG` in {16, 32, 64, 128}, and pairs a *small* NWG only with a *small*
+MWG. So when `N_pack` is an **odd multiple of 16** — 48, 80, 112, 144 — every NWG above 16 is
+rejected, no Wide candidate has `NWG=16` at all, and the GEMM falls through to
+`params_prefer = {…MWG=16, NWG=16, MDIMC=4, NDIMC=4…}`: a 16x16 tile with **16 threads per
+workgroup**. The exhaustive branch cannot rescue it either — its MWG/NWG lists were also
+{16,32,64,128}.
+
+Added `MNN_GEMM_DEBUG=1`, which prints the problem size and the tile actually chosen (nothing in the
+profiler distinguishes XgemmBatched configurations — trap 4). Measured, buffer + forced Winograd:
+
+| core | M x N x K | tile MWG x NWG | **threads/group** |
+|---|---|---|---|
+| 32->32@72x96 | 1728 x 32 x 32 | 16 x 32 | 32 |
+| **48->48@36x48** | **448 x 48 x 48** | **16 x 16** | **16** |
+| 96->96@18x24 | 128 x 96 x 96 | 64 x 32 | 128 |
+
+The 48-core runs with **8x fewer threads per group** than the 96-core, on 8 CUs. That is the whole
+1.83x-at-equal-FLOPs gap of §H.51.
+
+**Why `N_pack=48`:** `mCo=48` is not `> 64`, so `mAlignN` stays 16 and
+`N_pack = ROUND_UP(48,16) = 48`. It is the *conv's output-channel count* that decides.
+
+#### The fix
+Six extra candidates in the `tuneLevel >= Wide` list — `NWG=16` paired with **large** MWG (64/128),
+and **`NWG=48`**, which divides N=48/96/144 exactly and so costs **no padding waste**; plus `48`
+added to the exhaustive MWG/NWG lists. These are ordinary tuner candidates: every valid one is
+built and benchmarked, so a slower one is never selected. Gated by `MNN_GEMM_NO_TALLSKINNY=1`
+(removes them) purely so both arms live in one binary and can be interleaved (trap 6).
+
+After the fix the 48-core selects `MWG=64 NWG=48`, **64 threads/group**.
+
+#### Measured — forced Winograd, cooled, interleaved, `conv_all_us`, CPU-gated
+| core | buffer default | wino + stock gemm | **wino + FIXED gemm** | fix delta |
+|---|---|---|---|---|
+| 32->32@72x96 | 120.0 | 145.0 | 142.0 | −2.1% (noise; N=32 was never starved) |
+| **48->48@36x48** | 101.0 | 88.0 | **67.0** | **−23.9%** |
+| 96->96@18x24 | 53.0 | 51.0 | 50.0 | −2.0% (noise) |
+
+Correctness unchanged, stock vs fixed identical to 6 digits (0.999998 / 0.999995 / 1.000000 vs CPU
+on the unfused twin).
+
+**On the 48-core, buffer + fixed GEMM now MATCHES image mode: 67.0 vs 67.8 µs.** That is the §H.51
+prediction confirmed — and it is the better place for the win to live, since buffer keeps the fused
+PReLU natively and carries none of image mode's wide-tensor risk.
+
+#### It is also a DEFAULT-path win, no flags required
+Regression sweep over shapes where MNN selects Winograd **by itself**:
+
+| shape | stock | fixed | |
+|---|---|---|---|
+| 64->64@72x96 | 290.6 | 288.0 | −0.9% |
+| 64->64@36x48 | 81.9 | 82.9 | +1.2% |
+| 96->96@36x48 | 125.8 | 125.8 | +0.0% |
+| 96->96@18x24 | 50.0 | 51.0 | +2.0% |
+| 32->32@18x24 | 28.0 | 30.0 | +7.1% → **noise**: at 5 reps 29.0 vs 30.0, raws 28–31 vs 29–31 overlap |
+| **48->48@18x24** | 41.0 | **33.0** | **−19.5%, with no flags at all** |
+
+Both movers are N=48. Everything else is inside the ±6% noise floor of §H.29. The `32->32@18x24`
+row is worth noting as a process point: the tuner picked a *different but equally fast* config
+between runs (`MDIMC` 4→8, 32→64 threads, both ~29 µs), which is tuner timing noise, not a
+regression caused by the new candidates.
+
+#### Real blocks (cooled — the first attempt was thrown away, see below)
+| block | metric | buffer default | +fixed gemm | wino + fixed gemm | image |
+|---|---|---|---|---|---|
+| Block1 | whole graph | **1410** | 1403 (−0.5%) | 1568 (+11.2%) | 1546 (+9.6%) |
+| **Block2** | whole graph | 1055 | 1061 (+0.6%) | **881 (−16.5%)** | **806 (−23.6%)** |
+| | conv only | 824 | 824 (+0.0%) | **645 (−21.7%)** | **456 (−44.7%)** |
+
+The fix improves Block2's forced-Winograd arm from 1017 (§H.51) to **881**, i.e. −4.0% → **−16.5%**.
+It does nothing on the *default* arm because MNN does not select Winograd for those convs unaided —
+the gate of §H.29 is still what blocks it.
+
+**Image is still ahead on Block2 (806 vs 881), and the reason is now specific.** Block2 also
+contains two stride-2 head convs that run on the DIRECT path, where image wins independently
+(§H.51 measured image-direct beating buffer-direct by 25–30% at C=16/24). Post-fix breakdown of
+buffer's Block2 conv time: winograd transforms **228 µs**, batchgemm 204 µs, the two direct head
+convs 139 + 79 µs. **The transforms are now the largest single item** — with the gemm fixed, they
+are the next bottleneck, not the gemm.
+
+**Throttling trap, again (trap 6).** The first Block2 run produced raws like `[2449, 1530, 1384]`
+and `[2104, 1746, 826]` — a 3x spread — after Block1 had heated the device. Those numbers were
+discarded, not reported; the table above is a separate run after a 120 s cooldown with 25 s between
+reps, raws tight to ±1 (`[1056, 1055, 1055]`). A median over a throttling ramp is meaningless, and
+it would have shown image mode *losing* on Block2.
+
+#### Status and scope
+**Default ON**, deliberately, against this project's usual default-OFF convention: this is a
+selection blind spot rather than a speculative strategy, the autotuner benchmarks every candidate
+before choosing it, and no real regression was found. `MNN_GEMM_NO_TALLSKINNY=1` restores the old
+behaviour. Note `getGemmParams` is shared with `MatmulBufExecution`, `SelfAttentionBufExecution` and
+`StrassenMatmulOpenCLComputor` — those paths gain the same candidates, and the same benchmark
+protection, but were **not** measured here. The cost is 6 extra candidates to benchmark per unique
+GEMM shape at tune time.
+
+**Next bottleneck, now identified:** the Winograd source/dest transform kernels, which are 228 µs of
+Block2's 645 µs post-fix conv time and were already the reason image mode loses the large-spatial
+shapes (§H.51 §3).
+
+### §H.53 — Winograd selection gate re-derived and FIXED; transform kernels attacked and FALSIFIED
+
+Two follow-ups from §H.52, one a win and one a well-mechanised negative.
+
+---
+
+#### Part 1 — the selection gate: `in_w < out_c` → `in_w <= 2 * out_c`
+
+**The §H.29 fit was stale.** It was measured before the tall-skinny GEMM fix, which changed the
+economics of exactly the shapes the gate governs. Re-swept all 14 shapes with the fixed GEMM
+(cooled, interleaved, `conv_all_us`, default vs forced Winograd):
+
+| C | HxW | in_w | default | forced wino | delta | vs §H.29 |
+|---|---|---|---|---|---|---|
+| 16 | 72x96 | 96 | 45.0 | 71.9 | +59.8% | loss (same) |
+| 24 | 72x96 | 96 | 85.0 | 128.0 | +50.6% | loss (same) |
+| 32 | 72x96 | 96 | 118.7 | 142.0 | +19.6% | loss (same) |
+| **48** | **72x96** | 96 | 264.3 | **214.0** | **−19.0%** | **FLIPPED from +11.9%** |
+| 64 | 72x96 | 96 | 278.0 | 279.7 | +0.6% | control |
+| 16 | 36x48 | 48 | 26.0 | 33.0 | +26.8% | loss (same) |
+| **32** | 36x48 | 48 | 58.0 | 46.0 | **−20.7%** | win (was −24.7%) |
+| **48** | 36x48 | 48 | 101.7 | **66.9** | **−34.2%** | win, much bigger (was −13.3%) |
+| 64 | 36x48 | 48 | 82.9 | 82.9 | +0.0% | control |
+| 96 | 36x48 | 48 | 125.8 | 124.8 | −0.8% | control |
+| **32** | 18x24 | 24 | 31.0 | 28.0 | **−9.7%** | win (was +1.7%) |
+| 48 | 18x24 | 24 | 33.0 | 33.0 | +0.1% | control |
+| 96 | 18x24 | 24 | 50.0 | 51.0 | +2.0% | control |
+| 32 | 144x192 | 192 | 380.0 | 580.0 | +52.6% | loss (same) |
+
+**Fitting the coefficient.** With the `ic>=32 && oc>=32` floor retained, testing
+`in_w <= K * out_c`:
+
+| K | missed wins | admitted losses |
+|---|---|---|
+| 1.0 (stock, strict `<`) | 2 | 0 |
+| 1.5 (§H.29's proposal) | 1 | 0 |
+| **2.0** | **0** | **0** |
+| 2.5 | 0 | 0 |
+| 3.0 | 0 | 1 |
+
+The binding constraints are `48->48@72x96` (needs K >= 2.0) and `32->32@72x96` (needs K < 3.0).
+**K = 2** is the conservative end of the admissible band and classifies all 14 shapes correctly.
+Note §H.29's own proposal of 1.5 would now MISS the `48->48@72x96` win — the GEMM fix moved it.
+
+Implemented in `ConvBufWinograd::valid`; `MNN_WINOGRAD_GATE_OLD=1` restores the stock clause.
+**Caveat, unchanged from §H.29: this is a fit on ONE device and MNN's heuristic is global.**
+
+---
+
+#### Part 2 — the transform kernels: two optimisations, both FALSIFIED
+
+Per-launch decomposition of the 48-core showed src ≈ 20 µs, gemm ≈ 22, dst ≈ 19 — the two
+transforms are **64% of conv time**. Traffic analysis: src moves ~1.33 MB, which at ~460 GB/s is
+2.9 µs, so at 20 µs it runs **6.9x off the bandwidth floor** — latency/instruction bound, with
+apparent headroom.
+
+**Attempt 1 — `_w2`, two tiles per work-item.** Adjacent tiles overlap by 2 input columns (−25%
+loads) and land on consecutive destination slots, so every store becomes a `vstore2` (−50% store
+instructions). Correct (cosine 0.999999, identical to stock).
+**Result: +29.2% — SLOWER.** Controls in the same interleaved run: gemm −1.2%, dst +2.1%.
+*Mechanism:* 24 loaded columns + 32 accumulators ≈ **56 live FLOAT4**, far past the register cliff
+this investigation already measured (§H.8/§H.22: 8 accumulators optimal, 16 catastrophic), and it
+halves the thread count on a device where every previous result says occupancy dominates.
+**This was a self-inflicted repeat** — the register-cliff finding was on file and should have
+excluded the design before it was built.
+
+**Attempt 2 — `_fast`, bounds-check elimination only.** Identical register footprint and thread
+count; the 16 per-tap bounds tests hoisted into a single interior test. Correct (0.999999).
+**Result: +1.4% / +1.1%, against control drift of +2.4% / +1.3% in the same runs ⇒ NO EFFECT.**
+The clspv→SPIR-V toolchain evidently already handles these cheaply.
+
+**Why neither works — the transform is one-third launch overhead.** Fitting src time against
+work-item count across three cores:
+
+| core | work-items | src µs |
+|---|---|---|
+| 96->96@18x24 | 2592 | 14.0 |
+| 48->48@36x48 | 5184 | 21.8 |
+| 32->32@72x96 | 13824 | 44.7 |
+
+`src_us = 7.3 + 2.711 per 1000 work-items` (predicts 14.3 / 21.4 / 44.8 — an excellent fit).
+**~7.3 µs is FIXED per-launch overhead: 34% of the transform at the 48-core**, and two transform
+launches per conv means ~15 µs/conv that no kernel change can touch. The remaining variable part is
+~4.9x off the bandwidth floor and latency-bound, and the standard fix for that — more work per
+thread — is exactly what the register cliff forbids.
+
+⇒ **The transforms are at their practical floor for this kernel structure.** Reducing them further
+needs either dispatch batching (§H.32, attacks fixed cost, not kernel time) or a change to the
+intermediate layout that breaks the GEMM's contract. Both kernels are kept selectable via
+`MNN_WINO_SRC=stock|fast|w2`; **default is `stock`**, since shipping a measured no-op is only risk.
+
+---
+
+#### Combined result — GEMM fix + gate fix, DEFAULT path, no flags
+Cooled, interleaved, gated against CPU on the unfused twin. Baseline = stock MNN
+(`MNN_GEMM_NO_TALLSKINNY=1 MNN_WINOGRAD_GATE_OLD=1`).
+
+| target | metric | stock MNN | **both fixes** | | cos vs CPU |
+|---|---|---|---|---|---|
+| 32->32@72x96 | conv | 119.0 | 119.0 | +0.0% | 0.999995 |
+| **48->48@36x48** | conv | 101.0 | **67.0** | **−33.7%** | 0.999999 |
+| 96->96@18x24 | conv | 51.0 | 50.0 | −1.9% | 0.999996 |
+| Block1 | whole graph | 1403 | 1400 | −0.2% | 0.999984 |
+| **Block2** | whole graph | 1058 | **889** | **−16.0%** | 0.999999 |
+
+Block2 raws `[1054,1058,1061]` → `[889,886,890]`. **−16.0% end-to-end with no flags and no model
+change**, from two selector fixes. Block1 is correctly left alone: its convs are large-spatial and
+low-channel, exactly where the gate should say no.
+
+For reference, image mode on Block2 is 806 µs. Buffer has closed most of the gap (1058 → 889 vs
+806); the residual is the stride-2 head convs on the direct path, where image wins independently
+(§H.51).

@@ -50,7 +50,8 @@ def list_devices():
 
 
 # --------------------------------------------------------------- device run helpers
-def run_model(d, model, shape, loops, env="", cache="p.bin", pull=False, timeout=600):
+def run_model(d, model, shape, loops, env="", cache="p.bin", pull=False, timeout=600,
+              mode=68, ftype=3):
     """Push model+input.json, run ModuleBasic, return (stdout, output_floats_or_None)."""
     inj = HERE / "_input.json"
     inj.write_text(json.dumps({"inputs": [{"name": "input", "shape": shape}],
@@ -59,8 +60,8 @@ def run_model(d, model, shape, loops, env="", cache="p.bin", pull=False, timeout
     d.push(MODELS / model, f"{DEV}/{model}")
     if pull:
         d.shell(f"rm -rf {DEV}/output"); d.shell(f"mkdir -p {DEV}/output")
-    out = d.shell(f"cd {DEV} && {env} LD_LIBRARY_PATH=. ./ModuleBasic.out {model} tdir 0 3 "
-                  f"{loops} 68 2 {cache} 2>&1", timeout=timeout)
+    out = d.shell(f"cd {DEV} && {env} LD_LIBRARY_PATH=. ./ModuleBasic.out {model} tdir 0 {ftype} "
+                  f"{loops} {mode} 2 {cache} 2>&1", timeout=timeout)
     vals = None
     if pull:
         p = HERE / "_out.txt"
@@ -289,10 +290,16 @@ def main(argv=None):
             if "has_subgroup_shuffle" in ln: shuffle = ln.strip().endswith("=1")
             elif not exts: exts = ln.replace("[CL_EXT]", "").strip()
     for k in ("name", "max_compute_units", "max_clock_mhz", "local_mem_bytes",
-              "max_work_group_size", "pref_vec_half", "native_vec_half", "driver_version"):
+              "max_work_group_size", "pref_vec_half", "native_vec_half", "driver_version",
+              "image2d_max_width", "image2d_max_height"):
         if k in hw: say(f"- **{k}**: `{hw[k]}`")
     say(f"- **subgroup_shuffle**: `{shuffle}`")
     D["hw"] = dict(hw); D["hw"]["subgroup_shuffle"] = shuffle
+    # numeric, because §17 gates every image-mode shape against these (a tensor over the limit can
+    # REBOOT the device, not merely fail to allocate)
+    for k in ("image2d_max_width", "image2d_max_height"):
+        try: D["hw"][k] = int(hw.get(k, 0))
+        except ValueError: D["hw"][k] = 0
     if exts: say(f"\n<details><summary>CL extensions</summary>\n\n```\n{exts}\n```\n</details>\n")
 
     # ---- 2. clock at the START (re-checked at the end; see §12)
@@ -760,8 +767,164 @@ def main(argv=None):
         "> where this could flip. This GEMM is deliberately simple — no LDS tiling of the column\n"
         "> matrix — so treat a loss here as a bound, not a proof. Reference outcome: §H.38.\n\n")
 
+    # ---- image (texture) memory mode vs buffer
+    say("\n## 17. Memory mode: buffer vs IMAGE (texture)\n")
+    say("> `gpuMode` 68 = `MNN_GPU_MEMORY_BUFFER|WIDE`, 132 = `MNN_GPU_MEMORY_IMAGE|WIDE`. These are\n"
+        "> two SEPARATE, fully-implemented backends (`execution/buffer/` vs `execution/image/`), both\n"
+        "> compiled into the same libMNN_CL.so -- the choice is purely runtime.\n>\n"
+        "> **The comparison is confounded unless you control for the Winograd gate.** The two\n"
+        "> backends select Winograd differently:\n>\n"
+        "> * buffer `ConvBufWinograd::valid`: `ic>=32 && oc>=32 && in_w < out_c`\n"
+        "> * image  `ConvWinograd::valid`:    `ic>=32 && oc>=32`   (no width clause)\n>\n"
+        "> so on a shape like 48->48@36x48 (`48 < 48` false) buffer runs a DIRECT conv while image\n"
+        "> runs Winograd, and a naive buffer-vs-image delta is really an algorithm delta. The\n"
+        "> `buffer forced-wino` column is the matched-algorithm control (FINDINGS §H.51).\n>\n"
+        "> IMAGE MODE CAN REBOOT THE DEVICE on tensors larger than the 2D image limit reported in\n"
+        "> section 1. MNN maps an NC4HW4 tensor to an image of `W*ceil(C/4)` x `N*H`; every shape\n"
+        "> below is checked against the limit before it is run.\n")
+    maxw, maxh = D.get("hw", {}).get("image2d_max_width", 0), D.get("hw", {}).get("image2d_max_height", 0)
+    say("| shape | image dims | buffer default | buffer forced-wino | **image** | image vs default | "
+        "image vs best buffer | vs CPU |")
+    say("|---|---|---|---|---|---|---|---|")
+    D["memory_mode"] = {}
+    for c in cores:
+        m, shp, dep, key = c["model"], c["shape"], c["depth"], c["key"]
+        iw, ih = shp[3] * ((shp[1] + 3) // 4), shp[0] * shp[2]
+        if maxw and (iw > maxw or ih > maxh):
+            say(f"| {c['label']} | {iw}x{ih} | — | — | **SKIPPED** | exceeds {maxw}x{maxh} | — | — |")
+            D["memory_mode"][key] = {"skipped": "exceeds image2d limit", "image_dims": [iw, ih]}
+            continue
+        cooldown(d, cool_s)
+        # correctness gate: the CPU backend is the only independent ground truth. Comparing image
+        # against the buffer GPU arm cannot tell "image is wrong" from "buffer does something extra"
+        # -- that mistake nearly recorded a wrong result twice (FINDINGS §H.47).
+        # The CPU arm must run the UNFUSED twin: CPU does not implement leakyReluSlope, so CPU on a
+        # fused model returns the un-activated result and would report a false MISMATCH at ~0.45.
+        _, cpu_v = run_model(d, c.get("unfused_model", m), shp, 2, cache=f"mmcpu{key}.bin",
+                             pull=True, ftype=0)
+        _, img_v = run_model(d, m, shp, 2, cache=f"mmimg{key}.bin", pull=True, mode=132)
+        cos = cosine(cpu_v, img_v)
+        r = interleaved({
+            "bd": lambda i, m=m, shp=shp, key=key: conv_all_us(
+                run_model(d, m, shp, 120, cache=f"mmbd{key}{i}.bin")[0], dep),
+            "bw": lambda i, m=m, shp=shp, key=key: conv_all_us(
+                run_model(d, m, shp, 120, env="MNN_FORCE_WINOGRAD=1",
+                          cache=f"mmbw{key}{i}.bin")[0], dep),
+            "im": lambda i, m=m, shp=shp, key=key: conv_all_us(
+                run_model(d, m, shp, 120, cache=f"mmim{key}{i}.bin", mode=132)[0], dep),
+        }, reps)
+        bd, bw, im = r["bd"], r["bw"], r["im"]
+        best_buf = min(x for x in (bd, bw) if x) if (bd or bw) else 0
+        D["memory_mode"][key] = {"buffer_default_us": bd, "buffer_forced_wino_us": bw,
+                                 "image_us": im, "image_dims": [iw, ih], "cos_vs_cpu": cos}
+        flag = "ok" if cos > 0.999 else f"**{cos:.4f} MISMATCH**"
+        say(f"| {c['label']} | {iw}x{ih} | {bd:.0f} | {bw:.0f} | **{im:.0f}** | {pct(im, bd)} | "
+            f"{pct(im, best_buf)} | {flag} |")
+    say("\n> **How to read the last two columns.** `image vs default` is what you would actually get\n"
+        "> by flipping gpuMode. `image vs best buffer` is the part attributable to the memory mode\n"
+        "> itself, once buffer is allowed the same algorithm. On the reference device those differ\n"
+        "> by ~10 points on 48->48@36x48 (-33% vs -23%): about a third of the headline win is just\n"
+        "> the Winograd gate, reachable in buffer mode with MNN_FORCE_WINOGRAD=1.\n>\n"
+        "> **A `vs CPU` mismatch is a correctness failure, not a slow arm.** The image backend\n"
+        "> ignored `Convolution2DCommon.leakyReluSlope` until FINDINGS §H.51 ported the fusion into\n"
+        "> `ConvWinograd` + `winogradTransformDest*.cl`; before that it silently dropped the fused\n"
+        "> PReLU and looked fast because it was doing less work. If this column mismatches on a\n"
+        "> PReLU-fused model, that port is missing from the build under test.\n")
+
+    # ---- XgemmBatched tile selection on tall-skinny GEMM
+    say("\n## 18. Winograd batchgemm tile selection (tall-skinny GEMM)\n")
+    say("> MNN packs the Winograd GEMM to `M_pack x N_pack x K_pack` and picks CLBlast-style tile\n"
+        "> parameters in `getGemmParams`. `isCandidateValid` requires **NWG to divide N exactly**,\n"
+        "> and every stock candidate pairs a small NWG only with a small MWG. So when N_pack is an\n"
+        "> **odd multiple of 16** (48, 80, 112 ...) every NWG in {32,64,128} is rejected and the GEMM\n"
+        "> silently falls back to a 16x16 tile with **16 threads per workgroup** -- measured 1.83x\n"
+        "> off at equal FLOPs. Extra candidates (NWG=16 paired with large MWG, and NWG=48) fix it;\n"
+        "> they are ordinary tuner candidates, so a slower one is simply never selected.\n"
+        "> `MNN_GEMM_NO_TALLSKINNY=1` removes them again for A/B. Reference outcome: FINDINGS §H.52.\n")
+    say("| shape | M x N x K | tile MWG x NWG | threads/group | stock gemm | fixed gemm | delta |")
+    say("|---|---|---|---|---|---|---|")
+    D["gemm_tile"] = {}
+    for c in cores:
+        cooldown(d, cool_s)
+        m, shp, dep, key = c["model"], c["shape"], c["depth"], c["key"]
+        # instrument the selection rather than infer it: nothing in the profiler identifies which
+        # XgemmBatched configuration ran (FINDINGS trap 4)
+        o, _ = run_model(d, m, shp, 3, env="MNN_GEMM_DEBUG=1 MNN_FORCE_WINOGRAD=1",
+                         cache=f"gt{key}.bin")
+        gm = None
+        for mt in re.finditer(r"\[GEMM\] M=(\d+) N=(\d+) K=(\d+) batch=(\d+) -> tuned \| "
+                              r"MWG=(\d+) NWG=(\d+) KWG=\d+ MDIMC=(\d+) NDIMC=(\d+)", o):
+            gm = mt
+        if gm is None:
+            say(f"| {c['label']} | (no batchgemm on this path) | — | — | — | — | — |")
+            continue
+        M, N, K, B, MWG, NWG, MDIMC, NDIMC = (int(x) for x in gm.groups())
+        thr = MDIMC * NDIMC
+        r = interleaved({
+            "stock": lambda i, m=m, shp=shp, key=key: conv_all_us(
+                run_model(d, m, shp, 120, env="MNN_GEMM_NO_TALLSKINNY=1 MNN_FORCE_WINOGRAD=1",
+                          cache=f"gs{key}{i}.bin")[0], dep),
+            "fixed": lambda i, m=m, shp=shp, key=key: conv_all_us(
+                run_model(d, m, shp, 120, env="MNN_FORCE_WINOGRAD=1",
+                          cache=f"gf{key}{i}.bin")[0], dep),
+        }, reps)
+        st, fx = r["stock"], r["fixed"]
+        D["gemm_tile"][key] = {"M": M, "N": N, "K": K, "batch": B, "MWG": MWG, "NWG": NWG,
+                               "threads_per_group": thr, "stock_us": st, "fixed_us": fx}
+        warn = " ⚠️ starved" if thr <= 32 else ""
+        say(f"| {c['label']} | {M}x{N}x{K} (b{B}) | {MWG}x{NWG} | {thr}{warn} | {st:.0f} | "
+            f"{fx:.0f} | {pct(fx, st)} |")
+    say("\n> **How to read it.** A `threads/group` of 16-32 means the tile selector was cornered by\n"
+        "> the divisibility rule, and this shape is a candidate for the fix. N here is the padded\n"
+        "> output-channel count (`ROUND_UP(out_channels, mAlignN)`), so it is the CONV's channel\n"
+        "> count that decides: any conv whose padded output channels land on an odd multiple of 16\n"
+        "> hits this. The delta column only moves on shapes that were starved -- elsewhere the\n"
+        "> extra candidates lose the tuner's own benchmark and change nothing.\n")
+
+    # ---- Winograd selection gate
+    say("\n## 19. Winograd selection gate\n")
+    say("> MNN admits Winograd only when `ic>=32 && oc>=32 && in_w < out_c` (or both >=64). The\n"
+        "> width clause has the right idea -- the transform cost scales with SPATIAL size and the\n"
+        "> arithmetic saving with CHANNELS -- but is calibrated so tightly it refuses shapes where\n"
+        "> Winograd wins by 20-34%. This build uses **`in_w <= 2 * out_c`**, fit on-device with zero\n"
+        "> missed wins and zero admitted losses over 14 shapes (FINDINGS §H.53).\n>\n"
+        "> The coefficient is a fit on ONE device and depends on the GEMM tile fix of §18: before\n"
+        "> that fix the right answer was ~1.5, and `48->48@72x96` flipped from +11.9% to -19.0%.\n"
+        "> **Re-fit both together on new hardware.** `MNN_WINOGRAD_GATE_OLD=1` restores the stock\n"
+        "> clause; the `forced` column below is the upper bound the gate is trying to reach.\n")
+    say("| shape | in_w | out_c | old gate | NEW gate | forced wino | gate verdict |")
+    say("|---|---|---|---|---|---|---|")
+    D["wino_gate"] = {}
+    for c in cores:
+        cooldown(d, cool_s)
+        m, shp, dep, key = c["model"], c["shape"], c["depth"], c["key"]
+        in_w, out_c = shp[3], shp[1]
+        r = interleaved({
+            "old": lambda i, m=m, shp=shp, key=key: conv_all_us(
+                run_model(d, m, shp, 120, env="MNN_WINOGRAD_GATE_OLD=1",
+                          cache=f"wo{key}{i}.bin")[0], dep),
+            "new": lambda i, m=m, shp=shp, key=key: conv_all_us(
+                run_model(d, m, shp, 120, cache=f"wn{key}{i}.bin")[0], dep),
+            "forced": lambda i, m=m, shp=shp, key=key: conv_all_us(
+                run_model(d, m, shp, 120, env="MNN_FORCE_WINOGRAD=1",
+                          cache=f"wfz{key}{i}.bin")[0], dep),
+        }, reps)
+        old_, new_, forced_ = r["old"], r["new"], r["forced"]
+        D["wino_gate"][key] = {"in_w": in_w, "out_c": out_c, "old_gate_us": old_,
+                               "new_gate_us": new_, "forced_us": forced_}
+        if new_ < old_ * 0.97:
+            v = f"**new gate captures {pct(new_, old_)}**"
+        elif forced_ < new_ * 0.97:
+            v = f"⚠️ still leaving {pct(forced_, new_)} on the table — re-fit the coefficient"
+        else:
+            v = "gate agrees with the clock"
+        say(f"| {c['label']} | {in_w} | {out_c} | {old_:.0f} | **{new_:.0f}** | {forced_:.0f} | {v} |")
+    say("\n> **If the `forced` column is materially below `NEW gate` on some shape, the coefficient\n"
+        "> is wrong for this device** -- Winograd would win there and the gate is refusing it. Raise\n"
+        "> K until that stops, then check no shape where `forced` is ABOVE `old gate` got admitted.\n")
+
     # ---- 11. what to do on this device
-    say("## 17. Recommendations for THIS device\n")
+    say("## 20. Recommendations for THIS device\n")
     recs = []
     for c in cores:
         if c["key"] in summary:

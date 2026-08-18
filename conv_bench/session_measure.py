@@ -59,8 +59,13 @@ def push_build():
     shell(f"chmod 755 {DEV}/ModuleBasic.out")
 
 
-def run(model, shape, loops=120, env="", cache="p.bin", pull=False, timeout=900):
-    """Push a matching input.json, run ModuleBasic, return (stdout, output floats or None)."""
+def run(model, shape, loops=120, env="", cache="p.bin", pull=False, timeout=900, mode=68, ftype=3):
+    """Push a matching input.json, run ModuleBasic, return (stdout, output floats or None).
+
+    mode = gpuMode: 68 = MNN_GPU_MEMORY_BUFFER|WIDE, 132 = MNN_GPU_MEMORY_IMAGE|WIDE.
+    IMAGE mode can REBOOT the device on tensors whose image dims exceed
+    CL_DEVICE_IMAGE2D_MAX_WIDTH/HEIGHT (16384x16384 here); image width = W*ceil(C/4),
+    height = N*H. Check before adding a shape (FINDINGS trap 5)."""
     inj = TMP / "_input.json"
     inj.parent.mkdir(parents=True, exist_ok=True)
     inj.write_text(json.dumps({"inputs": [{"name": "input", "shape": shape}],
@@ -68,8 +73,8 @@ def run(model, shape, loops=120, env="", cache="p.bin", pull=False, timeout=900)
     sh(f'push "{inj}" {DEV}/tdir/input.json')
     if pull:
         shell(f"rm -rf {DEV}/output && mkdir -p {DEV}/output")
-    out = shell(f"cd {DEV} && {env} LD_LIBRARY_PATH=. ./ModuleBasic.out {model} tdir 0 3 "
-                f"{loops} 68 2 {cache} 2>&1", timeout=timeout)
+    out = shell(f"cd {DEV} && {env} LD_LIBRARY_PATH=. ./ModuleBasic.out {model} tdir 0 {ftype} "
+                f"{loops} {mode} 2 {cache} 2>&1", timeout=timeout)
     vals = None
     if pull:
         p = TMP / "_out.txt"

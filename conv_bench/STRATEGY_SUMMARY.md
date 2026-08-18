@@ -1,8 +1,12 @@
-# Buffer-mode strategy summary — what we have, and why each works or doesn't
+# Conv strategy summary — what we have, and why each works or doesn't
 
-Every item below is **measured on-device** (Xclipse 960 / Exynos 2600, OpenCL buffer + fp16), is
-env-gated and **default OFF**, and is registered in `conv_bench/` so it re-decides itself on new
-hardware. Full detail in `FINDINGS.md`; section numbers are the pointers.
+Every item below is **measured on-device** (Xclipse 960 / Exynos 2600, OpenCL fp16), is env-gated
+and **default OFF**, and is registered in `conv_bench/` so it re-decides itself on new hardware.
+Full detail in `FINDINGS.md`; section numbers are the pointers.
+
+Sections 1–4 were measured in **buffer** mode (`gpuMode=68`) unless stated. **Image/texture mode
+(`gpuMode=132`) is a separate, fully-implemented backend**, audited in §H.51 — see the image row in
+section 1 and the per-shape table there before assuming a buffer-mode result transfers.
 
 Reference shapes: `32→32@72×96`, `48→48@36×48`, `96→96@18×24` (stride-1 cores) and six stride-2
 head convs. Baselines: MNN's autotuned default, and `conv_2d_c4h4w2 + MNN_CONV_HARD` (−18.7%).
@@ -14,12 +18,15 @@ head convs. Baselines: MNN's autotuned default, and `conv_2d_c4h4w2 + MNN_CONV_H
 | strategy | flag | result | why it works |
 |---|---|---|---|
 | **PReLU fused into conv** | converter `MNN_FUSE_CONV_PRELU=1` | **−8/9% per block** | removes a whole extra kernel + its full output round-trip. Already shipped. §E |
-| **Force Winograd on** | `MNN_FORCE_WINOGRAD=1` | **−13% on 48→48@36×48**, −25% on 32→32@36×48 | Winograd cuts multiplies 2.25×; MNN's selection gate (`in_w < out_c`) refuses these shapes for no measured reason. **No new kernel — the code already exists.** §H.28/§H.29 |
+| **Winograd gate fixed** | on by default (`MNN_WINOGRAD_GATE_OLD=1` reverts) | **−33.7% on 48→48@36×48**, **−16.0% on Block2 whole-graph, no flags** | the stock clause `in_w < out_c` had the right idea but was calibrated far too tightly. Re-derived after the GEMM fix as **`in_w <= 2*out_c`**: 0 missed wins, 0 admitted losses over 14 shapes. §H.29's own 1.5 proposal is now stale — `48→48@72×96` flipped +11.9% → −19.0%. §H.53 |
 | **Shape hardcoding** | `MNN_CONV_HARD=1` | **−18.7% on 32→32@72×96** | every shape value is a runtime arg by default, so nothing constant-folds. Baking them collapses the per-tap halo bounds checks and the channel loop. Kernel- and shape-dependent: it *hurts* some pairs (+16%, +33%). §H.23/§H.34 |
 | **2-D register tile** | `conv_2d_c4h4w2` | −7.6% alone, −18.7% with HARD | at equal accumulator count, spreading the tile over **two spatial axes** reuses each loaded weight better than 1-D. §H.21/§H.22 |
+| **Tall-skinny GEMM tile fix** | on by default (`MNN_GEMM_NO_TALLSKINNY=1` reverts) | **−23.9% on 48→48@36×48**; **−19.5% on 48→48@18×24 with no flags**; Block2 forced-wino −4.0% → **−16.5%** | `getGemmParams` requires `NWG` to divide N exactly and never pairs a small NWG with a large MWG, so any padded out-channel count that is an **odd multiple of 16** (48, 80, 112) collapses to a 16×16 tile with **16 threads/group**. Adding `NWG=48` + large-MWG/`NWG=16` candidates fixes it. Buffer now MATCHES image on the 48-core (67.0 vs 67.8). §H.52 |
+| **IMAGE (texture) memory mode** | runtime `gpuMode=132` | **−24.5% on Block2 whole-graph** (−44.6% conv-only); −18…−33% on 8 of 14 shapes | two independent effects: image's Winograd gemm beats buffer's general `XgemmBatched` on **tall-skinny** GEMM (small out-channels), and image's **direct** conv beats buffer's at C≤24. **No new kernel — a separate backend that already exists.** Wins C≤48, loses C≥64. §H.51 |
 
-**Combined recommendation:** PReLU fusion everywhere + Winograd on the 48-core ≈ **−10% on Block2**,
-with no new kernel code.
+**Combined recommendation:** PReLU fusion everywhere + **image mode on Block2** ≈ **−24.5% on Block2**
+whole-graph, with no new kernel code. Block1 stays on buffer (image regresses it 9.5%). `gpuMode` is
+per-Interpreter, so a split pipeline picks per model.
 
 ---
 
@@ -58,7 +65,7 @@ either layout.
 |---|---|
 | **`conv time` excludes Winograd transforms** | it was the primary metric for most of the investigation. Turned a +15% regression into an apparent −45% win, and under-reports every Winograd shape. Some older recorded numbers — including the ~3.03 TFLOP/s ceiling — need re-deriving. §H.27 |
 | **A renamed macro silently disabled `MNN_CONV_HARD`** | the −18.7% lever was a no-op for four kernels and nobody noticed; it fails *silently and in the fast direction*. §H.34 |
-| **IMAGE mode is −32.7% on the 48-core** | never tested, because a wide-tensor crash caused buffer mode to be mandated globally. Biggest open lead. Blocked on image mode dropping the fused PReLU. §H.47 |
+| **IMAGE mode was never tested at all** | a wide-tensor crash caused buffer mode to be mandated globally, and ~20 strategies were then evaluated inside that assumption. It is worth **−24.5% on Block2**. The lesson is the over-generalisation, not the number: one real failure closed off an entire backend for the rest of the investigation. §H.47/§H.51 |
 | **Four ideas nearly died from bad first implementations** | swings of 1.8×–3.4× from implementation quality alone. A single bad measurement is not evidence an idea is bad. |
 
 ---
@@ -67,7 +74,9 @@ either layout.
 
 | idea | status |
 |---|---|
-| **Image (texture) mode audit** | −32.7% measured on one core; needs PReLU fusion ported. See `IMAGE_MODE_SESSION_PROMPT.md` |
+| ~~Image (texture) mode audit~~ | **DONE — §H.51.** PReLU fusion ported to the image backend (cost measured: **zero**); win re-measured against the Winograd-gate confound and swept over 14 shapes. Wins C≤48, loses C≥64. |
+| ~~Fix buffer's `XgemmBatched` on tall-skinny GEMM~~ | **DONE — §H.52.** Root cause was a divisibility rule in the tile selector, not the kernel. Fixed, default ON, measured safe. |
+| ~~Winograd transform kernels~~ | **ATTEMPTED, FALSIFIED — §H.53.** 2-tiles/thread: **+29% slower** (56 live FLOAT4 = register cliff). Bounds-check elimination: **no effect**. They are **34% fixed launch overhead** (`src_us = 7.3 + 2.711/1000 items`) and latency-bound otherwise — at their practical floor for this structure. Further gains need dispatch batching (§H.32) or an intermediate-layout change. |
 | **Winograd F(4,3)** | scoped, not built. MNN ships only the `2_3_1` transforms, so it is a from-scratch 6×6 transform pair. §F's rejection is a *cost model*, computed for a different conv, on assumptions §H.35 has since undermined. §H.50 |
 | **INT8 + `cl_khr_integer_dot_product`** | extension is exposed and unused; 1.67–2.45× reported elsewhere. **Only idea on the list that trades accuracy** — needs a real output gate, not a cosine check. §H.48 |
 | Zero-copy input (dma_buf) | ~32% of wall clock, but the heaps are unreachable as uid `shell`; needs a real app context. §H.33 |

@@ -154,6 +154,11 @@ def main():
         # 6-deep chain +PReLU (fused) -> the sustained-load timing vehicle
         chain = tmp / f"core_{C}.onnx"; make_chain(str(chain), 1, C, H, W, depth=6, act="prelu", k=3, stride=1)
         convert(str(chain), str(OUT / "models" / f"core_{C}.mnn"), fp16=False, fuse_prelu=True)
+        # UNFUSED twin of the same chain. Needed as CPU ground truth for the image-mode section:
+        # CPU ignores Convolution2DCommon.leakyReluSlope, so running the FUSED model on CPU yields
+        # the un-activated answer (cosine ~0.45-0.56 against a correct GPU arm) and would report a
+        # false MISMATCH. Gate = CPU on this model vs GPU on the fused one (FINDINGS §H.51).
+        convert(str(chain), str(OUT / "models" / f"core_{C}_unfused.mnn"), fp16=False, fuse_prelu=False)
         # single conv (direct baseline + fused2 vehicle)
         one = tmp / f"single_{C}.onnx"; make_conv(str(one), 1, C, C, H, W, 3, 3, 1, 1, 1, 1, "none")
         convert(str(one), str(OUT / "models" / f"single_{C}.mnn"))
@@ -167,6 +172,7 @@ def main():
             "key": key, "label": f"{C}->{C}@{H}x{W}", "C": C, "H": H, "W": W,
             "model": f"core_{C}.mnn", "shape": [1, C, H, W], "depth": 6,
             "single_model": f"single_{C}.mnn",
+            "unfused_model": f"core_{C}_unfused.mnn",
             "im2col_model": f"ic_{C}.mnn",
             "gemm_model": f"gp_{C}.mnn", "gemm_shape": [1, C * 9, H, W]})
         print(f"   core {key}")
