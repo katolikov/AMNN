@@ -37,7 +37,25 @@ bool ConvBufWinograd::valid(const Convolution2DCommon* common, const Tensor* inp
         return true;
     }
 
-    bool valid = input->channel() >= 32 && output->channel() >= 32 && input->width() < output->channel();
+    // Selection gate. The stock clause was `input->width() < output->channel()` -- the right IDEA
+    // (Winograd wants small spatial x many channels, since its transform cost scales with spatial
+    // and its arithmetic saving with channels) but calibrated far too tightly: it refused shapes
+    // where Winograd wins by 20-34%.
+    //
+    // `in_w <= 2 * out_c` is re-derived from a 14-shape on-device sweep taken AFTER the
+    // XgemmBatched tall-skinny fix (FINDINGS §H.52), which changed the economics -- 48->48@72x96
+    // flipped from +11.9% to -19.0%, so the older §H.29 fit is stale. At this coefficient the
+    // sweep has zero missed wins and zero admitted losses; the binding constraints are
+    // 48->48@72x96 (needs >=2.0) and 32->32@72x96 (needs <3.0).
+    //
+    // Caveat: this is a fit on ONE device, and MNN's heuristic is global.
+    // MNN_WINOGRAD_GATE_OLD=1 restores the stock clause for A/B.
+    if (nullptr != getenv("MNN_WINOGRAD_GATE_OLD")) {
+        bool old = input->channel() >= 32 && output->channel() >= 32 && input->width() < output->channel();
+        return old || (input->channel() >= 64 && output->channel() >= 64);
+    }
+    bool valid = input->channel() >= 32 && output->channel() >= 32 &&
+                 input->width() <= 2 * output->channel();
     valid = valid || (input->channel() >= 64 && output->channel() >= 64);
     return valid;
 }
@@ -561,7 +579,29 @@ ErrorCode ConvBufWinograd::onEncode(const std::vector<Tensor*>& inputs, const st
             ::memset(format, 0, sizeof(format));
             sprintf(format, "%d_%d_%d", UNIT, mKernelX, INTERP);
             auto formatStr      = std::string(format);
-            mUnits[b * loop_num].kernel = runTime->buildKernel("winogradTransform_buf", "winoTransSrcBuf" + formatStr, basic, mOpenCLBackend->getPrecision());
+            // Source transform. The _w2 variant handles TWO adjacent tiles per work-item: they
+            // overlap by 2 input columns (-25% loads) and land on consecutive destination slots,
+            // so every store becomes a vstore2 (-50% store instructions). It also has an interior
+            // fast path with no bounds checks. MNN_WINO_SRC_W2=0 selects the stock kernel.
+            // MNN_WINO_SRC: stock (default) | fast | w2
+            //   fast = stock kernel with the 16 per-tap bounds tests hoisted into one interior
+            //          test. Same registers, same thread count, control flow only.
+            //          MEASURED +1.1..1.4%, inside the +1.3..2.4% drift of the untouched gemm/dst
+            //          controls in the same runs => NO EFFECT. Not default: a no-op code path.
+            //   w2   = 2 tiles per work-item. MEASURED +29% (SLOWER): ~56 live FLOAT4 blows past
+            //          the register cliff (§H.8/§H.22) and halves the thread count.
+            // Both kept selectable for reproducibility. The transform is ~34% fixed launch
+            // overhead (fit: src_us = 7.3 + 2.711 per 1000 work-items) and its variable part is
+            // latency-bound, which is why neither kernel change moves it (FINDINGS §H.53).
+            {
+                const char* v = getenv("MNN_WINO_SRC");
+                mSrcVariant = (nullptr == v) ? ""
+                            : (0 == strcmp(v, "w2") ? "_w2"
+                            : (0 == strcmp(v, "fast") ? "_fast" : ""));
+            }
+            mUnits[b * loop_num].kernel = runTime->buildKernel("winogradTransform_buf",
+                "winoTransSrcBuf" + formatStr + mSrcVariant,
+                basic, mOpenCLBackend->getPrecision());
             {
                 std::set<std::string> buildOptions = basic;
                 if (mResource->mCommon->relu()) {
@@ -583,7 +623,14 @@ ErrorCode ConvBufWinograd::onEncode(const std::vector<Tensor*>& inputs, const st
 
             // Source Transform
             {
+                // _w2 covers two tiles per work-item, so the x extent is the number of tile PAIRS
+                // per unit row times the unit rows. (The stock kernel is launched over the padded
+                // M_pack and returns early past wUnit*hUnit; the padding rows are never written in
+                // either case, so the GEMM sees the same buffer state.)
                 std::vector<uint32_t> gws_S = {static_cast<uint32_t>(M_pack), static_cast<uint32_t>(UP_DIV(K_pack, 4))};
+                if (mSrcVariant == "_w2") {
+                    gws_S[0] = static_cast<uint32_t>(UP_DIV(wUnit, 2) * hUnit);
+                }
                 int kernel_idx = b * loop_num;
                 int index = 0;
                 cl_int ret = CL_SUCCESS;

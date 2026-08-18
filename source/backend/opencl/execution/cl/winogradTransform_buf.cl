@@ -526,3 +526,603 @@ __kernel void winoTransDstBuf2_3_1(GLOBAL_SIZE_DIM2
         }
     }
 }
+
+
+__kernel void winoTransSrcBuf2_3_1_w2(GLOBAL_SIZE_DIM2
+                                      __global const FLOAT* uInput, // 0
+                                      __global FLOAT* uOutput, __private const int unitWidth,
+                                      __private const int unitHeight, // 3
+                                      __private const int padX, __private const int padY,
+                                      __private const int srcWidth, // 6
+                                      __private const int srcHeight, __private const int srcChannelC4,
+                                      __private const int dstHeightPad, __private const int srcChannelPad,
+                                      __private const int batch,
+                                      __private const int batchOffset) {
+    int2 pos = (int2)(get_global_id(0), get_global_id(1));
+    UNIFORM_BOUNDRY_CHECK(pos.x, pos.y);
+
+    const int wPair = (unitWidth + 1) >> 1;   // tile PAIRS per unit row
+    if(pos.x >= wPair * unitHeight || pos.y >= srcChannelC4) {
+        return;
+    }
+    const int pairIdx        = pos.x % wPair;
+    const int unitHeight_idx = pos.x / wPair;
+    const int uw0 = pairIdx << 1;
+    const int uw1 = uw0 + 1;
+    const bool hasSecond = (uw1 < unitWidth);
+
+    const int dstXOrigin = pos.y;
+    const int srcZ       = pos.y % srcChannelC4;
+    const int batchIndex = batchOffset;
+    const int dstYOrigin = unitWidth * unitHeight_idx + uw0;
+
+    const int sxStart = uw0 * 2 - padX;   // first of SIX columns covering both tiles
+    const int syStart = unitHeight_idx * 2 - padY;
+    const int inp_offset = (((batchIndex + srcZ * batch) * srcHeight + syStart) * srcWidth + sxStart) * 4;
+
+    FLOAT4 C00, C01, C02, C03;
+    FLOAT4 C10, C11, C12, C13;
+    FLOAT4 C20, C21, C22, C23;
+    FLOAT4 C30, C31, C32, C33;
+    FLOAT4 C40, C41, C42, C43;
+    FLOAT4 C50, C51, C52, C53;
+
+    // Interior fast path: the whole 6x4 footprint is inside, so every bounds test is provably
+    // false. This is the majority of tiles -- only the border ring takes the checked path.
+    if(sxStart >= 0 && sxStart + 5 < srcWidth && syStart >= 0 && syStart + 3 < srcHeight) {
+        C00 = vload4(0, uInput+inp_offset+0+0*srcWidth);
+        C10 = vload4(0, uInput+inp_offset+4+0*srcWidth);
+        C20 = vload4(0, uInput+inp_offset+8+0*srcWidth);
+        C30 = vload4(0, uInput+inp_offset+12+0*srcWidth);
+        C40 = vload4(0, uInput+inp_offset+16+0*srcWidth);
+        C50 = vload4(0, uInput+inp_offset+20+0*srcWidth);
+        C01 = vload4(0, uInput+inp_offset+0+4*srcWidth);
+        C11 = vload4(0, uInput+inp_offset+4+4*srcWidth);
+        C21 = vload4(0, uInput+inp_offset+8+4*srcWidth);
+        C31 = vload4(0, uInput+inp_offset+12+4*srcWidth);
+        C41 = vload4(0, uInput+inp_offset+16+4*srcWidth);
+        C51 = vload4(0, uInput+inp_offset+20+4*srcWidth);
+        C02 = vload4(0, uInput+inp_offset+0+8*srcWidth);
+        C12 = vload4(0, uInput+inp_offset+4+8*srcWidth);
+        C22 = vload4(0, uInput+inp_offset+8+8*srcWidth);
+        C32 = vload4(0, uInput+inp_offset+12+8*srcWidth);
+        C42 = vload4(0, uInput+inp_offset+16+8*srcWidth);
+        C52 = vload4(0, uInput+inp_offset+20+8*srcWidth);
+        C03 = vload4(0, uInput+inp_offset+0+12*srcWidth);
+        C13 = vload4(0, uInput+inp_offset+4+12*srcWidth);
+        C23 = vload4(0, uInput+inp_offset+8+12*srcWidth);
+        C33 = vload4(0, uInput+inp_offset+12+12*srcWidth);
+        C43 = vload4(0, uInput+inp_offset+16+12*srcWidth);
+        C53 = vload4(0, uInput+inp_offset+20+12*srcWidth);
+    } else {
+        C00 = (sxStart+0 < 0 || sxStart+0 >= srcWidth || syStart+0 < 0 || syStart+0 >= srcHeight)
+                ? (FLOAT4)(0) : vload4(0, uInput+inp_offset+0+0*srcWidth);
+        C10 = (sxStart+1 < 0 || sxStart+1 >= srcWidth || syStart+0 < 0 || syStart+0 >= srcHeight)
+                ? (FLOAT4)(0) : vload4(0, uInput+inp_offset+4+0*srcWidth);
+        C20 = (sxStart+2 < 0 || sxStart+2 >= srcWidth || syStart+0 < 0 || syStart+0 >= srcHeight)
+                ? (FLOAT4)(0) : vload4(0, uInput+inp_offset+8+0*srcWidth);
+        C30 = (sxStart+3 < 0 || sxStart+3 >= srcWidth || syStart+0 < 0 || syStart+0 >= srcHeight)
+                ? (FLOAT4)(0) : vload4(0, uInput+inp_offset+12+0*srcWidth);
+        C40 = (sxStart+4 < 0 || sxStart+4 >= srcWidth || syStart+0 < 0 || syStart+0 >= srcHeight)
+                ? (FLOAT4)(0) : vload4(0, uInput+inp_offset+16+0*srcWidth);
+        C50 = (sxStart+5 < 0 || sxStart+5 >= srcWidth || syStart+0 < 0 || syStart+0 >= srcHeight)
+                ? (FLOAT4)(0) : vload4(0, uInput+inp_offset+20+0*srcWidth);
+        C01 = (sxStart+0 < 0 || sxStart+0 >= srcWidth || syStart+1 < 0 || syStart+1 >= srcHeight)
+                ? (FLOAT4)(0) : vload4(0, uInput+inp_offset+0+4*srcWidth);
+        C11 = (sxStart+1 < 0 || sxStart+1 >= srcWidth || syStart+1 < 0 || syStart+1 >= srcHeight)
+                ? (FLOAT4)(0) : vload4(0, uInput+inp_offset+4+4*srcWidth);
+        C21 = (sxStart+2 < 0 || sxStart+2 >= srcWidth || syStart+1 < 0 || syStart+1 >= srcHeight)
+                ? (FLOAT4)(0) : vload4(0, uInput+inp_offset+8+4*srcWidth);
+        C31 = (sxStart+3 < 0 || sxStart+3 >= srcWidth || syStart+1 < 0 || syStart+1 >= srcHeight)
+                ? (FLOAT4)(0) : vload4(0, uInput+inp_offset+12+4*srcWidth);
+        C41 = (sxStart+4 < 0 || sxStart+4 >= srcWidth || syStart+1 < 0 || syStart+1 >= srcHeight)
+                ? (FLOAT4)(0) : vload4(0, uInput+inp_offset+16+4*srcWidth);
+        C51 = (sxStart+5 < 0 || sxStart+5 >= srcWidth || syStart+1 < 0 || syStart+1 >= srcHeight)
+                ? (FLOAT4)(0) : vload4(0, uInput+inp_offset+20+4*srcWidth);
+        C02 = (sxStart+0 < 0 || sxStart+0 >= srcWidth || syStart+2 < 0 || syStart+2 >= srcHeight)
+                ? (FLOAT4)(0) : vload4(0, uInput+inp_offset+0+8*srcWidth);
+        C12 = (sxStart+1 < 0 || sxStart+1 >= srcWidth || syStart+2 < 0 || syStart+2 >= srcHeight)
+                ? (FLOAT4)(0) : vload4(0, uInput+inp_offset+4+8*srcWidth);
+        C22 = (sxStart+2 < 0 || sxStart+2 >= srcWidth || syStart+2 < 0 || syStart+2 >= srcHeight)
+                ? (FLOAT4)(0) : vload4(0, uInput+inp_offset+8+8*srcWidth);
+        C32 = (sxStart+3 < 0 || sxStart+3 >= srcWidth || syStart+2 < 0 || syStart+2 >= srcHeight)
+                ? (FLOAT4)(0) : vload4(0, uInput+inp_offset+12+8*srcWidth);
+        C42 = (sxStart+4 < 0 || sxStart+4 >= srcWidth || syStart+2 < 0 || syStart+2 >= srcHeight)
+                ? (FLOAT4)(0) : vload4(0, uInput+inp_offset+16+8*srcWidth);
+        C52 = (sxStart+5 < 0 || sxStart+5 >= srcWidth || syStart+2 < 0 || syStart+2 >= srcHeight)
+                ? (FLOAT4)(0) : vload4(0, uInput+inp_offset+20+8*srcWidth);
+        C03 = (sxStart+0 < 0 || sxStart+0 >= srcWidth || syStart+3 < 0 || syStart+3 >= srcHeight)
+                ? (FLOAT4)(0) : vload4(0, uInput+inp_offset+0+12*srcWidth);
+        C13 = (sxStart+1 < 0 || sxStart+1 >= srcWidth || syStart+3 < 0 || syStart+3 >= srcHeight)
+                ? (FLOAT4)(0) : vload4(0, uInput+inp_offset+4+12*srcWidth);
+        C23 = (sxStart+2 < 0 || sxStart+2 >= srcWidth || syStart+3 < 0 || syStart+3 >= srcHeight)
+                ? (FLOAT4)(0) : vload4(0, uInput+inp_offset+8+12*srcWidth);
+        C33 = (sxStart+3 < 0 || sxStart+3 >= srcWidth || syStart+3 < 0 || syStart+3 >= srcHeight)
+                ? (FLOAT4)(0) : vload4(0, uInput+inp_offset+12+12*srcWidth);
+        C43 = (sxStart+4 < 0 || sxStart+4 >= srcWidth || syStart+3 < 0 || syStart+3 >= srcHeight)
+                ? (FLOAT4)(0) : vload4(0, uInput+inp_offset+16+12*srcWidth);
+        C53 = (sxStart+5 < 0 || sxStart+5 >= srcWidth || syStart+3 < 0 || syStart+3 >= srcHeight)
+                ? (FLOAT4)(0) : vload4(0, uInput+inp_offset+20+12*srcWidth);
+    }
+
+    int out_offset = (0 * srcChannelPad + 4 * dstXOrigin) * dstHeightPad + dstYOrigin;
+    const int batch_offset = srcChannelPad * dstHeightPad;
+
+    // ---- tile a: input columns 0..3
+    FLOAT4 am00 = C00 - C02;
+    FLOAT4 am01 = (FLOAT)0.5f * C01 + (FLOAT)0.5f * C02;
+    FLOAT4 am02 = -(FLOAT)0.5f * C01 + (FLOAT)0.5f * C02;
+    FLOAT4 am03 = -C01 + C03;
+    FLOAT4 am10 = C10 - C12;
+    FLOAT4 am11 = (FLOAT)0.5f * C11 + (FLOAT)0.5f * C12;
+    FLOAT4 am12 = -(FLOAT)0.5f * C11 + (FLOAT)0.5f * C12;
+    FLOAT4 am13 = -C11 + C13;
+    FLOAT4 am20 = C20 - C22;
+    FLOAT4 am21 = (FLOAT)0.5f * C21 + (FLOAT)0.5f * C22;
+    FLOAT4 am22 = -(FLOAT)0.5f * C21 + (FLOAT)0.5f * C22;
+    FLOAT4 am23 = -C21 + C23;
+    FLOAT4 am30 = C30 - C32;
+    FLOAT4 am31 = (FLOAT)0.5f * C31 + (FLOAT)0.5f * C32;
+    FLOAT4 am32 = -(FLOAT)0.5f * C31 + (FLOAT)0.5f * C32;
+    FLOAT4 am33 = -C31 + C33;
+
+    // ---- tile b: input columns 2..5
+    FLOAT4 bm00 = C20 - C22;
+    FLOAT4 bm01 = (FLOAT)0.5f * C21 + (FLOAT)0.5f * C22;
+    FLOAT4 bm02 = -(FLOAT)0.5f * C21 + (FLOAT)0.5f * C22;
+    FLOAT4 bm03 = -C21 + C23;
+    FLOAT4 bm10 = C30 - C32;
+    FLOAT4 bm11 = (FLOAT)0.5f * C31 + (FLOAT)0.5f * C32;
+    FLOAT4 bm12 = -(FLOAT)0.5f * C31 + (FLOAT)0.5f * C32;
+    FLOAT4 bm13 = -C31 + C33;
+    FLOAT4 bm20 = C40 - C42;
+    FLOAT4 bm21 = (FLOAT)0.5f * C41 + (FLOAT)0.5f * C42;
+    FLOAT4 bm22 = -(FLOAT)0.5f * C41 + (FLOAT)0.5f * C42;
+    FLOAT4 bm23 = -C41 + C43;
+    FLOAT4 bm30 = C50 - C52;
+    FLOAT4 bm31 = (FLOAT)0.5f * C51 + (FLOAT)0.5f * C52;
+    FLOAT4 bm32 = -(FLOAT)0.5f * C51 + (FLOAT)0.5f * C52;
+    FLOAT4 bm33 = -C51 + C53;
+
+    // Row-direction transform + store. The two tiles land on CONSECUTIVE dstYOrigin slots, so
+    // each component pair is one vstore2 instead of two scalar stores.
+    FLOAT4 ra, rb;
+    FLOAT2 p;
+    ra = am00 - am20;
+    rb = bm00 - bm20;
+    {
+        int o = out_offset + 0 * batch_offset;
+        if(hasSecond) {
+            p = (FLOAT2)(ra.x, rb.x); vstore2(p, 0, uOutput+o+0*dstHeightPad);
+            p = (FLOAT2)(ra.y, rb.y); vstore2(p, 0, uOutput+o+1*dstHeightPad);
+            p = (FLOAT2)(ra.z, rb.z); vstore2(p, 0, uOutput+o+2*dstHeightPad);
+            p = (FLOAT2)(ra.w, rb.w); vstore2(p, 0, uOutput+o+3*dstHeightPad);
+        } else {
+            uOutput[o+0*dstHeightPad] = ra.x;
+            uOutput[o+1*dstHeightPad] = ra.y;
+            uOutput[o+2*dstHeightPad] = ra.z;
+            uOutput[o+3*dstHeightPad] = ra.w;
+        }
+    }
+    ra = (FLOAT)0.5f * am10 + (FLOAT)0.5f * am20;
+    rb = (FLOAT)0.5f * bm10 + (FLOAT)0.5f * bm20;
+    {
+        int o = out_offset + 1 * batch_offset;
+        if(hasSecond) {
+            p = (FLOAT2)(ra.x, rb.x); vstore2(p, 0, uOutput+o+0*dstHeightPad);
+            p = (FLOAT2)(ra.y, rb.y); vstore2(p, 0, uOutput+o+1*dstHeightPad);
+            p = (FLOAT2)(ra.z, rb.z); vstore2(p, 0, uOutput+o+2*dstHeightPad);
+            p = (FLOAT2)(ra.w, rb.w); vstore2(p, 0, uOutput+o+3*dstHeightPad);
+        } else {
+            uOutput[o+0*dstHeightPad] = ra.x;
+            uOutput[o+1*dstHeightPad] = ra.y;
+            uOutput[o+2*dstHeightPad] = ra.z;
+            uOutput[o+3*dstHeightPad] = ra.w;
+        }
+    }
+    ra = -(FLOAT)0.5f * am10 + (FLOAT)0.5f * am20;
+    rb = -(FLOAT)0.5f * bm10 + (FLOAT)0.5f * bm20;
+    {
+        int o = out_offset + 2 * batch_offset;
+        if(hasSecond) {
+            p = (FLOAT2)(ra.x, rb.x); vstore2(p, 0, uOutput+o+0*dstHeightPad);
+            p = (FLOAT2)(ra.y, rb.y); vstore2(p, 0, uOutput+o+1*dstHeightPad);
+            p = (FLOAT2)(ra.z, rb.z); vstore2(p, 0, uOutput+o+2*dstHeightPad);
+            p = (FLOAT2)(ra.w, rb.w); vstore2(p, 0, uOutput+o+3*dstHeightPad);
+        } else {
+            uOutput[o+0*dstHeightPad] = ra.x;
+            uOutput[o+1*dstHeightPad] = ra.y;
+            uOutput[o+2*dstHeightPad] = ra.z;
+            uOutput[o+3*dstHeightPad] = ra.w;
+        }
+    }
+    ra = -am10 + am30;
+    rb = -bm10 + bm30;
+    {
+        int o = out_offset + 3 * batch_offset;
+        if(hasSecond) {
+            p = (FLOAT2)(ra.x, rb.x); vstore2(p, 0, uOutput+o+0*dstHeightPad);
+            p = (FLOAT2)(ra.y, rb.y); vstore2(p, 0, uOutput+o+1*dstHeightPad);
+            p = (FLOAT2)(ra.z, rb.z); vstore2(p, 0, uOutput+o+2*dstHeightPad);
+            p = (FLOAT2)(ra.w, rb.w); vstore2(p, 0, uOutput+o+3*dstHeightPad);
+        } else {
+            uOutput[o+0*dstHeightPad] = ra.x;
+            uOutput[o+1*dstHeightPad] = ra.y;
+            uOutput[o+2*dstHeightPad] = ra.z;
+            uOutput[o+3*dstHeightPad] = ra.w;
+        }
+    }
+    ra = am01 - am21;
+    rb = bm01 - bm21;
+    {
+        int o = out_offset + 4 * batch_offset;
+        if(hasSecond) {
+            p = (FLOAT2)(ra.x, rb.x); vstore2(p, 0, uOutput+o+0*dstHeightPad);
+            p = (FLOAT2)(ra.y, rb.y); vstore2(p, 0, uOutput+o+1*dstHeightPad);
+            p = (FLOAT2)(ra.z, rb.z); vstore2(p, 0, uOutput+o+2*dstHeightPad);
+            p = (FLOAT2)(ra.w, rb.w); vstore2(p, 0, uOutput+o+3*dstHeightPad);
+        } else {
+            uOutput[o+0*dstHeightPad] = ra.x;
+            uOutput[o+1*dstHeightPad] = ra.y;
+            uOutput[o+2*dstHeightPad] = ra.z;
+            uOutput[o+3*dstHeightPad] = ra.w;
+        }
+    }
+    ra = (FLOAT)0.5f * am11 + (FLOAT)0.5f * am21;
+    rb = (FLOAT)0.5f * bm11 + (FLOAT)0.5f * bm21;
+    {
+        int o = out_offset + 5 * batch_offset;
+        if(hasSecond) {
+            p = (FLOAT2)(ra.x, rb.x); vstore2(p, 0, uOutput+o+0*dstHeightPad);
+            p = (FLOAT2)(ra.y, rb.y); vstore2(p, 0, uOutput+o+1*dstHeightPad);
+            p = (FLOAT2)(ra.z, rb.z); vstore2(p, 0, uOutput+o+2*dstHeightPad);
+            p = (FLOAT2)(ra.w, rb.w); vstore2(p, 0, uOutput+o+3*dstHeightPad);
+        } else {
+            uOutput[o+0*dstHeightPad] = ra.x;
+            uOutput[o+1*dstHeightPad] = ra.y;
+            uOutput[o+2*dstHeightPad] = ra.z;
+            uOutput[o+3*dstHeightPad] = ra.w;
+        }
+    }
+    ra = -(FLOAT)0.5f * am11 + (FLOAT)0.5f * am21;
+    rb = -(FLOAT)0.5f * bm11 + (FLOAT)0.5f * bm21;
+    {
+        int o = out_offset + 6 * batch_offset;
+        if(hasSecond) {
+            p = (FLOAT2)(ra.x, rb.x); vstore2(p, 0, uOutput+o+0*dstHeightPad);
+            p = (FLOAT2)(ra.y, rb.y); vstore2(p, 0, uOutput+o+1*dstHeightPad);
+            p = (FLOAT2)(ra.z, rb.z); vstore2(p, 0, uOutput+o+2*dstHeightPad);
+            p = (FLOAT2)(ra.w, rb.w); vstore2(p, 0, uOutput+o+3*dstHeightPad);
+        } else {
+            uOutput[o+0*dstHeightPad] = ra.x;
+            uOutput[o+1*dstHeightPad] = ra.y;
+            uOutput[o+2*dstHeightPad] = ra.z;
+            uOutput[o+3*dstHeightPad] = ra.w;
+        }
+    }
+    ra = -am11 + am31;
+    rb = -bm11 + bm31;
+    {
+        int o = out_offset + 7 * batch_offset;
+        if(hasSecond) {
+            p = (FLOAT2)(ra.x, rb.x); vstore2(p, 0, uOutput+o+0*dstHeightPad);
+            p = (FLOAT2)(ra.y, rb.y); vstore2(p, 0, uOutput+o+1*dstHeightPad);
+            p = (FLOAT2)(ra.z, rb.z); vstore2(p, 0, uOutput+o+2*dstHeightPad);
+            p = (FLOAT2)(ra.w, rb.w); vstore2(p, 0, uOutput+o+3*dstHeightPad);
+        } else {
+            uOutput[o+0*dstHeightPad] = ra.x;
+            uOutput[o+1*dstHeightPad] = ra.y;
+            uOutput[o+2*dstHeightPad] = ra.z;
+            uOutput[o+3*dstHeightPad] = ra.w;
+        }
+    }
+    ra = am02 - am22;
+    rb = bm02 - bm22;
+    {
+        int o = out_offset + 8 * batch_offset;
+        if(hasSecond) {
+            p = (FLOAT2)(ra.x, rb.x); vstore2(p, 0, uOutput+o+0*dstHeightPad);
+            p = (FLOAT2)(ra.y, rb.y); vstore2(p, 0, uOutput+o+1*dstHeightPad);
+            p = (FLOAT2)(ra.z, rb.z); vstore2(p, 0, uOutput+o+2*dstHeightPad);
+            p = (FLOAT2)(ra.w, rb.w); vstore2(p, 0, uOutput+o+3*dstHeightPad);
+        } else {
+            uOutput[o+0*dstHeightPad] = ra.x;
+            uOutput[o+1*dstHeightPad] = ra.y;
+            uOutput[o+2*dstHeightPad] = ra.z;
+            uOutput[o+3*dstHeightPad] = ra.w;
+        }
+    }
+    ra = (FLOAT)0.5f * am12 + (FLOAT)0.5f * am22;
+    rb = (FLOAT)0.5f * bm12 + (FLOAT)0.5f * bm22;
+    {
+        int o = out_offset + 9 * batch_offset;
+        if(hasSecond) {
+            p = (FLOAT2)(ra.x, rb.x); vstore2(p, 0, uOutput+o+0*dstHeightPad);
+            p = (FLOAT2)(ra.y, rb.y); vstore2(p, 0, uOutput+o+1*dstHeightPad);
+            p = (FLOAT2)(ra.z, rb.z); vstore2(p, 0, uOutput+o+2*dstHeightPad);
+            p = (FLOAT2)(ra.w, rb.w); vstore2(p, 0, uOutput+o+3*dstHeightPad);
+        } else {
+            uOutput[o+0*dstHeightPad] = ra.x;
+            uOutput[o+1*dstHeightPad] = ra.y;
+            uOutput[o+2*dstHeightPad] = ra.z;
+            uOutput[o+3*dstHeightPad] = ra.w;
+        }
+    }
+    ra = -(FLOAT)0.5f * am12 + (FLOAT)0.5f * am22;
+    rb = -(FLOAT)0.5f * bm12 + (FLOAT)0.5f * bm22;
+    {
+        int o = out_offset + 10 * batch_offset;
+        if(hasSecond) {
+            p = (FLOAT2)(ra.x, rb.x); vstore2(p, 0, uOutput+o+0*dstHeightPad);
+            p = (FLOAT2)(ra.y, rb.y); vstore2(p, 0, uOutput+o+1*dstHeightPad);
+            p = (FLOAT2)(ra.z, rb.z); vstore2(p, 0, uOutput+o+2*dstHeightPad);
+            p = (FLOAT2)(ra.w, rb.w); vstore2(p, 0, uOutput+o+3*dstHeightPad);
+        } else {
+            uOutput[o+0*dstHeightPad] = ra.x;
+            uOutput[o+1*dstHeightPad] = ra.y;
+            uOutput[o+2*dstHeightPad] = ra.z;
+            uOutput[o+3*dstHeightPad] = ra.w;
+        }
+    }
+    ra = -am12 + am32;
+    rb = -bm12 + bm32;
+    {
+        int o = out_offset + 11 * batch_offset;
+        if(hasSecond) {
+            p = (FLOAT2)(ra.x, rb.x); vstore2(p, 0, uOutput+o+0*dstHeightPad);
+            p = (FLOAT2)(ra.y, rb.y); vstore2(p, 0, uOutput+o+1*dstHeightPad);
+            p = (FLOAT2)(ra.z, rb.z); vstore2(p, 0, uOutput+o+2*dstHeightPad);
+            p = (FLOAT2)(ra.w, rb.w); vstore2(p, 0, uOutput+o+3*dstHeightPad);
+        } else {
+            uOutput[o+0*dstHeightPad] = ra.x;
+            uOutput[o+1*dstHeightPad] = ra.y;
+            uOutput[o+2*dstHeightPad] = ra.z;
+            uOutput[o+3*dstHeightPad] = ra.w;
+        }
+    }
+    ra = am03 - am23;
+    rb = bm03 - bm23;
+    {
+        int o = out_offset + 12 * batch_offset;
+        if(hasSecond) {
+            p = (FLOAT2)(ra.x, rb.x); vstore2(p, 0, uOutput+o+0*dstHeightPad);
+            p = (FLOAT2)(ra.y, rb.y); vstore2(p, 0, uOutput+o+1*dstHeightPad);
+            p = (FLOAT2)(ra.z, rb.z); vstore2(p, 0, uOutput+o+2*dstHeightPad);
+            p = (FLOAT2)(ra.w, rb.w); vstore2(p, 0, uOutput+o+3*dstHeightPad);
+        } else {
+            uOutput[o+0*dstHeightPad] = ra.x;
+            uOutput[o+1*dstHeightPad] = ra.y;
+            uOutput[o+2*dstHeightPad] = ra.z;
+            uOutput[o+3*dstHeightPad] = ra.w;
+        }
+    }
+    ra = (FLOAT)0.5f * am13 + (FLOAT)0.5f * am23;
+    rb = (FLOAT)0.5f * bm13 + (FLOAT)0.5f * bm23;
+    {
+        int o = out_offset + 13 * batch_offset;
+        if(hasSecond) {
+            p = (FLOAT2)(ra.x, rb.x); vstore2(p, 0, uOutput+o+0*dstHeightPad);
+            p = (FLOAT2)(ra.y, rb.y); vstore2(p, 0, uOutput+o+1*dstHeightPad);
+            p = (FLOAT2)(ra.z, rb.z); vstore2(p, 0, uOutput+o+2*dstHeightPad);
+            p = (FLOAT2)(ra.w, rb.w); vstore2(p, 0, uOutput+o+3*dstHeightPad);
+        } else {
+            uOutput[o+0*dstHeightPad] = ra.x;
+            uOutput[o+1*dstHeightPad] = ra.y;
+            uOutput[o+2*dstHeightPad] = ra.z;
+            uOutput[o+3*dstHeightPad] = ra.w;
+        }
+    }
+    ra = -(FLOAT)0.5f * am13 + (FLOAT)0.5f * am23;
+    rb = -(FLOAT)0.5f * bm13 + (FLOAT)0.5f * bm23;
+    {
+        int o = out_offset + 14 * batch_offset;
+        if(hasSecond) {
+            p = (FLOAT2)(ra.x, rb.x); vstore2(p, 0, uOutput+o+0*dstHeightPad);
+            p = (FLOAT2)(ra.y, rb.y); vstore2(p, 0, uOutput+o+1*dstHeightPad);
+            p = (FLOAT2)(ra.z, rb.z); vstore2(p, 0, uOutput+o+2*dstHeightPad);
+            p = (FLOAT2)(ra.w, rb.w); vstore2(p, 0, uOutput+o+3*dstHeightPad);
+        } else {
+            uOutput[o+0*dstHeightPad] = ra.x;
+            uOutput[o+1*dstHeightPad] = ra.y;
+            uOutput[o+2*dstHeightPad] = ra.z;
+            uOutput[o+3*dstHeightPad] = ra.w;
+        }
+    }
+    ra = -am13 + am33;
+    rb = -bm13 + bm33;
+    {
+        int o = out_offset + 15 * batch_offset;
+        if(hasSecond) {
+            p = (FLOAT2)(ra.x, rb.x); vstore2(p, 0, uOutput+o+0*dstHeightPad);
+            p = (FLOAT2)(ra.y, rb.y); vstore2(p, 0, uOutput+o+1*dstHeightPad);
+            p = (FLOAT2)(ra.z, rb.z); vstore2(p, 0, uOutput+o+2*dstHeightPad);
+            p = (FLOAT2)(ra.w, rb.w); vstore2(p, 0, uOutput+o+3*dstHeightPad);
+        } else {
+            uOutput[o+0*dstHeightPad] = ra.x;
+            uOutput[o+1*dstHeightPad] = ra.y;
+            uOutput[o+2*dstHeightPad] = ra.z;
+            uOutput[o+3*dstHeightPad] = ra.w;
+        }
+    }
+}
+
+
+__kernel void winoTransSrcBuf2_3_1_fast(GLOBAL_SIZE_DIM2
+                                      __global const FLOAT* uInput, // 0
+                                      __global FLOAT* uOutput, __private const int unitWidth,
+                                      __private const int unitHeight, // 3
+                                      __private const int padX, __private const int padY,
+                                      __private const int srcWidth, // 6
+                                      __private const int srcHeight, __private const int srcChannelC4,
+                                      __private const int dstHeightPad, __private const int srcChannelPad,
+                                      __private const int batch,
+                                      __private const int batchOffset) {
+    int2 pos = (int2)(get_global_id(0), get_global_id(1));
+    UNIFORM_BOUNDRY_CHECK(pos.x, pos.y);
+    if(pos.x >= unitWidth * unitHeight || pos.y >= srcChannelC4) {
+        return;
+    }
+    int unitWidth_idx = pos.x % unitWidth;
+    int unitHeight_idx = pos.x / unitWidth;
+    int dstXOrigin = pos.y;
+    int srcZ       = pos.y % srcChannelC4;
+    int dstYOrigin = unitWidth * unitHeight_idx + unitWidth_idx;
+    int batchIndex = batchOffset;
+    int sxStart = unitWidth_idx * 2 - padX;
+    int syStart = unitHeight_idx * 2 - padY;
+    int inp_offset = (((batchIndex + srcZ * batch) * srcHeight + syStart) * srcWidth + sxStart) * 4;
+    FLOAT4 S00, S10, S20, S30;
+    FLOAT4 S01, S11, S21, S31;
+    FLOAT4 S02, S12, S22, S32;
+    FLOAT4 S03, S13, S23, S33;
+    if(sxStart >= 0 && sxStart + 3 < srcWidth && syStart >= 0 && syStart + 3 < srcHeight) {
+        S00 = vload4(0, uInput+inp_offset+0+0*srcWidth);
+        S10 = vload4(0, uInput+inp_offset+4+0*srcWidth);
+        S20 = vload4(0, uInput+inp_offset+8+0*srcWidth);
+        S30 = vload4(0, uInput+inp_offset+12+0*srcWidth);
+        S01 = vload4(0, uInput+inp_offset+0+4*srcWidth);
+        S11 = vload4(0, uInput+inp_offset+4+4*srcWidth);
+        S21 = vload4(0, uInput+inp_offset+8+4*srcWidth);
+        S31 = vload4(0, uInput+inp_offset+12+4*srcWidth);
+        S02 = vload4(0, uInput+inp_offset+0+8*srcWidth);
+        S12 = vload4(0, uInput+inp_offset+4+8*srcWidth);
+        S22 = vload4(0, uInput+inp_offset+8+8*srcWidth);
+        S32 = vload4(0, uInput+inp_offset+12+8*srcWidth);
+        S03 = vload4(0, uInput+inp_offset+0+12*srcWidth);
+        S13 = vload4(0, uInput+inp_offset+4+12*srcWidth);
+        S23 = vload4(0, uInput+inp_offset+8+12*srcWidth);
+        S33 = vload4(0, uInput+inp_offset+12+12*srcWidth);
+    } else {
+        S00 = (sxStart+0 < 0 || sxStart+0 >= srcWidth || syStart+0 < 0 || syStart+0 >= srcHeight)
+                ? (FLOAT4)(0) : vload4(0, uInput+inp_offset+0+0*srcWidth);
+        S10 = (sxStart+1 < 0 || sxStart+1 >= srcWidth || syStart+0 < 0 || syStart+0 >= srcHeight)
+                ? (FLOAT4)(0) : vload4(0, uInput+inp_offset+4+0*srcWidth);
+        S20 = (sxStart+2 < 0 || sxStart+2 >= srcWidth || syStart+0 < 0 || syStart+0 >= srcHeight)
+                ? (FLOAT4)(0) : vload4(0, uInput+inp_offset+8+0*srcWidth);
+        S30 = (sxStart+3 < 0 || sxStart+3 >= srcWidth || syStart+0 < 0 || syStart+0 >= srcHeight)
+                ? (FLOAT4)(0) : vload4(0, uInput+inp_offset+12+0*srcWidth);
+        S01 = (sxStart+0 < 0 || sxStart+0 >= srcWidth || syStart+1 < 0 || syStart+1 >= srcHeight)
+                ? (FLOAT4)(0) : vload4(0, uInput+inp_offset+0+4*srcWidth);
+        S11 = (sxStart+1 < 0 || sxStart+1 >= srcWidth || syStart+1 < 0 || syStart+1 >= srcHeight)
+                ? (FLOAT4)(0) : vload4(0, uInput+inp_offset+4+4*srcWidth);
+        S21 = (sxStart+2 < 0 || sxStart+2 >= srcWidth || syStart+1 < 0 || syStart+1 >= srcHeight)
+                ? (FLOAT4)(0) : vload4(0, uInput+inp_offset+8+4*srcWidth);
+        S31 = (sxStart+3 < 0 || sxStart+3 >= srcWidth || syStart+1 < 0 || syStart+1 >= srcHeight)
+                ? (FLOAT4)(0) : vload4(0, uInput+inp_offset+12+4*srcWidth);
+        S02 = (sxStart+0 < 0 || sxStart+0 >= srcWidth || syStart+2 < 0 || syStart+2 >= srcHeight)
+                ? (FLOAT4)(0) : vload4(0, uInput+inp_offset+0+8*srcWidth);
+        S12 = (sxStart+1 < 0 || sxStart+1 >= srcWidth || syStart+2 < 0 || syStart+2 >= srcHeight)
+                ? (FLOAT4)(0) : vload4(0, uInput+inp_offset+4+8*srcWidth);
+        S22 = (sxStart+2 < 0 || sxStart+2 >= srcWidth || syStart+2 < 0 || syStart+2 >= srcHeight)
+                ? (FLOAT4)(0) : vload4(0, uInput+inp_offset+8+8*srcWidth);
+        S32 = (sxStart+3 < 0 || sxStart+3 >= srcWidth || syStart+2 < 0 || syStart+2 >= srcHeight)
+                ? (FLOAT4)(0) : vload4(0, uInput+inp_offset+12+8*srcWidth);
+        S03 = (sxStart+0 < 0 || sxStart+0 >= srcWidth || syStart+3 < 0 || syStart+3 >= srcHeight)
+                ? (FLOAT4)(0) : vload4(0, uInput+inp_offset+0+12*srcWidth);
+        S13 = (sxStart+1 < 0 || sxStart+1 >= srcWidth || syStart+3 < 0 || syStart+3 >= srcHeight)
+                ? (FLOAT4)(0) : vload4(0, uInput+inp_offset+4+12*srcWidth);
+        S23 = (sxStart+2 < 0 || sxStart+2 >= srcWidth || syStart+3 < 0 || syStart+3 >= srcHeight)
+                ? (FLOAT4)(0) : vload4(0, uInput+inp_offset+8+12*srcWidth);
+        S33 = (sxStart+3 < 0 || sxStart+3 >= srcWidth || syStart+3 < 0 || syStart+3 >= srcHeight)
+                ? (FLOAT4)(0) : vload4(0, uInput+inp_offset+12+12*srcWidth);
+    }
+    FLOAT4 m00 = S00 - S02;
+    FLOAT4 m01 = (FLOAT)0.5f * S01 + (FLOAT)0.5f * S02;
+    FLOAT4 m02 = -(FLOAT)0.5f * S01 + (FLOAT)0.5f * S02;
+    FLOAT4 m03 = -S01 + S03;
+    FLOAT4 m10 = S10 - S12;
+    FLOAT4 m11 = (FLOAT)0.5f * S11 + (FLOAT)0.5f * S12;
+    FLOAT4 m12 = -(FLOAT)0.5f * S11 + (FLOAT)0.5f * S12;
+    FLOAT4 m13 = -S11 + S13;
+    FLOAT4 m20 = S20 - S22;
+    FLOAT4 m21 = (FLOAT)0.5f * S21 + (FLOAT)0.5f * S22;
+    FLOAT4 m22 = -(FLOAT)0.5f * S21 + (FLOAT)0.5f * S22;
+    FLOAT4 m23 = -S21 + S23;
+    FLOAT4 m30 = S30 - S32;
+    FLOAT4 m31 = (FLOAT)0.5f * S31 + (FLOAT)0.5f * S32;
+    FLOAT4 m32 = -(FLOAT)0.5f * S31 + (FLOAT)0.5f * S32;
+    FLOAT4 m33 = -S31 + S33;
+    int out_offset = (0 * srcChannelPad + 4 * dstXOrigin) * dstHeightPad + dstYOrigin;
+    const int batch_offset = srcChannelPad * dstHeightPad;
+    FLOAT4 res;
+    res = m00 - m20;
+    uOutput[out_offset + 0 * batch_offset + 0 * dstHeightPad] = res.x;
+    uOutput[out_offset + 0 * batch_offset + 1 * dstHeightPad] = res.y;
+    uOutput[out_offset + 0 * batch_offset + 2 * dstHeightPad] = res.z;
+    uOutput[out_offset + 0 * batch_offset + 3 * dstHeightPad] = res.w;
+    res = (FLOAT)0.5f * m10 + (FLOAT)0.5f * m20;
+    uOutput[out_offset + 1 * batch_offset + 0 * dstHeightPad] = res.x;
+    uOutput[out_offset + 1 * batch_offset + 1 * dstHeightPad] = res.y;
+    uOutput[out_offset + 1 * batch_offset + 2 * dstHeightPad] = res.z;
+    uOutput[out_offset + 1 * batch_offset + 3 * dstHeightPad] = res.w;
+    res = -(FLOAT)0.5f * m10 + (FLOAT)0.5f * m20;
+    uOutput[out_offset + 2 * batch_offset + 0 * dstHeightPad] = res.x;
+    uOutput[out_offset + 2 * batch_offset + 1 * dstHeightPad] = res.y;
+    uOutput[out_offset + 2 * batch_offset + 2 * dstHeightPad] = res.z;
+    uOutput[out_offset + 2 * batch_offset + 3 * dstHeightPad] = res.w;
+    res = -m10 + m30;
+    uOutput[out_offset + 3 * batch_offset + 0 * dstHeightPad] = res.x;
+    uOutput[out_offset + 3 * batch_offset + 1 * dstHeightPad] = res.y;
+    uOutput[out_offset + 3 * batch_offset + 2 * dstHeightPad] = res.z;
+    uOutput[out_offset + 3 * batch_offset + 3 * dstHeightPad] = res.w;
+    res = m01 - m21;
+    uOutput[out_offset + 4 * batch_offset + 0 * dstHeightPad] = res.x;
+    uOutput[out_offset + 4 * batch_offset + 1 * dstHeightPad] = res.y;
+    uOutput[out_offset + 4 * batch_offset + 2 * dstHeightPad] = res.z;
+    uOutput[out_offset + 4 * batch_offset + 3 * dstHeightPad] = res.w;
+    res = (FLOAT)0.5f * m11 + (FLOAT)0.5f * m21;
+    uOutput[out_offset + 5 * batch_offset + 0 * dstHeightPad] = res.x;
+    uOutput[out_offset + 5 * batch_offset + 1 * dstHeightPad] = res.y;
+    uOutput[out_offset + 5 * batch_offset + 2 * dstHeightPad] = res.z;
+    uOutput[out_offset + 5 * batch_offset + 3 * dstHeightPad] = res.w;
+    res = -(FLOAT)0.5f * m11 + (FLOAT)0.5f * m21;
+    uOutput[out_offset + 6 * batch_offset + 0 * dstHeightPad] = res.x;
+    uOutput[out_offset + 6 * batch_offset + 1 * dstHeightPad] = res.y;
+    uOutput[out_offset + 6 * batch_offset + 2 * dstHeightPad] = res.z;
+    uOutput[out_offset + 6 * batch_offset + 3 * dstHeightPad] = res.w;
+    res = -m11 + m31;
+    uOutput[out_offset + 7 * batch_offset + 0 * dstHeightPad] = res.x;
+    uOutput[out_offset + 7 * batch_offset + 1 * dstHeightPad] = res.y;
+    uOutput[out_offset + 7 * batch_offset + 2 * dstHeightPad] = res.z;
+    uOutput[out_offset + 7 * batch_offset + 3 * dstHeightPad] = res.w;
+    res = m02 - m22;
+    uOutput[out_offset + 8 * batch_offset + 0 * dstHeightPad] = res.x;
+    uOutput[out_offset + 8 * batch_offset + 1 * dstHeightPad] = res.y;
+    uOutput[out_offset + 8 * batch_offset + 2 * dstHeightPad] = res.z;
+    uOutput[out_offset + 8 * batch_offset + 3 * dstHeightPad] = res.w;
+    res = (FLOAT)0.5f * m12 + (FLOAT)0.5f * m22;
+    uOutput[out_offset + 9 * batch_offset + 0 * dstHeightPad] = res.x;
+    uOutput[out_offset + 9 * batch_offset + 1 * dstHeightPad] = res.y;
+    uOutput[out_offset + 9 * batch_offset + 2 * dstHeightPad] = res.z;
+    uOutput[out_offset + 9 * batch_offset + 3 * dstHeightPad] = res.w;
+    res = -(FLOAT)0.5f * m12 + (FLOAT)0.5f * m22;
+    uOutput[out_offset + 10 * batch_offset + 0 * dstHeightPad] = res.x;
+    uOutput[out_offset + 10 * batch_offset + 1 * dstHeightPad] = res.y;
+    uOutput[out_offset + 10 * batch_offset + 2 * dstHeightPad] = res.z;
+    uOutput[out_offset + 10 * batch_offset + 3 * dstHeightPad] = res.w;
+    res = -m12 + m32;
+    uOutput[out_offset + 11 * batch_offset + 0 * dstHeightPad] = res.x;
+    uOutput[out_offset + 11 * batch_offset + 1 * dstHeightPad] = res.y;
+    uOutput[out_offset + 11 * batch_offset + 2 * dstHeightPad] = res.z;
+    uOutput[out_offset + 11 * batch_offset + 3 * dstHeightPad] = res.w;
+    res = m03 - m23;
+    uOutput[out_offset + 12 * batch_offset + 0 * dstHeightPad] = res.x;
+    uOutput[out_offset + 12 * batch_offset + 1 * dstHeightPad] = res.y;
+    uOutput[out_offset + 12 * batch_offset + 2 * dstHeightPad] = res.z;
+    uOutput[out_offset + 12 * batch_offset + 3 * dstHeightPad] = res.w;
+    res = (FLOAT)0.5f * m13 + (FLOAT)0.5f * m23;
+    uOutput[out_offset + 13 * batch_offset + 0 * dstHeightPad] = res.x;
+    uOutput[out_offset + 13 * batch_offset + 1 * dstHeightPad] = res.y;
+    uOutput[out_offset + 13 * batch_offset + 2 * dstHeightPad] = res.z;
+    uOutput[out_offset + 13 * batch_offset + 3 * dstHeightPad] = res.w;
+    res = -(FLOAT)0.5f * m13 + (FLOAT)0.5f * m23;
+    uOutput[out_offset + 14 * batch_offset + 0 * dstHeightPad] = res.x;
+    uOutput[out_offset + 14 * batch_offset + 1 * dstHeightPad] = res.y;
+    uOutput[out_offset + 14 * batch_offset + 2 * dstHeightPad] = res.z;
+    uOutput[out_offset + 14 * batch_offset + 3 * dstHeightPad] = res.w;
+    res = -m13 + m33;
+    uOutput[out_offset + 15 * batch_offset + 0 * dstHeightPad] = res.x;
+    uOutput[out_offset + 15 * batch_offset + 1 * dstHeightPad] = res.y;
+    uOutput[out_offset + 15 * batch_offset + 2 * dstHeightPad] = res.z;
+    uOutput[out_offset + 15 * batch_offset + 3 * dstHeightPad] = res.w;
+}

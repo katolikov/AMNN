@@ -72,6 +72,7 @@ private:
     std::vector<std::vector<uint32_t> > mLWS_M;
 private:
     int mAlignM;
+    std::string mSrcVariant = "";        // source-transform variant (MNN_WINO_SRC=stock|fast|w2)
 };
 
 } // namespace OpenCL
