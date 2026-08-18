@@ -211,12 +211,20 @@ def cooldown(d, seconds):
 
 
 def interleaved(fns, reps):
-    """Run labelled measurements round-robin (a,b,a,b,...) so thermal drift hits all arms
-    equally. fns = {label: callable(i)->float}. Returns {label: median}."""
+    """Run labelled measurements round-robin so thermal drift hits all arms equally.
+    fns = {label: callable(i)->float}. Returns {label: median}.
+
+    The arm ORDER IS ROTATED every rep. Without that, the first arm in the dict is measured first in
+    every rep and gets a systematic advantage whenever the device is still warming: a run of
+    section 9 on a cool device read default=119 / NO_WINOGRAD=268 for two arms that are the SAME
+    code path (verified 120.0 vs 119.0 cooled). Interleaving alone protects against drift ACROSS
+    reps, not WITHIN one."""
     acc = {k: [] for k in fns}
+    keys = list(fns)
     for i in range(reps):
-        for k, f in fns.items():
-            v = f(i)
+        r = i % len(keys)
+        for k in keys[r:] + keys[:r]:
+            v = fns[k](i)
             if v: acc[k].append(v)
     return {k: (statistics.median(v) if v else 0.0) for k, v in acc.items()}
 

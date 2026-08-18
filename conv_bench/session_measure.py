@@ -152,9 +152,11 @@ def interleaved(arms, reps=3, cool_s=8, verbose=True):
     Returns {label: (median, [raw...])} -- raw values are printed because a median spanning the
     throttle point is meaningless and you must be able to see that."""
     acc = {k: [] for k in arms}
+    keys = list(arms)
     for i in range(reps):
-        for k, f in arms.items():
-            v = f(i)
+        r = i % len(keys)              # rotate: never let one arm always be measured first
+        for k in keys[r:] + keys[:r]:
+            v = arms[k](i)
             if v: acc[k].append(v)
             if verbose: print(f"   rep{i} {k:<34} {v:8.1f}", flush=True)
         cool(cool_s)
