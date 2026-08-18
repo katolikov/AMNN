@@ -24,6 +24,13 @@ DEV = "/data/local/tmp/convprobe"
 R = []
 D = {}   # machine-readable results, written next to the report as .json
 
+# Every arm that FORCES a specific direct conv kernel must disable Winograd first. MNN picks the
+# Winograd path before MNN_CONV_FORCE is ever consulted, so without this the forced arm silently
+# runs the SAME Winograd kernels as the baseline and reports the no-flag value -- which reads as
+# "this kernel is exactly as fast as the default" instead of "the flag did nothing" (trap 4).
+# This became load-bearing once the §19 gate started admitting Winograd on the mid-size cores.
+NOWG = "MNN_NO_WINOGRAD=1 "
+
 
 def reset():
     """Allow a driver script (run_suite.py) to call main() more than once."""
@@ -305,7 +312,7 @@ def main(argv=None):
     # ---- 2. clock at the START (re-checked at the end; see §12)
     say("## 2. GPU clock at start of run\n")
     s, tbl = sample_clock(d, cores[0]["model"], cores[0]["shape"])
-    clk_start = max(s) if s else 0
+    clk_start = int(statistics.median(s)) if s else 0
     if s:
         mx, mn = max(s), min(s)
         pin = sum(1 for v in s if v == mx)
@@ -340,6 +347,11 @@ def main(argv=None):
 
     # ---- 4. variants -> the winner
     say("## 4. Kernel strategies (per-conv µs, lower is better)\n")
+    say("> **MNN default** is whatever MNN picks for this shape, which after the §19 gate may be\n"
+        "> Winograd. Every custom-kernel column runs with `MNN_NO_WINOGRAD=1` so the forced kernel\n"
+        "> actually engages -- otherwise it silently re-measures the default. All columns use\n"
+        "> `conv_all_us` (every conv kernel, transforms included), so a Winograd default and a\n"
+        "> direct custom kernel are charged on the same basis.\n")
     say("| shape | " + " | ".join(["MNN default"] + [v.replace("conv_2d_", "") for v in variants] + ["LDS"]) + " |")
     say("|" + "---|" * (len(variants) + 3))
     allrows = {}
@@ -347,14 +359,17 @@ def main(argv=None):
         m, shp, dep = c["model"], c["shape"], c["depth"]
         # INTERLEAVED (a,b,c,...,a,b,c,...) not arm-by-arm: this device throttles, and measuring
         # 13 arms sequentially would systematically penalise whichever runs last.
-        fns = {"MNN default": lambda i: conv_us(
+        # conv_all_us, NOT conv_us: the baseline may be Winograd (§19), and conv_us omits the two
+        # rearrange kernels -- on 48->48@36x48 it reads 34.5 against a true 67.0, which would make
+        # the default look ~2x better than it is and bury every custom kernel (§H.27).
+        fns = {"MNN default": lambda i: conv_all_us(
             run_model(d, m, shp, 120, cache=f"st{c['key']}{i}.bin")[0], dep)}
         for v in variants:
-            env = ("MNN_CONV_SPEC=1 " if v in spec_only else "") + f"MNN_CONV_FORCE={v}"
-            fns[v] = (lambda i, e=env, v=v: conv_us(
+            env = NOWG + ("MNN_CONV_SPEC=1 " if v in spec_only else "") + f"MNN_CONV_FORCE={v}"
+            fns[v] = (lambda i, e=env, v=v: conv_all_us(
                 run_model(d, m, shp, 120, env=e, cache=f"f{c['key']}{v[-5:]}{i}.bin")[0], dep))
-        fns["LDS"] = lambda i: conv_us(
-            run_model(d, m, shp, 120, env="MNN_CONV_LDS=1", cache=f"l{c['key']}{i}.bin")[0], dep)
+        fns["LDS"] = lambda i: conv_all_us(
+            run_model(d, m, shp, 120, env=NOWG + "MNN_CONV_LDS=1", cache=f"l{c['key']}{i}.bin")[0], dep)
         cooldown(d, cool_s)
         row = interleaved(fns, reps)
         allrows[c["key"]] = row
@@ -367,7 +382,8 @@ def main(argv=None):
         cand = {k: v for k, v in row.items() if v and k != "MNN default"}
         if not cand: continue
         best = min(cand, key=lambda k: cand[k])
-        summary[c["key"]] = (base, best, cand[best])
+        summary[c["key"]] = {"label": c["label"], "kind": "stride-1 core",
+                             "base": base, "best": best, "best_us": cand[best]}
         D.setdefault("winner", {})[c["key"]] = {"default_us": base, "best": best, "best_us": cand[best], "label": c["label"]}
         verdict = f"**{pct(cand[best], base)} vs MNN default**" if cand[best] < base else \
                   f"(MNN default already best; closest custom {best} {pct(cand[best], base)})"
@@ -388,13 +404,14 @@ def main(argv=None):
         for c in cores:
             cooldown(d, cool_s)
             m, shp, dep = c["model"], c["shape"], c["depth"]
-            fns = {"MNN default": lambda i, m=m, shp=shp, c=c: conv_us(
-                run_model(d, m, shp, 120, cache=f"hd{c['key']}{i}.bin")[0], dep)}
+            # every arm direct (NOWG) so HARD is isolated against a like-for-like baseline
+            fns = {"MNN default": lambda i, m=m, shp=shp, c=c: conv_all_us(
+                run_model(d, m, shp, 120, env=NOWG, cache=f"hd{c['key']}{i}.bin")[0], dep)}
             for v in hard_capable:
-                base = ("MNN_CONV_SPEC=1 " if v in spec_only else "") + f"MNN_CONV_FORCE={v}"
-                fns[v] = (lambda i, e=base, v=v, m=m, shp=shp, c=c: conv_us(
+                base = NOWG + ("MNN_CONV_SPEC=1 " if v in spec_only else "") + f"MNN_CONV_FORCE={v}"
+                fns[v] = (lambda i, e=base, v=v, m=m, shp=shp, c=c: conv_all_us(
                     run_model(d, m, shp, 120, env=e, cache=f"hp{c['key']}{v[-5:]}{i}.bin")[0], dep))
-                fns[v + "+HARD"] = (lambda i, e="MNN_CONV_HARD=1 " + base, v=v, m=m, shp=shp, c=c: conv_us(
+                fns[v + "+HARD"] = (lambda i, e="MNN_CONV_HARD=1 " + base, v=v, m=m, shp=shp, c=c: conv_all_us(
                     run_model(d, m, shp, 120, env=e, cache=f"hh{c['key']}{v[-5:]}{i}.bin")[0], dep))
             row = interleaved(fns, reps)
             cand = {k: t for k, t in row.items() if t}
@@ -446,6 +463,17 @@ def main(argv=None):
                 say(f"| {c['label']} | " +
                     " | ".join(f"{row[k][t]:.0f}" if row[k][t] else "-" for k in head_vars) +
                     f" | **{best.replace('conv_2d_','')}** |")
+                # feed §20. These winners used to be printed here and thrown away, so the
+                # recommendations silently covered stride-1 cores only.
+                # exclude the baseline from the CANDIDATE set: otherwise "best" can come back as
+                # "MNN default" and §20 prints the nonsense "no custom kernel beat it (closest
+                # `MNN default`)". §4 already does this; the head path did not.
+                custom = {k: v for k, v in cand.items() if k != "MNN default"}
+                if custom and row["MNN default"][t]:
+                    cbest = min(custom, key=lambda k: custom[k])
+                    summary[f"{h['key']}:{t}"] = {
+                        "label": c["label"], "kind": "stride-2 head",
+                        "base": row["MNN default"][t], "best": cbest, "best_us": custom[cbest]}
             D.setdefault("heads", {})[h["key"]] = {
                 "label": h["label"],
                 "convs": {c["label"]: {k: row[k][c["tag"]] for k in head_vars} for c in h["convs"]}}
@@ -458,8 +486,8 @@ def main(argv=None):
     for c in cores:
         m, shp, dep = c["model"], c["shape"], c["depth"]; row = {}
         for t in tiles:
-            row[t] = med(lambda i, t=t: conv_us(run_model(d, m, shp, 120,
-                         env=f"MNN_CONV_LDS=1 MNN_LDS_TILE={t}", cache=f"t{c['key']}{t}{i}.bin")[0], dep),
+            row[t] = med(lambda i, t=t: conv_all_us(run_model(d, m, shp, 120,
+                         env=NOWG + f"MNN_CONV_LDS=1 MNN_LDS_TILE={t}", cache=f"t{c['key']}{t}{i}.bin")[0], dep),
                          1 if a.quick else 2)
         bt = min(row, key=lambda t: row[t] if row[t] else 9e9)
         say(f"| {c['label']} | " + " | ".join(f"{row[t]:.0f}" for t in tiles) +
@@ -474,11 +502,11 @@ def main(argv=None):
         cooldown(d, cool_s)
         # interleaved with a fresh default measurement so all three share the same thermal state
         r = interleaved({
-            "im2col": lambda i, c=c: conv_us(run_model(d, c["im2col_model"], c["shape"], 200,
-                      env="MNN_NO_WINOGRAD=1 MNN_CONV_IM2COL=1", cache=f"ic{c['key']}{i}.bin")[0]),
-            "gemm": lambda i, c=c: conv_us(run_model(d, c["gemm_model"], c["gemm_shape"], 200,
-                    cache=f"gp{c['key']}{i}.bin")[0]),
-            "default": lambda i, c=c: conv_us(run_model(d, c["model"], c["shape"], 120,
+            "im2col": lambda i, c=c: conv_all_us(run_model(d, c["im2col_model"], c["shape"], 200,
+                      env=NOWG + "MNN_CONV_IM2COL=1", cache=f"ic{c['key']}{i}.bin")[0]),
+            "gemm": lambda i, c=c: conv_all_us(run_model(d, c["gemm_model"], c["gemm_shape"], 200,
+                    env=NOWG, cache=f"gp{c['key']}{i}.bin")[0]),
+            "default": lambda i, c=c: conv_all_us(run_model(d, c["model"], c["shape"], 120,
                        cache=f"dr{c['key']}{i}.bin")[0], c["depth"]),
         }, reps)
         im, gm, base = r["im2col"], r["gemm"], r["default"]
@@ -768,6 +796,11 @@ def main(argv=None):
         "> matrix — so treat a loss here as a bound, not a proof. Reference outcome: §H.38.\n\n")
 
     # ---- image (texture) memory mode vs buffer
+    # These last three sections DECIDE things (memory mode, GEMM tiles, the Winograd gate) and run
+    # at the hottest point of the report. A 5s cooldown is not enough there: on the reference device
+    # §17 read image mode at 115us where a cooled interleaved run reads 67.9us -- a 70% inflation
+    # that silently flipped the recommendation. Give them a real cooldown.
+    late_cool = max(cool_s, 30)
     say("\n## 17. Memory mode: buffer vs IMAGE (texture)\n")
     say("> `gpuMode` 68 = `MNN_GPU_MEMORY_BUFFER|WIDE`, 132 = `MNN_GPU_MEMORY_IMAGE|WIDE`. These are\n"
         "> two SEPARATE, fully-implemented backends (`execution/buffer/` vs `execution/image/`), both\n"
@@ -794,7 +827,7 @@ def main(argv=None):
             say(f"| {c['label']} | {iw}x{ih} | — | — | **SKIPPED** | exceeds {maxw}x{maxh} | — | — |")
             D["memory_mode"][key] = {"skipped": "exceeds image2d limit", "image_dims": [iw, ih]}
             continue
-        cooldown(d, cool_s)
+        cooldown(d, late_cool)
         # correctness gate: the CPU backend is the only independent ground truth. Comparing image
         # against the buffer GPU arm cannot tell "image is wrong" from "buffer does something extra"
         # -- that mistake nearly recorded a wrong result twice (FINDINGS §H.47).
@@ -845,14 +878,14 @@ def main(argv=None):
     say("|---|---|---|---|---|---|---|")
     D["gemm_tile"] = {}
     for c in cores:
-        cooldown(d, cool_s)
+        cooldown(d, late_cool)
         m, shp, dep, key = c["model"], c["shape"], c["depth"], c["key"]
         # instrument the selection rather than infer it: nothing in the profiler identifies which
         # XgemmBatched configuration ran (FINDINGS trap 4)
         o, _ = run_model(d, m, shp, 3, env="MNN_GEMM_DEBUG=1 MNN_FORCE_WINOGRAD=1",
                          cache=f"gt{key}.bin")
         gm = None
-        for mt in re.finditer(r"\[GEMM\] M=(\d+) N=(\d+) K=(\d+) batch=(\d+) -> tuned \| "
+        for mt in re.finditer(r"\[GEMM\] M=(\d+) N=(\d+) K=(\d+) batch=(\d+) -> (?:tuned|cached) \| "
                               r"MWG=(\d+) NWG=(\d+) KWG=\d+ MDIMC=(\d+) NDIMC=(\d+)", o):
             gm = mt
         if gm is None:
@@ -896,7 +929,7 @@ def main(argv=None):
     say("|---|---|---|---|---|---|---|")
     D["wino_gate"] = {}
     for c in cores:
-        cooldown(d, cool_s)
+        cooldown(d, late_cool)
         m, shp, dep, key = c["model"], c["shape"], c["depth"], c["key"]
         in_w, out_c = shp[3], shp[1]
         r = interleaved({
@@ -925,16 +958,80 @@ def main(argv=None):
 
     # ---- 11. what to do on this device
     say("## 20. Recommendations for THIS device\n")
+    say("> Per-conv advice covers **both** conv families measured here: the stride-1 cores (§4) and\n"
+        "> the stride-2 heads (§6). A claim counts only if it clears the **6% noise floor** measured\n"
+        "> from this suite's own control arms — 3% is inside run-to-run spread on this device.\n")
     recs = []
-    for c in cores:
-        if c["key"] in summary:
-            base, best, bt = summary[c["key"]]
-            if bt < base * 0.97:
-                recs.append(f"✅ **{c['label']}: use `{best}`** — {pct(bt, base)} vs MNN's default "
+    NOISE = 0.94   # 6% noise floor; controls in §9 spread +/-6%, mostly +/-2%
+
+    # Thermal gate. §17-§19 run at the hottest point of the report, and a throttled reading there
+    # is not a slow configuration -- it is a void measurement. Sample the sustained clock here and
+    # refuse to give late-section advice if the device is not at nominal.
+    s20, _ = sample_clock(d, cores[0]["model"], cores[0]["shape"])
+    nominal20 = int(hw.get("max_clock_mhz", 0) or 0)
+    sustained = int(statistics.median(s20)) if s20 else 0
+    thermal_ok = (not nominal20) or (not sustained) or sustained >= nominal20 * 0.9
+    if not thermal_ok:
+        say(f"> ⚠️ **The device is throttling ({sustained} MHz sustained vs {nominal20} MHz "
+            "nominal).** The memory-mode / GEMM-tile / Winograd-gate advice below is derived from\n"
+            "> §17-§19, which run at the end of this report, so those readings are inflated and the\n"
+            "> recommendations are SUPPRESSED. Re-run those three sections on a cooled device\n"
+            "> (`--cooldown 60`) before acting on them. The per-kernel advice from §4/§6 was\n"
+            "> measured early and is unaffected.\n")
+    D["recommend_thermal_ok"] = thermal_ok
+    D["recommend_sustained_mhz"] = sustained
+    for kind in ("stride-1 core", "stride-2 head"):
+        rows = [v for v in summary.values() if v["kind"] == kind]
+        if not rows:
+            continue
+        recs.append(f"**{kind}s**")
+        for r in rows:
+            base, best, bt = r["base"], r["best"], r["best_us"]
+            if not base:
+                continue
+            if bt < base * NOISE:
+                recs.append(f"  ✅ **{r['label']}: use `{best}`** — {pct(bt, base)} vs MNN's default "
                             f"({base:.0f}→{bt:.0f}µs). Wire it in via the autotuner or force it.")
+            elif bt < base:
+                recs.append(f"  ➖ **{r['label']}**: `{best}` is {pct(bt, base)} — **inside the 6% "
+                            f"noise floor**, not a result. Treat the default ({base:.0f}µs) as best.")
             else:
-                recs.append(f"➖ **{c['label']}**: MNN's default ({base:.0f}µs) is already best; no "
-                            f"custom kernel beat it (closest `{best}` {bt:.0f}µs).")
+                recs.append(f"  ➖ **{r['label']}**: MNN's default ({base:.0f}µs) is best; no custom "
+                            f"kernel beat it (closest `{best}` {bt:.0f}µs).")
+
+    # --- levers that are NOT per-kernel, and are usually larger than any of the above
+    mm = D.get("memory_mode", {}) if thermal_ok else {}
+    img_wins = [(k, v) for k, v in mm.items() if v.get("image_us") and v.get("buffer_default_us")
+                and v["image_us"] < v["buffer_default_us"] * NOISE]
+    if img_wins:
+        recs.append("**Memory mode**")
+        for k, v in img_wins:
+            lab = summary.get(k, {}).get("label", k)
+            recs.append(f"  🖼️ **{lab}: run this model in IMAGE mode** (`gpuMode=132`) — "
+                        f"{pct(v['image_us'], v['buffer_default_us'])} vs buffer "
+                        f"({v['buffer_default_us']:.0f}→{v['image_us']:.0f}µs). gpuMode is per-"
+                        "Interpreter, so a split pipeline can choose per model. Check §17 first: it "
+                        "is a shape-gated win, not a global one.")
+    starved = [(k, v) for k, v in (D.get("gemm_tile", {}) if thermal_ok else {}).items()
+               if v.get("threads_per_group", 99) <= 32]
+    if starved:
+        recs.append("**GEMM tile selection**")
+        for k, v in starved:
+            lab = summary.get(k, {}).get("label", k)
+            recs.append(f"  ⚙️ **{lab}**: the Winograd batchgemm runs {v['MWG']}x{v['NWG']} with only "
+                        f"{v['threads_per_group']} threads/group (N={v['N']}). If N is an odd multiple "
+                        "of 16 this is the §18 starvation case — check a tile candidate with NWG "
+                        "dividing N exists.")
+    gate_gap = [(k, v) for k, v in (D.get("wino_gate", {}) if thermal_ok else {}).items()
+                if v.get("forced_us") and v.get("new_gate_us")
+                and v["forced_us"] < v["new_gate_us"] * NOISE]
+    if gate_gap:
+        recs.append("**Winograd gate**")
+        for k, v in gate_gap:
+            lab = summary.get(k, {}).get("label", k)
+            recs.append(f"  📐 **{lab}**: forcing Winograd is {pct(v['forced_us'], v['new_gate_us'])} "
+                        "below what the gate selects — the `in_w <= 2*out_c` coefficient is wrong for "
+                        "this device. Re-fit it (§19), together with the §18 GEMM tiles.")
     if sg.get("shuffle"):
         recs.append("🔥 **Build the implicit-GEMM conv** — `sub_group_shuffle` works here, so the "
                     "3×3 column gather can happen in registers (no LDS, no barriers). Combine with "
@@ -948,13 +1045,19 @@ def main(argv=None):
     for r in recs: say(f"- {r}")
 
     # ---- 12. clock re-check: did the device throttle over the run?
-    say("\n## 18. GPU clock at END of run (thermal validity check)\n")
+    say("\n## 21. GPU clock at END of run (thermal validity check)\n")
     cooldown(d, cool_s)
     s2c, _ = sample_clock(d, cores[0]["model"], cores[0]["shape"])
-    clk_end = max(s2c) if s2c else 0
+    clk_end = int(statistics.median(s2c)) if s2c else 0
+    nominal = int(hw.get("max_clock_mhz", 0) or 0)
+    throttled = ([x for x in s2c if nominal and x < nominal * 0.9] if s2c else [])
     D["clock_end_mhz"] = clk_end; D["clock_start_mhz"] = clk_start
-    say(f"- start of run: **{clk_start} MHz**  →  end of run: **{clk_end} MHz**"
-        + (f" (samples {s2c})" if s2c else ""))
+    D["clock_end_min_mhz"] = min(s2c) if s2c else 0
+    D["clock_throttled_fraction"] = (len(throttled) / len(s2c)) if s2c else 0.0
+    say(f"- start of run: **{clk_start} MHz** (median)  →  end of run: **{clk_end} MHz** (median)"
+        + (f", min {min(s2c)} MHz, {100*len(throttled)/len(s2c):.0f}% of samples below 90% of "
+           f"nominal" if s2c else ""))
+    say(f"- (raw end samples {s2c})" if s2c else "")
     if clk_start and clk_end:
         drop = 100 * (clk_start - clk_end) / clk_start
         if drop <= 5:

@@ -2105,3 +2105,48 @@ low-channel, exactly where the gate should say no.
 For reference, image mode on Block2 is 806 µs. Buffer has closed most of the gap (1058 → 889 vs
 806); the residual is the stride-2 head convs on the direct path, where image wins independently
 (§H.51).
+
+
+### §H.54 — Report bug hunt: the recommendation mechanism was covering only half the convs
+
+Reported by the user: the per-device recommendation "doesn't provide the overall best suggestion for
+both stride-2 conv blocks and conv blocks." Correct, and it turned out to be five defects in one
+chain, three of which I had just introduced with the §H.52/§H.53 changes.
+
+| # | defect | effect |
+|---|---|---|
+| 1 | `summary` was populated only in the §4 `for c in cores` loop. §6 computed a winner for every stride-2 head conv, printed it, and **discarded it**. | §20 covered stride-1 cores ONLY — six head convs silently absent |
+| 2 | §4/§5/§7/§8 scored with `conv_us`, which **omits the Winograd transforms** | once §H.53's gate started admitting Winograd on the 48-core, the baseline read **34.5 µs against a true 67.0** — the default looked ~2x better than it is and buried every custom kernel |
+| 3 | forced-kernel arms had no `MNN_NO_WINOGRAD=1` | MNN selects Winograd **before** `MNN_CONV_FORCE` is consulted, so every variant arm silently re-ran the default. Measured: default 67.0, `c4h4w2` 69.0, `c4h1w4` 66.9 — identical kernel names. **Trap 4, verbatim** |
+| 4 | §18's parser matched only `-> tuned` | `getGemmParams` prints `-> cached` on a tuner-cache hit, so a re-run reported "no batchgemm on this path" for every shape and §20 lost the GEMM-tile advice entirely |
+| 5 | thermal validity used `max()` of the clock samples | samples `[980 x13, 653, 764, 836, 764, 836, 764, 605]` reported **"VALID — clock held within 0%"** |
+
+Defect 5 is why 1-4 went unnoticed: §17-§19 run ~40 min into the report, and with `--quick`'s 5 s
+cooldown the device was throttling hard. §17 measured image mode at **115 µs where a cooled
+interleaved run reads 67.9** — a 70% inflation that flipped its verdict — while the report cheerfully
+certified the run as thermally valid.
+
+**Fixes.** `summary` carries both conv families and a `kind` field, fed from §4 and §6; all
+kernel-comparison sections use `conv_all_us`; every forced arm gets `MNN_NO_WINOGRAD=1`; the §18
+parser accepts `tuned|cached`; the thermal check uses the **median** and additionally reports the
+minimum and the fraction of samples below 90% of nominal; §17-§19 get `late_cool = max(cool_s, 30)`;
+and §20 samples the sustained clock itself and **suppresses** the memory-mode / GEMM-tile / gate
+advice when the device is throttling, since a throttled reading there is a void measurement rather
+than a slow configuration. §20 also now requires the **6% noise floor** (it used 3%, inside spread)
+and excludes the baseline from the head candidate set (it could return "best = MNN default").
+
+**A result of mine that this invalidates.** The first re-run reported the stride-2 heads at
+`18->16@288x384 s2` default 473 µs, best 272 µs (**-42%**), which I quoted. On the cooled re-run the
+same conv reads **148 µs default with no custom kernel beating it**. The -42% was thermal, not a
+kernel win. The cooled head results are: `34->32@144x192 s2` **-29%**, `64->64@72x96 s2` -13%,
+`32->48@72x96 s2` -10%, `64->96@36x48 s2` -8%, and the two largest heads showing no win at all.
+
+**And one conclusion this updates.** With the gate and GEMM fixes in the buffer path, §17 now reads
+`48->48@36x48` as buffer 66 / image 68 — **image mode is no longer a win on that shape.** §H.51's
+-33% was measured against the OLD buffer default. Image mode's remaining advantage is the direct
+path at low channel counts, not this core.
+
+**Process note.** Every one of defects 2, 3 and 5 is a trap already written down in this file's own
+trap list, re-committed by me within the same session that documented them. The metric trap is
+listed as trap 0. Writing a trap down does not prevent it; only a mechanised check does — which is
+why the fixes above are in the report itself rather than in this prose.
