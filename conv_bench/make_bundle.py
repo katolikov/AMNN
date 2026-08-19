@@ -21,7 +21,12 @@ from bench import convert, LIBS, MODULE
 from block_fixture import load_blocks, build_onnx
 
 OUT = REPO / "conv_bench" / "conv_probe_bundle"
-CORES = [(32, 72, 96), (48, 36, 48), (96, 18, 24)]   # homogeneous 6-deep stride-1 cores
+# Homogeneous 6-deep stride-1 cores. Every kernel-strategy section of the report iterates over
+# CORES (and HEADS); a conv that appears in neither list gets NO strategy coverage at all, which is
+# why the small-channel convs of Block3/Block4 were unmeasured until they were added here.
+# 8@288x384 and 16@144x192 are 63.7 MMAC/conv -- identical to 32@72x96, so they extend the existing
+# MAC-matched comparison rather than introducing a new workload class.
+CORES = [(32, 72, 96), (48, 36, 48), (96, 18, 24), (8, 288, 384), (16, 144, 192)]
 
 # Stride-2 "head" pairs: two 3x3 s2 convs that halve the spatial size twice. Each conv has a
 # different shape, so these are reported PER CONV (matched by the shape tag MNN puts in the
@@ -33,6 +38,12 @@ HEADS = [
                 dict(cin=32, cout=48, H=72,  W=96,  stride=2, pad=1, prelu=1)]),
     ("head64", [dict(cin=64, cout=64, H=72,  W=96,  stride=2, pad=1, prelu=1),
                 dict(cin=64, cout=96, H=36,  W=48,  stride=2, pad=1, prelu=1)]),
+    # Block3/Block4 stride-2 convs. They chain exactly (576x768 -> 288x384 -> 144x192), so this is
+    # the model's own pyramid, not an invented pair. cin=1 is the interesting case: NC4HW4 pads it
+    # to 4 channels, a 4x input-read tax, where §H.39's heads only paid 6-11% (cin=18/34). The NCHW
+    # section iterates cores+heads, so adding this measures that regime for the first time.
+    ("head1",  [dict(cin=1,  cout=8,  H=576, W=768, stride=2, pad=1, prelu=1),
+                dict(cin=8,  cout=16, H=288, W=384, stride=2, pad=1, prelu=1)]),
 ]
 CC = (32, 24, 48)                            # correctness shape: %16/%4 (LDS) and %6/%6 (fused2) ok
 VARIANTS = ["conv_2d_c4h1w1", "conv_2d_c4h1w2", "conv_2d_c4h4w1", "conv_2d_c4h1w4",
@@ -199,9 +210,14 @@ def main():
             c0 = convs[0]
             p = tmp / f"{name}.onnx"; build_onnx(str(p), convs)
             convert(str(p), str(OUT / "models" / f"{name}.mnn"), fp16=False, fuse_prelu=False)
-            convert(str(p), str(OUT / "models" / f"{name}_fused.mnn"), fp16=False, fuse_prelu=True)
+            # Only emit the fused model where there is a PReLU to fold. For a bare-conv block the
+            # fused convert is a no-op, and the report would score plain-vs-plain as "no saving".
+            has_prelu = any(c["prelu"] for c in convs)
+            if has_prelu:
+                convert(str(p), str(OUT / "models" / f"{name}_fused.mnn"), fp16=False, fuse_prelu=True)
             man["blocks"].append({"key": name, "model": f"{name}.mnn",
-                                  "fused_model": f"{name}_fused.mnn",
+                                  "fused_model": (f"{name}_fused.mnn" if has_prelu else None),
+                                  "has_prelu": has_prelu,
                                   "shape": [1, c0["cin"], c0["H"], c0["W"]]})
             print(f"   block {name}")
     except Exception as e:

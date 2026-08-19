@@ -2150,3 +2150,91 @@ path at low channel counts, not this core.
 trap list, re-committed by me within the same session that documented them. The metric trap is
 listed as trap 0. Writing a trap down does not prevent it; only a mechanised check does — which is
 why the fixes above are in the report itself rather than in this prose.
+
+### §H.55 — Small-channel cores added to the suite: one real win, one retracted claim, one thermally invalid run
+Session added `Block96` (head64+core96, the 96-level that existed only as parts), three bare
+`s2+s1` blocks (Block3/4/5), two cores (`8@288x384`, `16@144x192`) and one head
+(`head1 = 1->8@576x768 s2 -> 8->16@288x384 s2`). **Why they were missing is structural, not neglect:**
+every strategy section of `run_report.py` iterates `cores` or `heads`; only §11 touches `blocks`, and
+only plain-vs-fused. A conv gets strategy coverage **iff it appears in CORES or HEADS**. Before this
+session exactly 4 convs (Block3/Block4's) were in neither list.
+
+**THE FULL-SUITE RUN IS THERMALLY INVALID FOR ABSOLUTES.** 3h29m under the governor, no root:
+GPU **980 -> 747 MHz** (min 629), `clock_throttled_fraction = 1.0`, `recommend_thermal_ok = False`.
+Within-section A/B deltas survive (arms interleaved + rotated); absolute us and cross-section
+comparisons do not. This is the §H.43 trap at suite scale, and it produced a false headline (below).
+
+**RETRACTED: the "-53% autotuner miss on 16->16@144x192" does not exist.** The suite reported MNN
+default 231 us vs `c8h4w1` 108 us (-53%), and image mode 88 us (-62%) — two independent paths
+beating the default by >2x, which read as a real defect. **Cooled re-measurement falsifies it:**
+
+| arm (core_16, total kernel time, 4 reps, rotated, cooled) | median | vs default | reps |
+|---|---|---|---|
+| default | 796.5 | — | 797, 796, 796, 797 |
+| **ctrl** (default again, different cache) | **796.5** | **+0.0%** | 797, 796, 796, 797 |
+| `c8h4w1` forced | 898.5 | **+12.8%** | 797, 801, **1023, 996** |
+| image mode | 690.0 | **-13.4%** | 689, 692, 690, 690 |
+
+Forcing `c8h4w1` is **slower**, not 2x faster, and its arm is **bimodal** (28% spread) against a
+**0.0% control floor** — the arm itself is unreliable. The suite's 231 us default for that row is
+irreconcilable with the cooled 796.5 us chain, so the baseline it was measured against was inflated.
+**Lesson: a 2x win reported against a throttled baseline is a baseline finding, not a kernel finding.**
+The `ctrl` arm is what settled it, and the suite had no such arm — its accidental control (§19 old-gate
+vs new-gate, identical code path where both reject) read **248 vs 288, +16%**, which was the warning.
+
+**REAL AND REPRODUCIBLE: image mode wins on the small-channel cores.** Cooled, whole-chain, control
+floor 0.0-0.1%, all reps within +-0.5%:
+
+| core | buffer default | image | delta |
+|---|---|---|---|
+| `16->16@144x192` | 796.5 | **690.0** | **-13.4%** |
+| `8->8@288x384` | 958.0 | **877.0** | **-8.5%** |
+
+This is §H.51's `C<=48` rule holding at C=8/16, and it is the payoff for adding the cores: Block3 and
+Block4 now have a lever they did not have. **Quote the whole-chain number, not the suite's conv-only
+-62%/-18%** — the latter share the inflated baseline, and image mode does not accelerate the Raster
+and PReLU dispatches that dominate these blocks.
+
+**NCHW at cin=1: the mechanism is real, the economics still lose.** §H.39 falsified NCHW on heads
+with cin=18/34 — 11% and 6% padding waste. `head1`'s first conv is **cin=1, padded to 4 = a 300%
+input-read tax**, an order of magnitude outside the falsified regime, so it was worth re-testing.
+
+| shape | NC4HW4 | NCHW | delta | conversions (EXCLUDED) |
+|---|---|---|---|---|
+| `1->8@576x768` (head1) | 168 | 157 | **-7%** | **286** |
+| `16->16@144x192` | 108 | 100 | -7% | 422 |
+| `8->8@288x384` | 111 | 115 | -3% (HARD) | **777** |
+| head18 (cin=18) | 214 | 271 | +27% | 271 |
+| head64 (cin=64) | 285 | 425 | +49% | 85 |
+
+**The first NCHW conv-time wins in this investigation** — the padding argument is correct. But the
+layout conversions cost **286 us against a 168 us conv** (and 777 vs 111 at C=8): the fix costs
+1.7-7x what it saves. NCHW stays falsified end-to-end unless the conversions fold across the graph.
+
+**Winograd gate: 5/5 correct, including both new cores.** `8->8@288x384` forced = **915 vs 111
+(+724%)**, `16->16@144x192` = **849 vs 288**. Verdict "gate agrees with the clock" on every core
+except `48->48@36x48`, where the new gate captures -34%. The `ic>=32 && oc>=32` clause — whose own
+code comment said it had never been checked against the clock — is now checked and vindicated;
+independently, `32->32@72x96` forced re-measured at **+17.3%** (§H.28 recorded +19.6%).
+**Do not relax the channel floor.** Stride-2 convs cannot take Winograd at all, so in `s2+s1` block
+pairs only the second conv is ever a candidate.
+
+**Block96 has its first whole-graph number:** 1220 -> 1146 us, **-6%** from PReLU fusion — the only
+shipped win that reaches it (the gate admits its core via the older `ic/oc>=64` clause, and 96 is an
+*even* multiple of 16 so the §H.52 tile fix never applies).
+
+**Harness defects found and fixed:**
+1. **split-K ran ineligible factors.** `ConvBufExecution` gates on `inputChannelBlocks >= splitK`;
+   C=8 has 2 blocks, so `splitK=4` was silently ignored and the arm **re-measured the default** —
+   printing as a real number equal to baseline, i.e. "no effect". Now gated, renders `n/a (Cin<16)`.
+2. **`fused2` is not just slow, it is WRONG:** correctness cosine **-0.005629 = FAIL** against the
+   conv^2 reference. Falsified for speed in §H.25/§H.44 and off by default, so nothing else is
+   tainted, but the kernel is broken.
+3. **Bare-conv blocks scored plain-vs-plain.** Block3/4/5 have no PReLU; the fused arm converted a
+   byte-identical model and the report flagged "no saving — is PReLU fusion supported?". Now
+   conditional on the block's own `has_prelu`, rendering `n/a (no PReLU)`.
+4. **Kernel-variant engagement cannot be detected from kernel names.** MNN labels profiling events by
+   conv PATH (`ConvBuf2D-ori-...`), never by variant, so `MNN_CONV_FORCE=<kernel>` has **no
+   observable confirmation** in the profile output. Every §4/§5 number rests on the flag having
+   worked, unverifiably — this is §H.34's silent-no-op hazard, still open. **Needs a kernel-name or
+   marker emitted by the specialised kernels before any variant claim can be trusted.**

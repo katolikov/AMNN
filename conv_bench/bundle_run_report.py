@@ -605,6 +605,14 @@ def main(argv=None):
     say("|---|---|---|---|")
     for b in man["blocks"]:
         cooldown(d, cool_s)
+        # Bare-conv blocks have no PReLU to fold: run the single arm rather than scoring a
+        # byte-identical model against itself and flagging the tautological "no saving".
+        if not b.get("has_prelu", True):
+            t0 = med(lambda i, b=b: total_us(run_model(d, b["model"], b["shape"], 120,
+                     cache=f"{b['key']}a{i}.bin")[0]), 2 if a.quick else 3)
+            D.setdefault("blocks", {})[b["key"]] = {"plain_us": t0, "prelu_fused_us": None}
+            say(f"| {b['key']} | {t0:.0f} | _n/a (no PReLU)_ | — |")
+            continue
         r = interleaved({
             "plain": lambda i, b=b: total_us(run_model(d, b["model"], b["shape"], 120,
                      cache=f"{b['key']}a{i}.bin")[0]),
@@ -690,13 +698,17 @@ def main(argv=None):
             "w2base": lambda i, m=m, shp=shp, dep=dep, k=k: conv_all_us(
                 run_model(d, m, shp, 60, env="MNN_CONV_SPEC=1 MNN_CONV_FORCE=conv_2d_c4h1w2",
                           cache=f"sb_b{k}{i}.bin")[0], dep),
-            "sk2": lambda i, m=m, shp=shp, dep=dep, k=k: conv_all_us(
-                run_model(d, m, shp, 60, env="MNN_CONV_SPLITK=2",
-                          cache=f"sb_2{k}{i}.bin")[0], dep),
-            "sk4": lambda i, m=m, shp=shp, dep=dep, k=k: conv_all_us(
-                run_model(d, m, shp, 60, env="MNN_CONV_SPLITK=4",
-                          cache=f"sb_4{k}{i}.bin")[0], dep),
         }
+        # ConvBufExecution gates split-K on `inputChannelBlocks >= splitK`. Below that the flag is
+        # silently ignored and the arm re-measures the DEFAULT -- it would print as a real number
+        # equal to the baseline, i.e. "split-K has no effect", which is not what was measured.
+        # C=8 has 2 channel blocks, so splitK=4 must not be run there at all.
+        in_blocks = (c["C"] + 3) // 4
+        for f in (2, 4):
+            if in_blocks >= f:
+                fns[f"sk{f}"] = (lambda i, m=m, shp=shp, dep=dep, k=k, f=f: conv_all_us(
+                    run_model(d, m, shp, 60, env=f"MNN_CONV_SPLITK={f}",
+                              cache=f"sb_{f}{k}{i}.bin")[0], dep))
         if tile:
             fns["lds"] = lambda i, m=m, shp=shp, dep=dep, k=k, tl=tile: conv_all_us(
                 run_model(d, m, shp, 60, env=f"MNN_CONV_LDS=w2 MNN_LDS_TILE={tl}",
@@ -704,8 +716,9 @@ def main(argv=None):
         r = interleaved(fns, reps)
         D.setdefault("session_b", {})[k] = r
         lds_s = f"{r['lds']:.0f}" if tile else "n/a (tile)"
+        sk = {f: (f"{r[f'sk{f}']:.0f}" if f"sk{f}" in r else f"n/a (Cin<{4*f})") for f in (2, 4)}
         say(f"| {c['label']} | {r['def']:.0f} | {r['w2base']:.0f} | {lds_s} | "
-            f"{r['sk2']:.0f} | {r['sk4']:.0f} |")
+            f"{sk[2]} | {sk[4]} |")
     say("\n> **How to read this table on YOUR device** (the reference numbers are in FINDINGS\n"
         "> §H.30/§H.31 and are NOT repeated here, because the whole point is to re-decide):\n"
         "> - `c4h1w2+LDS` vs `c4h1w2` isolates LDS at constant blocking. LDS pays when the input\n"

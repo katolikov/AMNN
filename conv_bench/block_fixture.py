@@ -125,7 +125,12 @@ if __name__ == "__main__":
     for name, convs in blocks.items():
         if which != "all" and name != which:
             continue
-        r, out = run_block(name, convs, fuse_prelu=fuse)
+        # A bare-conv block has no PReLU to fold: the fused arm would convert to a byte-identical
+        # model and "measure" the plain number twice. Run it once instead of reporting a fake A/B.
+        has_prelu = any(c["prelu"] for c in convs)
+        if fuse and not has_prelu:
+            print(f"  ({name}: no PReLU in this block -- fused arm skipped, running plain)")
+        r, out = run_block(name, convs, fuse_prelu=fuse and has_prelu)
         results[name] = {k: v for k, v in r.items() if k != "convs"}
         raw[name] = out
     (REPO / "conv_bench" / "block_baseline.json").write_text(json.dumps(results, indent=2, default=str))

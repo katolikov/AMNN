@@ -75,7 +75,7 @@ def convert(onnx_path, mnn_path, fp16=False, fuse_prelu=False):
 
 
 def run_on_device(mnn_path, in_name, in_shape, out_name, fwd=3, loops=200, gpu_mode=68,
-                  prec_mem_mask=2, clear_cache=True, tuning_cache="conv.cache"):
+                  prec_mem_mask=2, clear_cache=True, tuning_cache="conv.cache", env=""):
     LOCAL.mkdir(parents=True, exist_ok=True)
     tdir = LOCAL / "tdir"; tdir.mkdir(exist_ok=True)
     (tdir / "input.json").write_text(json.dumps({
@@ -90,7 +90,8 @@ def run_on_device(mnn_path, in_name, in_shape, out_name, fwd=3, loops=200, gpu_m
         adb(f"shell rm -f {DEV}/{tuning_cache}")
     libpath = DEV
     # args: model Dir runMask fwd loops gpuMode mask cache
-    cmd = (f"shell 'cd {DEV} && LD_LIBRARY_PATH={libpath} ./ModuleBasic.out {base} tdir "
+    # env: extra "K=V " prefix for measurement flags (MNN_FORCE_WINOGRAD=1, ...)
+    cmd = (f"shell 'cd {DEV} && {env}LD_LIBRARY_PATH={libpath} ./ModuleBasic.out {base} tdir "
            f"0 {fwd} {loops} {gpu_mode} {prec_mem_mask} {tuning_cache} 2>&1'")
     r = adb(cmd)
     return r.stdout + r.stderr
