@@ -252,7 +252,10 @@ def main():
     # its own tooling simply does not carry it).
     for src, dst, required in (("bundle_run_report.py", "run_report.py", True),
                                ("bundle_run_suite.py", "run_suite.py", False),
-                               ("bundle_clocks.py", "clocks.py", False)):
+                               ("bundle_clocks.py", "clocks.py", False),
+                               # the integrity gate must travel WITH the bundle: run_suite.py runs
+                               # it before any timing, and without it no cell can be validated
+                               ("preflight.py", "preflight.py", False)):
         s = REPO / "conv_bench" / src
         if not s.exists():
             if required:
@@ -262,6 +265,15 @@ def main():
         os.chmod(OUT / dst, 0o755)
 
     (OUT / "README.md").write_text(f"""# Conv-strategy probe — self-contained bundle
+
+**Before any timing, `run_suite.py` runs `preflight.py` (~1 min) and gates on it.** Preflight is a
+measurement-INTEGRITY audit, not a benchmark: it proves each arm actually engages, that comparisons
+are not confounded by algorithm choice, that the parser sees every dispatch, and that every case is
+numerically correct against CPU. It writes `preflight_result.json`, which `run_report.py` reads to
+mark cells `invalid` where an arm does not measure what its column header claims. That file is a
+per-device, per-build artifact and is intentionally not version-controlled -- it is regenerated on
+each run. A GLOBAL preflight failure aborts the suite; cell-scoped failures only mask those cells.
+Override with `--skip-preflight`, which produces an UNVALIDATED report.
 
 Sets the clocks on one Android device, runs every convolution strategy we have implemented, and
 writes a report that tells you **which one is fastest on that device**.
