@@ -30,7 +30,79 @@ bool ConvBufWinograd::valid(const Convolution2DCommon* common, const Tensor* inp
         return input->width() * input->height() <= 4096;
     }
 
-    bool valid = input->channel() >= 32 && output->channel() >= 32 && input->width() < output->channel();
+    // MNN_FORCE_WINOGRAD=1: bypass the channel/size heuristic below and take the Winograd path for
+    // ANY 3x3 s1 d1 conv. The hard requirements above still apply. Measurement flag only -- it
+    // exists so the heuristic's verdict can be checked against the clock on a new device, which is
+    // how the coefficient below was fitted.
+    if (nullptr != getenv("MNN_FORCE_WINOGRAD")) {
+        return true;
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Winograd selection gate.
+    //
+    // The idea behind the stock clause `input->width() < output->channel()` is right: F(2,3)
+    // trades arithmetic for two extra transform kernels, so its cost scales with the SPATIAL size
+    // and its saving with the CHANNEL count. But the cutoff was calibrated far too tightly -- it
+    // refused shapes where Winograd wins by 20-34%.
+    //
+    // Re-fitted on device (Samsung Xclipse 960, RDNA-class, OpenCL buffer mode, fp16), 14 shapes,
+    // 3x3 s1, interleaved arms, thermally settled, scored on the SUM of every conv kernel per loop
+    // with the transforms INCLUDED -- MNN's own `conv time` counter omits the two rearrange
+    // kernels and so flatters Winograd by roughly 2x:
+    //
+    //     C     HxW      in_w   default   forced Winograd    delta
+    //     16    72x96      96     45.0         71.9         +59.8%   loss
+    //     24    72x96      96     85.0        128.0         +50.6%   loss
+    //     32    72x96      96    118.7        142.0         +19.6%   loss
+    //     48    72x96      96    264.3        214.0         -19.0%   WIN
+    //     64    72x96      96    278.0        279.7          +0.6%   neutral
+    //     16    36x48      48     26.0         33.0         +26.8%   loss
+    //     32    36x48      48     58.0         46.0         -20.7%   WIN
+    //     48    36x48      48    101.7         66.9         -34.2%   WIN
+    //     64    36x48      48     82.9         82.9          +0.0%   neutral
+    //     96    36x48      48    125.8        124.8          -0.8%   neutral
+    //     32    18x24      24     31.0         28.0          -9.7%   WIN
+    //     48    18x24      24     33.0         33.0          +0.1%   neutral
+    //     96    18x24      24     50.0         51.0          +2.0%   neutral
+    //     32   144x192    192    380.0        580.0         +52.6%   loss
+    //
+    // Scoring `input->width() <= K * output->channel()` against that table, with the
+    // ic/oc >= 32 floor kept:
+    //
+    //     K = 1.0 (stock, strict <)   2 missed wins, 0 admitted losses
+    //     K = 1.5                     1 missed win,  0 admitted losses
+    //     K = 2.0                     0 missed wins, 0 admitted losses   <-- chosen
+    //     K = 2.5                     0 missed wins, 0 admitted losses
+    //     K = 3.0                     0 missed wins, 1 admitted loss
+    //
+    // K = 2 is the conservative end of the admissible band. The binding constraints are
+    // 48->48@72x96 (needs K >= 2.0) and 32->32@72x96 (needs K < 3.0).
+    //
+    // ORDERING NOTE, load-bearing. The table above was taken on a build that ALREADY contains the
+    // XgemmBatched tall-skinny tile fix in OpenCLGemmTune.cpp (the immediately preceding commit).
+    // That fix moves exactly the shapes this gate governs: 48->48@72x96 flipped from +11.9% to
+    // -19.0% because of it, and without it the best coefficient measures as 1.5 instead. So this
+    // gate must not be applied on its own -- alone it would switch Winograd on for shapes that are
+    // only fast when the tile fix is present, making those convolutions slower while still looking
+    // like a correct heuristic.
+    //
+    // CAVEAT: this is a fit on ONE device and MNN's heuristic is global. When characterising new
+    // hardware, re-fit this coefficient and the GEMM tile candidates TOGETHER, not separately;
+    // MNN_FORCE_WINOGRAD=1 above is the lever for taking the "forced Winograd" column.
+    //
+    // MNN_WINOGRAD_GATE_OLD=1 restores the stock clause, so the before/after arms can be
+    // interleaved within ONE binary on ONE thermally-settled device -- the only comparison that
+    // holds up on a GPU that throttles under sustained load.
+    // -----------------------------------------------------------------------------------------
+    if (nullptr != getenv("MNN_WINOGRAD_GATE_OLD")) {
+        bool old = input->channel() >= 32 && output->channel() >= 32 &&
+                   input->width() < output->channel();
+        return old || (input->channel() >= 64 && output->channel() >= 64);
+    }
+
+    bool valid = input->channel() >= 32 && output->channel() >= 32 &&
+                 input->width() <= 2 * output->channel();
     valid = valid || (input->channel() >= 64 && output->channel() >= 64);
     return valid;
 }
