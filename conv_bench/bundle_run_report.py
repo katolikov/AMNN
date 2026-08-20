@@ -297,6 +297,9 @@ def main(argv=None):
                     help="only run these sections, e.g. --sections 15,17 (default: all). Sections "
                          "not selected are skipped entirely -- no device work, no output. Use with "
                          "--resume to reuse data already collected by an earlier run.")
+    ap.add_argument("--resume-from", default=None,
+                    help="explicit comma-separated json file(s) to resume from (default: every "
+                         "prior result json in the bundle dir, oldest first)")
     ap.add_argument("--resume", action="store_true",
                     help="load numbers from a previous run's .json so skipped sections still have "
                          "their data available for cross-section references and §20.")
@@ -360,13 +363,25 @@ def main(argv=None):
     # --resume: reuse an earlier run's numbers so a partial re-run still has cross-section data
     # (§7 and §20 read §4's baseline; §20 reads almost everything).
     if a.resume:
-        prev = HERE / f"detail_gpu{a.tag}.json" if hasattr(a, "tag") else None
-        cands = sorted(HERE.glob("detail_*.json"))
-        if cands:
-            D.update(json.loads(cands[-1].read_text()))
-            print(f"   (resumed {len(D)} keys from {cands[-1].name})")
+        # Chunked runs each write their own <out>.json, so resume must MERGE every prior result,
+        # not read one file. It globbed only detail_*.json before -- which our --out runs never
+        # produce, so resume silently restored nothing (and would happily have loaded a stray
+        # hand-made test file). Oldest first, so newer sections win on key collisions.
+        cands = [p for p in sorted(HERE.glob("*.json"), key=lambda x: x.stat().st_mtime)
+                 if p.name not in ("manifest.json", "_input.json", "preflight_result.json")]
+        if a.resume_from:
+            cands = [Path(x) for x in a.resume_from.split(",")]
+        n = 0
+        for c in cands:
+            try:
+                D.update(json.loads(c.read_text())); n += 1
+            except Exception as e:
+                print(f"   (--resume: skipping {c.name}: {e})")
+        if n:
+            print(f"   (resumed {len(D)} keys from {n} file(s): "
+                  f"{', '.join(c.name for c in cands)})")
         else:
-            print("   (--resume: no previous detail_*.json found; nothing to resume)")
+            print("   (--resume: no previous result json found; nothing to resume)")
 
     cores = man["cores"]           # [{key,label,C,H,W}]
     # Cells that preflight proved are not measuring what their column header claims (a flag that a
