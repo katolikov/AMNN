@@ -22,7 +22,44 @@ HERE = Path(__file__).resolve().parent
 BIN, MODELS, REFD = HERE / "bin", HERE / "models", HERE / "ref"
 DEV = "/data/local/tmp/convprobe"
 R = []
-D = {}   # machine-readable results, written next to the report as .json
+
+# Set by main()'s sec() marker; consulted by say(), run_model(), cooldown(), sample_clock() and D.
+_SKIP = {"on": False}
+
+
+class ResultDict(dict):
+    """The .json payload, but writes are DROPPED while a section is skipped.
+
+    A skipped section still executes its Python -- run_model() returns empty, the parsers return
+    0.0, and the section then stores those zeros. That produced a .json full of `0.0` entries
+    indistinguishable from real measurements, and under --resume the skipped sections would
+    OVERWRITE the very data resume had just loaded. Guarding the container is the only place that
+    catches every write path without touching 20 section bodies.
+    """
+    def __setitem__(self, k, v):
+        if _SKIP["on"]: return
+        super().__setitem__(k, v)
+
+    def setdefault(self, k, default=None):
+        # the caller usually subscripts the RESULT, e.g. D.setdefault("blocks", {})[key] = row --
+        # so while skipping, hand back a throwaway dict that is not attached to D.
+        if _SKIP["on"]:
+            return type(default)() if isinstance(default, (dict, list)) else default
+        return super().setdefault(k, default)
+
+    def update(self, *a, **kw):
+        if _SKIP["on"]: return
+        super().update(*a, **kw)
+
+    def __missing__(self, k):
+        # Sections commonly write then immediately read back: `D["hw"] = {...}` followed by
+        # `D["hw"]["x"] = y`. With the write dropped, that read would KeyError and kill the run.
+        # While skipping, hand back a throwaway dict so the chained write lands nowhere.
+        if _SKIP["on"]: return {}
+        raise KeyError(k)
+
+
+D = ResultDict()   # machine-readable results, written next to the report as .json
 
 # Every arm that FORCES a specific direct conv kernel must disable Winograd first. MNN picks the
 # Winograd path before MNN_CONV_FORCE is ever consulted, so without this the forced arm silently
@@ -38,6 +75,7 @@ def reset():
 
 
 def say(s=""):
+    if _SKIP["on"]: return
     print(s, flush=True); R.append(s)
 
 
@@ -60,6 +98,8 @@ def list_devices():
 def run_model(d, model, shape, loops, env="", cache="p.bin", pull=False, timeout=600,
               mode=68, ftype=3):
     """Push model+input.json, run ModuleBasic, return (stdout, output_floats_or_None)."""
+    if _SKIP["on"]:
+        return "", None          # section not selected: no device work at all
     inj = HERE / "_input.json"
     inj.write_text(json.dumps({"inputs": [{"name": "input", "shape": shape}],
                                "outputs": ["output"], "shapeMutable": False}))
@@ -81,11 +121,13 @@ def run_model(d, model, shape, loops, env="", cache="p.bin", pull=False, timeout
 
 
 def conv_us(out, depth=1):
+    if not out: return 0.0
     c = [int(t) for t in re.findall(r"conv time = (\d+) us", out)][3:]
     return (statistics.median(c) / depth) if c else 0.0
 
 
 def conv_all_us(out, depth=1):
+    if not out: return 0.0
     """Sum of EVERY conv-related kernel per loop -- winograd transforms, layout conversions and
     im2col included. MUST be used instead of conv_us() whenever an arm can change which conv
     IMPLEMENTATION runs (MNN_FORCE_WINOGRAD / MNN_NO_WINOGRAD / MNN_CONV_LDS / MNN_CONV_SPLITK /
@@ -156,6 +198,7 @@ def per_conv_us(out, tags):
 
 
 def total_us(out):
+    if not out: return 0.0
     t = [int(x) for x in re.findall(r"total kernel time = (\d+)  us", out)][3:]
     return statistics.median(t) if t else 0.0
 
@@ -185,6 +228,8 @@ def sample_clock(d, model, shape, seconds=6):
     NOTE: kills the helper run by PID -- `pkill -f ModuleBasic.out` would match (and kill) the
     very shell issuing it, leaving the background run alive to hog the GPU.
     """
+    if _SKIP["on"]:
+        return [], ""      # skipped section: do not run a 20000-loop job just to sample the clock
     tbl = d.shell("cat /sys/kernel/gpu/gpu_freq_table").strip()
     inj = HERE / "_input.json"
     inj.write_text(json.dumps({"inputs": [{"name": "input", "shape": shape}],
@@ -213,6 +258,10 @@ def sample_clock(d, model, shape, seconds=6):
 
 def cooldown(d, seconds):
     """Let the GPU cool so a later section isn't measured on a throttled clock."""
+    # A skipped section performs no measurement, so it has nothing to cool for. Without this,
+    # --sections still slept the full wall-clock of every section it skipped: `--sections 3` ran
+    # for over 10 minutes doing nothing but 60s sleeps, which defeats the entire point.
+    if _SKIP["on"]: return
     if seconds <= 0: return
     print(f"   (cooldown {seconds}s)", flush=True)
     d.shell(f"sleep {seconds}", timeout=seconds + 60)
@@ -244,6 +293,16 @@ def main(argv=None):
     ap.add_argument("--list", action="store_true", help="list attached devices and exit")
     ap.add_argument("--quick", action="store_true", help="fewer repeats/tiles (~4 min)")
     ap.add_argument("-o", "--out", default=None, help="report path (default report_<serial>.md)")
+    ap.add_argument("--sections", default=None,
+                    help="only run these sections, e.g. --sections 15,17 (default: all). Sections "
+                         "not selected are skipped entirely -- no device work, no output. Use with "
+                         "--resume to reuse data already collected by an earlier run.")
+    ap.add_argument("--resume", action="store_true",
+                    help="load numbers from a previous run's .json so skipped sections still have "
+                         "their data available for cross-section references and §20.")
+    ap.add_argument("--list-sections", action="store_true", help="print the section list and exit")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="report which sections would run/skip, touch no device, exit")
     ap.add_argument("--cooldown", type=int, default=None,
                     help="seconds of GPU idle between heavy sections (default 20, 5 with --quick); "
                          "this device throttles under prolonged load, so do not set 0 unless you "
@@ -258,9 +317,90 @@ def main(argv=None):
         print(f"Specify --serial. Attached: {devs or '(none)'}"); sys.exit(1)
     d = Dev(serial)
     reps = 1 if a.quick else 3
-    cool_s = a.cooldown if a.cooldown is not None else (5 if a.quick else 20)
+    # 20s was not enough (a 3.5h run fell 980 -> 747 MHz, invalidating every cross-section
+    # absolute); 60s made a full run ~9h. 30s is the compromise -- verify against §21's end-of-run
+    # clock rather than assuming it holds.
+    cool_s = a.cooldown if a.cooldown is not None else (5 if a.quick else 30)
     man = json.loads((HERE / "manifest.json").read_text())
+    # ---- section selection ------------------------------------------------------------------
+    # The report is one long linear function, so instead of re-indenting 20 blocks (and risking a
+    # silent behaviour change in a 5h run) an unselected section is neutralised at the EDGES: say()
+    # suppresses output and run_model() returns immediately without touching the device. The
+    # section's Python still executes, but it does no work and emits nothing.
+    WANT = None if not a.sections else {x.strip() for x in a.sections.split(",")}
+    STATE = {"sec": "0", "skip": False}
+    def sec(n):
+        """Mark the start of section n. Everything after this is skipped unless n is selected."""
+        STATE["sec"] = str(n)
+        STATE["skip"] = (WANT is not None and str(n) not in WANT)
+        _SKIP["on"] = STATE["skip"]
+        if STATE["skip"]:
+            print(f"   (section {n}: skipped)", flush=True)
+        return not STATE["skip"]
+
+    SECTIONS = {1:"Hardware", 2:"GPU clock at start", 3:"Subgroup capability",
+                4:"Kernel strategies", 5:"Shape hardcoding", 6:"Stride-2 head pairs",
+                7:"LDS tile sweep", 8:"im2col + GEMM", 9:"Winograd vs direct",
+                10:"Fused 2-layer megakernel", 11:"Real model blocks", 12:"Concurrency",
+                13:"Correctness", 14:"LDS-at-constant-blocking + split-K", 15:"NCHW layout",
+                16:"im2col+GEMM in NCHW", 17:"Memory mode buffer vs IMAGE",
+                18:"Winograd batchgemm tile", 19:"Winograd selection gate",
+                20:"Recommendations", 21:"GPU clock at END (thermal validity)"}
+    if a.list_sections:
+        print("sections:")
+        for k, v in SECTIONS.items(): print(f"  {k:>2}  {v}")
+        return
+    if a.dry_run:
+        print(f"selection: {a.sections or 'ALL'}")
+        for k, v in SECTIONS.items():
+            mark = "RUN " if (WANT is None or str(k) in WANT) else "skip"
+            print(f"  [{mark}] {k:>2}  {v}")
+        print("\n(dry run: no device was touched)")
+        return
+    # --resume: reuse an earlier run's numbers so a partial re-run still has cross-section data
+    # (§7 and §20 read §4's baseline; §20 reads almost everything).
+    if a.resume:
+        prev = HERE / f"detail_gpu{a.tag}.json" if hasattr(a, "tag") else None
+        cands = sorted(HERE.glob("detail_*.json"))
+        if cands:
+            D.update(json.loads(cands[-1].read_text()))
+            print(f"   (resumed {len(D)} keys from {cands[-1].name})")
+        else:
+            print("   (--resume: no previous detail_*.json found; nothing to resume)")
+
     cores = man["cores"]           # [{key,label,C,H,W}]
+    # Cells that preflight proved are not measuring what their column header claims (a flag that a
+    # path guard rejected, or a comparison confounded by algorithm). They are rendered `invalid`
+    # rather than printed as numbers -- a plausible number in the wrong column is the failure mode
+    # this whole audit exists to stop.
+    INVALID = {}
+    _pf = HERE / "preflight_result.json"
+    if not _pf.exists(): _pf = HERE.parent / "preflight_result.json"
+    if _pf.exists():
+        for _c in json.loads(_pf.read_text()).get("invalid_cells", []):
+            for _sec in str(_c["section"]).split(","):
+                INVALID.setdefault(_sec.strip(), {})[_c["shape"]] = _c["why"]
+        _known = {c["key"] for c in man["cores"]} | {h["key"] for h in man.get("heads", [])} \
+                 | {b["key"] for b in man.get("blocks", [])}
+        _cells = {k for v in INVALID.values() for k in v}
+        _orphan = _cells - _known
+        print(f"   (preflight: {sum(len(v) for v in INVALID.values())} invalid cell(s) will be masked)")
+        if _orphan:
+            # Silent no-op guard: this exact mismatch (preflight said "core32@72x96", the manifest
+            # says "32_72x96") printed "1 cell will be masked" and then masked nothing, so a
+            # confounded number was published as if valid.
+            print(f"   !! WARNING: {len(_orphan)} preflight cell(s) match NO case in the manifest "
+                  f"and will mask NOTHING: {sorted(_orphan)}")
+            print(f"      known keys: {sorted(_known)}")
+    else:
+        print("   (no preflight_result.json -- cells cannot be validated; run preflight.py first)")
+    def invalid(sec, key):
+        """sec may be a single section ("17") or several ("4,7,14") -- preflight stores each
+        section separately, so a multi-section lookup must check each one, not the joined string."""
+        for one in str(sec).split(","):
+            why = INVALID.get(one.strip(), {}).get(key)
+            if why: return why
+        return None
     variants = man["variants"]     # [kernel names]
     spec_only = set(man["spec_only"])
     stride1_only = set(man.get("stride1_only", []))
@@ -284,6 +424,7 @@ def main(argv=None):
     summary = {}
 
     # ---- 1. hardware
+    sec(1)
     say("## 1. Hardware\n")
     out, _ = run_model(d, cores[0]["model"], cores[0]["shape"], 1, env="MNN_DUMP_CL_EXT=1", cache="hw.bin")
     hw, exts, shuffle = {}, "", None
@@ -310,6 +451,7 @@ def main(argv=None):
     if exts: say(f"\n<details><summary>CL extensions</summary>\n\n```\n{exts}\n```\n</details>\n")
 
     # ---- 2. clock at the START (re-checked at the end; see §12)
+    sec(2)
     say("## 2. GPU clock at start of run\n")
     s, tbl = sample_clock(d, cores[0]["model"], cores[0]["shape"])
     clk_start = int(statistics.median(s)) if s else 0
@@ -330,6 +472,7 @@ def main(argv=None):
         say("- could not read `/sys/kernel/gpu/gpu_clock` (timings unvalidated)\n")
 
     # ---- 3. subgroup
+    sec(3)
     say("## 3. Subgroup capability\n")
     out, _ = run_model(d, cores[0]["model"], cores[0]["shape"], 1, env="MNN_SUBGROUP_PROBE=1", cache="sg.bin")
     sg = {}
@@ -346,14 +489,20 @@ def main(argv=None):
         say("\n> No `sub_group_shuffle` — register-level halo sharing not available in OpenCL here.\n")
 
     # ---- 4. variants -> the winner
+    sec(4)
     say("## 4. Kernel strategies (per-conv µs, lower is better)\n")
     say("> **MNN default** is whatever MNN picks for this shape, which after the §19 gate may be\n"
         "> Winograd. Every custom-kernel column runs with `MNN_NO_WINOGRAD=1` so the forced kernel\n"
         "> actually engages -- otherwise it silently re-measures the default. All columns use\n"
         "> `conv_all_us` (every conv kernel, transforms included), so a Winograd default and a\n"
         "> direct custom kernel are charged on the same basis.\n")
-    say("| shape | " + " | ".join(["MNN default"] + [v.replace("conv_2d_", "") for v in variants] + ["LDS"]) + " |")
-    say("|" + "---|" * (len(variants) + 3))
+    say("> **Baseline parity:** `MNN default` is measured with `MNN_NO_WINOGRAD=1`, the same\n"
+        "> constraint every variant arm carries, so this table compares KERNELS. `(free choice)` is\n"
+        "> MNN picking any algorithm including Winograd -- compare that against §19, not against\n"
+        "> the variants.\n")
+    say("| shape | " + " | ".join(["MNN default", "(free choice)"]
+                                  + [v.replace("conv_2d_", "") for v in variants] + ["LDS"]) + " |")
+    say("|" + "---|" * (len(variants) + 4))
     allrows = {}
     for c in cores:
         m, shp, dep = c["model"], c["shape"], c["depth"]
@@ -362,8 +511,15 @@ def main(argv=None):
         # conv_all_us, NOT conv_us: the baseline may be Winograd (§19), and conv_us omits the two
         # rearrange kernels -- on 48->48@36x48 it reads 34.5 against a true 67.0, which would make
         # the default look ~2x better than it is and bury every custom kernel (§H.27).
+        # BASELINE PARITY: every variant arm carries MNN_NO_WINOGRAD=1, so the baseline must too.
+        # Without it, on a Winograd shape (48->48@36x48, 96->96@18x24) the "MNN default" column was
+        # Winograd while all 15 variant columns were direct convolution -- "nothing beat the
+        # default" then meant "Winograd beats direct", which is a §19 question, not a kernel one.
+        # Free-choice default is reported separately so the Winograd advantage is not lost.
         fns = {"MNN default": lambda i: conv_all_us(
-            run_model(d, m, shp, 120, cache=f"st{c['key']}{i}.bin")[0], dep)}
+            run_model(d, m, shp, 120, env=NOWG, cache=f"st{c['key']}{i}.bin")[0], dep)}
+        fns["(free choice)"] = lambda i: conv_all_us(
+            run_model(d, m, shp, 120, cache=f"fc{c['key']}{i}.bin")[0], dep)
         for v in variants:
             env = NOWG + ("MNN_CONV_SPEC=1 " if v in spec_only else "") + f"MNN_CONV_FORCE={v}"
             fns[v] = (lambda i, e=env, v=v: conv_all_us(
@@ -374,12 +530,17 @@ def main(argv=None):
         row = interleaved(fns, reps)
         allrows[c["key"]] = row
         D.setdefault("variants", {})[c["key"]] = dict(row)
-        say(f"| {c['label']} | " + " | ".join(f"{row[k]:.1f}" if row.get(k) else "-"
-                                              for k in ["MNN default"] + variants + ["LDS"]) + " |")
+        def _cell(k, c=c, row=row):
+            if k == "LDS" and invalid("4,7,14", c["key"]):
+                return "**invalid**"   # flag rejected by a path guard: this would be the default
+            return f"{row[k]:.1f}" if row.get(k) else "-"
+        say(f"| {c['label']} | " + " | ".join(
+            _cell(k) for k in ["MNN default", "(free choice)"] + variants + ["LDS"]) + " |")
     say("")
     for c in cores:
         row = allrows[c["key"]]; base = row["MNN default"]
-        cand = {k: v for k, v in row.items() if v and k != "MNN default"}
+        cand = {k: v for k, v in row.items()
+                if v and k not in ("MNN default", "(free choice)")}
         if not cand: continue
         best = min(cand, key=lambda k: cand[k])
         summary[c["key"]] = {"label": c["label"], "kind": "stride-1 core",
@@ -391,6 +552,7 @@ def main(argv=None):
     say("")
 
     # ---- 5. shape hardcoding
+    sec(5)
     say("## 5. Shape hardcoding (MNN_CONV_HARD=1)\n")
     if not hard_capable:
         say("_(this bundle has no kernels that read the HC_* constants)_\n")
@@ -423,6 +585,7 @@ def main(argv=None):
             "> reference device this was worth an extra ~11 percentage points on the main core.\n")
 
     # ---- 6. stride-2 head pairs (per conv)
+    sec(6)
     say("## 6. Stride-2 head pairs (per-conv µs, lower is better)\n")
     heads = man.get("heads", [])
     if not heads:
@@ -480,7 +643,11 @@ def main(argv=None):
         say("")
 
     # ---- 7. LDS tiles
+    sec(7)
     say("## 7. LDS tile sweep\n")
+    say("> Shapes where a path guard rejects `MNN_CONV_LDS` (no tile divides the output) are shown\n"
+        "> as `invalid`: the flag is accepted on the command line but never applied, so the arm\n"
+        "> silently re-measures the default (preflight §B2).\n")
     say("| shape | " + " | ".join(tiles) + " | best LDS | vs MNN default |")
     say("|" + "---|" * (len(tiles) + 3))
     for c in cores:
@@ -489,12 +656,18 @@ def main(argv=None):
             row[t] = med(lambda i, t=t: conv_all_us(run_model(d, m, shp, 120,
                          env=NOWG + f"MNN_CONV_LDS=1 MNN_LDS_TILE={t}", cache=f"t{c['key']}{t}{i}.bin")[0], dep),
                          1 if a.quick else 2)
+        if invalid("4,7,14", c["key"]):
+            # every tile was rejected by the path guard, so every number here is the default
+            say(f"| {c['label']} | " + " | ".join("—" for _ in tiles)
+                + f" | **invalid** | {invalid('4,7,14', c['key'])} |")
+            continue
         bt = min(row, key=lambda t: row[t] if row[t] else 9e9)
         say(f"| {c['label']} | " + " | ".join(f"{row[t]:.0f}" for t in tiles) +
             f" | **{bt} = {row[bt]:.0f}** | {pct(row[bt], allrows[c['key']]['MNN default'])} |")
     say("")
 
     # ---- 6. im2col + GEMM
+    sec(8)
     say("## 8. im2col + GEMM (and implicit-GEMM headroom)\n")
     say("| shape | im2col | GEMM | total | MNN default | explicit verdict | **GEMM vs default** |")
     say("|---|---|---|---|---|---|---|")
@@ -518,6 +691,7 @@ def main(argv=None):
         "> straightforward if `sub_group_shuffle` is available (§3).\n")
 
     # ---- 7. Winograd: is it even selected, and does disabling it help?
+    sec(9)
     say("## 9. Winograd vs direct\n")
     say("> Measured with **conv_all_us** (every conv kernel, transforms included). MNN's `conv\n"
         "> time` counter omits the Winograd rearrange passes and would flatter Winograd by ~2x\n"
@@ -558,6 +732,7 @@ def main(argv=None):
         "> (FINDINGS §H.28/§H.29). It is a per-conv decision, never a per-model one.\n")
 
     # ---- 8. fused megakernel
+    sec(10)
     say("## 10. Fused 2-layer megakernel (NC4HW4 and NCHW)\n")
     say("> Both fused kernels apply the SAME weights twice, so they fit in one conv Execution and\n"
         "> are checked against the numpy conv(conv(x)) reference in §13. Each is compared with 2x\n"
@@ -600,6 +775,7 @@ def main(argv=None):
         "> device. Fusion therefore wins only where inter-layer traffic is genuinely expensive.\n")
 
     # ---- 8. real blocks
+    sec(11)
     say("## 11. Real model blocks (deployment numbers)\n")
     say("| block | plain | PReLU-fused | saving |")
     say("|---|---|---|---|")
@@ -626,6 +802,7 @@ def main(argv=None):
     say("")
 
     # ---- 9. concurrency
+    sec(12)
     say("## 12. Concurrency (2 independent streams)\n")
     MIN = re.compile(r"min= ([\d.]+) ms")
     m0, shp0 = cores[0]["model"], cores[0]["shape"]
@@ -652,6 +829,7 @@ def main(argv=None):
         say("- probe failed\n")
 
     # ---- 10. correctness
+    sec(13)
     say("## 13. Correctness (custom kernels vs MNN default output)\n")
     cc = man["correctness"]
     d.push(REFD / "cc_input.txt", f"{DEV}/tdir/input.txt")
@@ -676,6 +854,7 @@ def main(argv=None):
     say("")
 
     # ---- Session-B strategies (all env-gated, all default OFF)
+    sec(14)
     say("## 14. LDS-at-constant-blocking and split-K\n")
     say("> Two strategies that were previously closed by reasoning alone and are now measured.\n"
         "> `MNN_CONV_LDS=w2` is conv_2d_c4h1w2 with the input staged in __local -- its comparison\n"
@@ -715,7 +894,8 @@ def main(argv=None):
                           cache=f"sb_l{k}{i}.bin")[0], dep)
         r = interleaved(fns, reps)
         D.setdefault("session_b", {})[k] = r
-        lds_s = f"{r['lds']:.0f}" if tile else "n/a (tile)"
+        lds_s = ("**invalid**" if invalid("4,7,14", k)
+                 else (f"{r['lds']:.0f}" if tile else "n/a (tile)"))
         sk = {f: (f"{r[f'sk{f}']:.0f}" if f"sk{f}" in r else f"n/a (Cin<{4*f})") for f in (2, 4)}
         say(f"| {c['label']} | {r['def']:.0f} | {r['w2base']:.0f} | {lds_s} | "
             f"{sk[2]} | {sk[4]} |")
@@ -733,6 +913,7 @@ def main(argv=None):
         "> the thermal validity section at the end before trusting cross-section comparisons.\n")
 
     # ---- NCHW layout
+    sec(15)
     say("\n## 15. NCHW layout instead of NC4HW4 (conv-kernel time only)\n")
     say("> **Metric caveat, read before using these numbers.** The NCHW path needs an\n"
         "> NC4HW4->NCHW conversion before the conv and an NCHW->NC4HW4 conversion after it. In a\n"
@@ -767,6 +948,7 @@ def main(argv=None):
         "> (stride 2) / §H.40 (hardcoding).\n")
 
     # ---- im2col + GEMM in NCHW
+    sec(16)
     say("\n## 16. im2col + GEMM in NCHW\n")
     say("> **Trap:** at C>=64 MNN selects the Winograd path before any MNN_CONV_* flag is read, so\n"
         "> every arm would silently measure the same kernel. All arms here therefore run with\n"
@@ -814,6 +996,7 @@ def main(argv=None):
     # §17 read image mode at 115us where a cooled interleaved run reads 67.9us -- a 70% inflation
     # that silently flipped the recommendation. Give them a real cooldown.
     late_cool = max(cool_s, 30)
+    sec(17)
     say("\n## 17. Memory mode: buffer vs IMAGE (texture)\n")
     say("> `gpuMode` 68 = `MNN_GPU_MEMORY_BUFFER|WIDE`, 132 = `MNN_GPU_MEMORY_IMAGE|WIDE`. These are\n"
         "> two SEPARATE, fully-implemented backends (`execution/buffer/` vs `execution/image/`), both\n"
@@ -830,16 +1013,18 @@ def main(argv=None):
         "> below is checked against the limit before it is run.\n")
     maxw, maxh = D.get("hw", {}).get("image2d_max_width", 0), D.get("hw", {}).get("image2d_max_height", 0)
     say("| shape | image dims | buffer default | buffer forced-wino | **image** | image vs default | "
-        "image vs best buffer | vs CPU |")
-    say("|---|---|---|---|---|---|---|---|")
+        "image vs best buffer | buf direct | img direct | **memory-mode only** | vs CPU |")
+    say("|---|---|---|---|---|---|---|---|---|---|---|")
     D["memory_mode"] = {}
     for c in cores:
         m, shp, dep, key = c["model"], c["shape"], c["depth"], c["key"]
         iw, ih = shp[3] * ((shp[1] + 3) // 4), shp[0] * shp[2]
         if maxw and (iw > maxw or ih > maxh):
-            say(f"| {c['label']} | {iw}x{ih} | — | — | **SKIPPED** | exceeds {maxw}x{maxh} | — | — |")
+            say(f"| {c['label']} | {iw}x{ih} | — | — | **SKIPPED** | exceeds {maxw}x{maxh} "
+                f"| — | — | — | — | — |")
             D["memory_mode"][key] = {"skipped": "exceeds image2d limit", "image_dims": [iw, ih]}
             continue
+        conf = invalid("17f", key)   # gates disagree: free-choice columns are algorithm-confounded
         cooldown(d, late_cool)
         # correctness gate: the CPU backend is the only independent ground truth. Comparing image
         # against the buffer GPU arm cannot tell "image is wrong" from "buffer does something extra"
@@ -850,6 +1035,11 @@ def main(argv=None):
                              pull=True, ftype=0)
         _, img_v = run_model(d, m, shp, 2, cache=f"mmimg{key}.bin", pull=True, mode=132)
         cos = cosine(cpu_v, img_v)
+        # The free-choice arms (bd/im) answer "what do I get by flipping gpuMode" -- but the two
+        # backends have DIFFERENT Winograd gates (ConvBufWinograd::valid has an in_w term,
+        # ConvWinograd::valid does not), so on a shape where they disagree that comparison is
+        # algorithm-vs-algorithm, not memory mode. bdd/imd pin BOTH backends to the direct path via
+        # MNN_NO_WINOGRAD (now honoured by the image backend too) to isolate the memory mode.
         r = interleaved({
             "bd": lambda i, m=m, shp=shp, key=key: conv_all_us(
                 run_model(d, m, shp, 120, cache=f"mmbd{key}{i}.bin")[0], dep),
@@ -858,14 +1048,26 @@ def main(argv=None):
                           cache=f"mmbw{key}{i}.bin")[0], dep),
             "im": lambda i, m=m, shp=shp, key=key: conv_all_us(
                 run_model(d, m, shp, 120, cache=f"mmim{key}{i}.bin", mode=132)[0], dep),
+            "bdd": lambda i, m=m, shp=shp, key=key: conv_all_us(
+                run_model(d, m, shp, 120, env=NOWG, cache=f"mmbdd{key}{i}.bin")[0], dep),
+            "imd": lambda i, m=m, shp=shp, key=key: conv_all_us(
+                run_model(d, m, shp, 120, env=NOWG, cache=f"mmimd{key}{i}.bin", mode=132)[0], dep),
         }, reps)
         bd, bw, im = r["bd"], r["bw"], r["im"]
+        bdd, imd = r["bdd"], r["imd"]
         best_buf = min(x for x in (bd, bw) if x) if (bd or bw) else 0
-        D["memory_mode"][key] = {"buffer_default_us": bd, "buffer_forced_wino_us": bw,
-                                 "image_us": im, "image_dims": [iw, ih], "cos_vs_cpu": cos}
+        D["memory_mode"][key] = {"confounded_free_choice": conf, "buffer_default_us": bd, "buffer_forced_wino_us": bw,
+                                 "image_us": im, "buffer_direct_us": bdd, "image_direct_us": imd,
+                                 "image_dims": [iw, ih], "cos_vs_cpu": cos}
         flag = "ok" if cos > 0.999 else f"**{cos:.4f} MISMATCH**"
-        say(f"| {c['label']} | {iw}x{ih} | {bd:.0f} | {bw:.0f} | **{im:.0f}** | {pct(im, bd)} | "
-            f"{pct(im, best_buf)} | {flag} |")
+        if conf:
+            # free-choice columns compare algorithms here, so they are not rendered as numbers;
+            # the pinned pair below is a valid memory-mode comparison and IS rendered.
+            say(f"| {c['label']} | {iw}x{ih} | _conf._ | _conf._ | _confounded_ | — | — | "
+                f"{bdd:.0f} | {imd:.0f} | **{pct(imd, bdd)}** | {flag} |")
+        else:
+            say(f"| {c['label']} | {iw}x{ih} | {bd:.0f} | {bw:.0f} | **{im:.0f}** | {pct(im, bd)} | "
+                f"{pct(im, best_buf)} | {bdd:.0f} | {imd:.0f} | **{pct(imd, bdd)}** | {flag} |")
     say("\n> **How to read the last two columns.** `image vs default` is what you would actually get\n"
         "> by flipping gpuMode. `image vs best buffer` is the part attributable to the memory mode\n"
         "> itself, once buffer is allowed the same algorithm. On the reference device those differ\n"
@@ -878,6 +1080,7 @@ def main(argv=None):
         "> PReLU-fused model, that port is missing from the build under test.\n")
 
     # ---- XgemmBatched tile selection on tall-skinny GEMM
+    sec(18)
     say("\n## 18. Winograd batchgemm tile selection (tall-skinny GEMM)\n")
     say("> MNN packs the Winograd GEMM to `M_pack x N_pack x K_pack` and picks CLBlast-style tile\n"
         "> parameters in `getGemmParams`. `isCandidateValid` requires **NWG to divide N exactly**,\n"
@@ -928,6 +1131,7 @@ def main(argv=None):
         "> extra candidates lose the tuner's own benchmark and change nothing.\n")
 
     # ---- Winograd selection gate
+    sec(19)
     say("\n## 19. Winograd selection gate\n")
     say("> MNN admits Winograd only when `ic>=32 && oc>=32 && in_w < out_c` (or both >=64). The\n"
         "> width clause has the right idea -- the transform cost scales with SPATIAL size and the\n"
@@ -970,6 +1174,7 @@ def main(argv=None):
         "> K until that stops, then check no shape where `forced` is ABOVE `old gate` got admitted.\n")
 
     # ---- 11. what to do on this device
+    sec(20)
     say("## 20. Recommendations for THIS device\n")
     say("> Per-conv advice covers **both** conv families measured here: the stride-1 cores (§4) and\n"
         "> the stride-2 heads (§6). A claim counts only if it clears the **6% noise floor** measured\n"
@@ -1058,6 +1263,7 @@ def main(argv=None):
     for r in recs: say(f"- {r}")
 
     # ---- 12. clock re-check: did the device throttle over the run?
+    sec(21)
     say("\n## 21. GPU clock at END of run (thermal validity check)\n")
     cooldown(d, cool_s)
     s2c, _ = sample_clock(d, cores[0]["model"], cores[0]["shape"])

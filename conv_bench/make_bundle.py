@@ -65,7 +65,11 @@ HARD_CAPABLE = ["conv_2d_c4h4w2", "conv_2d_c4h2w2", "conv_2d_c4h2w4", "conv_2d_c
                 "conv_2d_c4h1w1_hc", "conv_2d_c4h1w2_hc", "conv_2d_c4h1w4_hc",
                 "conv_2d_c4h4w1_hc", "conv_2d_c8h4w1_hc", "conv_2d_c8h2w1_hc", "conv_2d_c8h1w4_hc"]
 SPEC_ONLY += HARD_CAPABLE   # every one of them needs MNN_CONV_SPEC to enter the candidate list
-LDS_TILES = ["16x4", "48x4", "16x12", "8x4", "24x4", "16x2"]
+# useLDS requires out_w % TILE_W == 0 and out_h % TILE_H == 0. NONE of the original tiles divide
+# 24x18 (core96), so MNN_CONV_LDS was accepted and then silently rejected there -- the arm
+# re-measured the default and LDS was unmeasurable at that shape (preflight §B2). 24x2 and 8x6
+# both divide 24x18 exactly.
+LDS_TILES = ["16x4", "48x4", "16x12", "8x4", "24x4", "16x2", "24x2", "8x6"]
 # LDS staging modes (env MNN_CONV_LDS=<mode>). "1" = the original 1-output/thread kernel;
 # "w2" = c4h1w2 blocking + LDS, which isolates LDS at constant register blocking (FINDINGS §H.30).
 # w2 needs out_w % (2*TILE_W) == 0, so its tile must be chosen per shape.
@@ -193,12 +197,18 @@ def main():
         p_onnx = tmp / f"{key}.onnx"
         build_onnx(str(p_onnx), convs)
         convert(str(p_onnx), str(OUT / "models" / f"{key}.mnn"), fp16=False, fuse_prelu=True)
+        # UNFUSED twin, same reason as the cores: CPU does not implement leakyReluSlope, so a fused
+        # model on CPU returns the un-activated result and any cosine against it is a FALSE
+        # mismatch. Without this twin the heads have no independent ground truth at all and their
+        # correctness is simply unchecked (preflight §D).
+        convert(str(p_onnx), str(OUT / "models" / f"{key}_unfused.mnn"), fp16=False, fuse_prelu=False)
         c0 = convs[0]
         man["heads"].append({
             "key": key,
             "label": " -> ".join(f"{c['cin']}->{c['cout']}@{c['H']}x{c['W']} s{c['stride']}"
                                  for c in convs),
-            "model": f"{key}.mnn", "shape": [1, c0["cin"], c0["H"], c0["W"]],
+            "model": f"{key}.mnn", "unfused_model": f"{key}_unfused.mnn",
+            "shape": [1, c0["cin"], c0["H"], c0["W"]],
             "convs": [{"label": f"{c['cin']}->{c['cout']}@{c['H']}x{c['W']} s{c['stride']}",
                        # MNN encodes the shape in the kernel name: ...b1ci18hi288wi384co16...
                        "tag": f"ci{c['cin']}hi{c['H']}wi{c['W']}co{c['cout']}"} for c in convs]})

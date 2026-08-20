@@ -657,7 +657,14 @@ public:
         }
         int maxWidth  = static_cast<OpenCLBackend *>(backend)->getOpenCLRuntime()->getMaxImage2DSize()[0];
         int maxHeight = static_cast<OpenCLBackend *>(backend)->getOpenCLRuntime()->getMaxImage2DSize()[1];
-        if (ConvWinograd::valid(conv2D->common(), inputs[0], outputs[0], maxWidth, maxHeight)) {
+        // MNN_NO_WINOGRAD: measurement flag, default off, symmetric with the buffer path
+        // (ConvBufExecution.cpp). Without it the image backend could not be pinned to the direct
+        // algorithm, so image-vs-buffer on a shape where the two gates disagree measured
+        // Winograd-vs-direct rather than the memory mode (preflight A4 / FINDINGS §H.55).
+        // NOTE the gates themselves are NOT unified here: ConvWinograd::valid has no in_w term and
+        // also admits 5x5. This flag only makes the comparison pinnable.
+        if (nullptr == getenv("MNN_NO_WINOGRAD") &&
+            ConvWinograd::valid(conv2D->common(), inputs[0], outputs[0], maxWidth, maxHeight)) {
             OPENCL_CREATOR_CHECK(new ConvWinograd(op, backend));
         }
         

@@ -799,6 +799,28 @@ ErrorCode ConvBufExecution::onResize(const std::vector<Tensor *> &inputs, const 
             && mPaddings[0] == 1 && mPaddings[1] == 1
             && (width % 4 == 0) && ((height * width) % 8 == 0)
             && mFilterDataPtr != nullptr;
+        // MNN_CONV_SELECT=1: one authoritative line reporting the path taken and, for every
+        // optional flag, REQUESTED vs APPLIED. Each of these flags has guards that can reject it
+        // silently (path predicates for LDS/IGEMM/IM2COL, a constant-buffer size limit for CONSTW,
+        // inputChannelBlocks for SPLITK) -- and because the profiling event name encodes only the
+        // conv path and tensor shape, a silently-rejected flag is indistinguishable from a flag
+        // that applied and did nothing. That ambiguity is fatal for any "no effect" conclusion
+        // (FINDINGS §H.55): "applied, measured 0%" and "never applied" are different facts.
+        if (nullptr != getenv("MNN_CONV_SELECT")) {
+            auto req = [](const char* e) { return nullptr != getenv(e) ? 1 : 0; };
+            MNN_PRINT("[CONV_PATH] b%dci%dhi%dwi%dco%d lds=%d/%d splitk=%d/%d nchw=%d/%d "
+                      "igemm=%d/%d imgemm=%d/%d im2col=%d/%d fused2=%d/%d constw=%d/%d hard=%d\n",
+                      inputs[0]->batch(), inputChannels, inputHeight, inputWidth, outChannel,
+                      req("MNN_CONV_LDS"),    (int)useLDS,
+                      req("MNN_CONV_SPLITK"), (int)useSplitK,
+                      req("MNN_CONV_NCHW"),   (int)useNchw,
+                      req("MNN_CONV_IGEMM"),  (int)useIGemm,
+                      req("MNN_CONV_IMGEMM"), (int)useImGemm,
+                      req("MNN_CONV_IM2COL"), (int)useIm2col,
+                      req("MNN_CONV_FUSED2"), (int)useFused2,
+                      req("MNN_CONV_CONSTW"), (int)useConstW,
+                      req("MNN_CONV_HARD"));
+        }
         if (useImGemm) {
             const int icNum = inputChannels, ocNum = outChannel;
             const int ocbNum = UP_DIV(ocNum, 4), ocPad = ocbNum * 4;
@@ -1318,10 +1340,25 @@ ErrorCode ConvBufExecution::onResize(const std::vector<Tensor *> &inputs, const 
         }
         // MNN_CONV_FORCE=<kernelName>: restrict the candidate set to one kernel (clean per-kernel measurement)
         const char* forceKnl = getenv("MNN_CONV_FORCE");
+        // An unmatched name falls through this loop with NO error and NO fallback marker: the full
+        // candidate list survives and the autotuner picks as usual, i.e. exactly the default arm.
+        // Record whether it matched so MNN_CONV_SELECT can report "not available for this shape"
+        // instead of the measurement silently degrading into a duplicate of the baseline.
+        bool forceMatched = false;
+        std::string candList;
+        const int nCand = (int)kernelName.size();
+        const bool selDbg = (nullptr != getenv("MNN_CONV_SELECT"));
+        if(selDbg){
+            for(int i = 0; i < nCand; ++i){
+                if(i) candList += ",";
+                candList += kernelName[i];
+            }
+        }
         if(forceKnl != nullptr){
             for(int i = 0; i < (int)kernelName.size(); ++i){
                 if(kernelName[i] == std::string(forceKnl)){
                     kernelName = {kernelName[i]}; itemC = {itemC[i]}; itemH = {itemH[i]}; itemW = {itemW[i]};
+                    forceMatched = true;
                     break;
                 }
             }
@@ -1429,6 +1466,22 @@ ErrorCode ConvBufExecution::onResize(const std::vector<Tensor *> &inputs, const 
             }
         }
         int min_index  = min_cost.second;
+        // MNN_CONV_SELECT=1: report WHICH kernel actually ran, and whether MNN_CONV_FORCE was
+        // honoured. The profiling event name (see pushEvent below) is built from the conv PATH and
+        // the TENSOR SHAPE only -- it never contains kernelName[min_index] -- so a forced kernel and
+        // a silently-dropped request produce byte-identical labels and identical timings. That makes
+        // "this variant is no better than default" and "this variant does not exist for this shape"
+        // indistinguishable in the report (FINDINGS §H.55). Pure observer: unlike MNN_CONV_SPEC this
+        // adds no build option and changes no behaviour.
+        if(selDbg){
+            MNN_PRINT("[CONV_SELECT] b%dci%dhi%dwi%dco%dho%dwo%dkh%dkw%d selected=%s force=%s force_ok=%d ncand=%d cands=%s\n",
+                      inputs[0]->batch(), inputChannels, inputHeight, inputWidth, outChannel,
+                      height, width, kernelShape[0], kernelShape[1],
+                      kernelName[min_index].c_str(),
+                      (forceKnl ? forceKnl : "-"),
+                      (forceKnl ? (forceMatched ? 1 : 0) : -1),
+                      nCand, candList.c_str());
+        }
         if(nullptr != getenv("MNN_CONV_SPEC")){
             MNN_PRINT("[CONV_SPEC] ci%d co%d %dx%d k%dx%d -> winner=%s (%d us)\n", inputChannels, outChannel, height, width, kernelShape[0], kernelShape[1], kernelName[min_index].c_str(), min_cost.first);
         }
