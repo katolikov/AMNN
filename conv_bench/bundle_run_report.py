@@ -318,29 +318,7 @@ def main(argv=None):
     serial = a.serial or (devs[0] if len(devs) == 1 else None)
     if not serial:
         print(f"Specify --serial. Attached: {devs or '(none)'}"); sys.exit(1)
-    d = Dev(serial)
-    reps = 1 if a.quick else 3
-    # 20s was not enough (a 3.5h run fell 980 -> 747 MHz, invalidating every cross-section
-    # absolute); 60s made a full run ~9h. 30s is the compromise -- verify against §21's end-of-run
-    # clock rather than assuming it holds.
-    cool_s = a.cooldown if a.cooldown is not None else (5 if a.quick else 30)
-    man = json.loads((HERE / "manifest.json").read_text())
-    # ---- section selection ------------------------------------------------------------------
-    # The report is one long linear function, so instead of re-indenting 20 blocks (and risking a
-    # silent behaviour change in a 5h run) an unselected section is neutralised at the EDGES: say()
-    # suppresses output and run_model() returns immediately without touching the device. The
-    # section's Python still executes, but it does no work and emits nothing.
     WANT = None if not a.sections else {x.strip() for x in a.sections.split(",")}
-    STATE = {"sec": "0", "skip": False}
-    def sec(n):
-        """Mark the start of section n. Everything after this is skipped unless n is selected."""
-        STATE["sec"] = str(n)
-        STATE["skip"] = (WANT is not None and str(n) not in WANT)
-        _SKIP["on"] = STATE["skip"]
-        if STATE["skip"]:
-            print(f"   (section {n}: skipped)", flush=True)
-        return not STATE["skip"]
-
     SECTIONS = {1:"Hardware", 2:"GPU clock at start", 3:"Subgroup capability",
                 4:"Kernel strategies", 5:"Shape hardcoding", 6:"Stride-2 head pairs",
                 7:"LDS tile sweep", 8:"im2col + GEMM", 9:"Winograd vs direct",
@@ -360,8 +338,31 @@ def main(argv=None):
             print(f"  [{mark}] {k:>2}  {v}")
         print("\n(dry run: no device was touched)")
         return
+
+    STATE = {"sec": "0", "skip": False}
+    def sec(n):
+        """Mark the start of section n. Everything after this is skipped unless n is selected."""
+        STATE["sec"] = str(n)
+        STATE["skip"] = (WANT is not None and str(n) not in WANT)
+        _SKIP["on"] = STATE["skip"]
+        if STATE["skip"]:
+            print(f"   (section {n}: skipped)", flush=True)
+        return not STATE["skip"]
+
     # --resume: reuse an earlier run's numbers so a partial re-run still has cross-section data
     # (§7 and §20 read §4's baseline; §20 reads almost everything).
+    d = Dev(serial)
+    reps = 1 if a.quick else 3
+    # 20s was not enough (a 3.5h run fell 980 -> 747 MHz, invalidating every cross-section
+    # absolute); 60s made a full run ~9h. 30s is the compromise -- verify against §21's end-of-run
+    # clock rather than assuming it holds.
+    cool_s = a.cooldown if a.cooldown is not None else (5 if a.quick else 30)
+    man = json.loads((HERE / "manifest.json").read_text())
+    # ---- section selection ------------------------------------------------------------------
+    # The report is one long linear function, so instead of re-indenting 20 blocks (and risking a
+    # silent behaviour change in a 5h run) an unselected section is neutralised at the EDGES: say()
+    # suppresses output and run_model() returns immediately without touching the device. The
+    # section's Python still executes, but it does no work and emits nothing.
     if a.resume:
         # Chunked runs each write their own <out>.json, so resume must MERGE every prior result,
         # not read one file. It globbed only detail_*.json before -- which our --out runs never
