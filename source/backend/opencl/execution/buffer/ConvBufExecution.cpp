@@ -106,9 +106,23 @@ ConvBufCommonExecution::ConvBufCommonExecution(const Op *op, Backend *backend, b
         openclBackend->getOpenCLRuntime()->commandQueue().enqueueUnmapMemObject(biasBuffer, biasPtrCL);
     }
 
+    const float *slopeDataPtr = nullptr;
     if(isExtra){
         const PRelu* preluParam = flatbuffers::GetRoot<PRelu>(op->main_as_Extra()->attr()->GetAs<Attribute>(1)->tensor()->uint8s()->data());
-        const float *slopeDataPtr = preluParam->slope()->data();
+        slopeDataPtr = preluParam->slope()->data();
+    } else if(op->type() == OpType_Convolution &&
+              conv2dParams->common()->leakyReluSlope() != nullptr &&
+              conv2dParams->common()->leakyReluSlope()->size() >= (size_t)biasSize){
+        // Fused per-channel PReLU carried directly on the conv (MergePReluToConvolution /
+        // Convolution2DCommon.leakyReluSlope). Reuses the same mPrelu/mSlope path as the
+        // internal ExtraConvolution2DPrelu op; covers every non-winograd buffer conv.
+        // Restricted to OpType_Convolution because the other users of this base ctor
+        // (deconv / depthwise) have no kernel that consumes the slope -- and the converter
+        // pass never emits the field on them either.
+        slopeDataPtr = conv2dParams->common()->leakyReluSlope()->data();
+    }
+    if(slopeDataPtr != nullptr){
+        mResource->mPrelu = true;
         mResource->mSlope.reset(Tensor::createDevice<float>({1, 1, 1, ROUND_UP(biasSize, 32)}));
         if (!(backend->onAcquireBuffer(mResource->mSlope.get(), Backend::STATIC))) {
             mConvComValid = false;
@@ -118,6 +132,7 @@ ConvBufCommonExecution::ConvBufCommonExecution(const Op *op, Backend *backend, b
             cl::Buffer &slopeBuffer = openCLBuffer(mResource->mSlope.get());
             auto slopePtrCL = openclBackend->getOpenCLRuntime()->commandQueue().enqueueMapBuffer(slopeBuffer, true, CL_MAP_WRITE, 0, buffer_size, nullptr, nullptr, &res);
             if(slopePtrCL != nullptr && res == CL_SUCCESS){
+                ::memset(slopePtrCL, 0, buffer_size);
                 if(openclBackend->getPrecision() != BackendConfig::Precision_High){
                     for(int i=0; i<biasSize; i++) {
                         ((half_float::half*)slopePtrCL)[i] = (half_float::half)(slopeDataPtr[i]);
@@ -947,9 +962,19 @@ public:
         }
 #endif
 
-        if (ConvBufWinograd::valid(conv2D->common(), inputs[0], outputs[0], static_cast<OpenCLBackend *>(backend)->getOpenCLRuntime()->getGpuType() == INTEL)) {
+        // A fused per-channel PReLU (Convolution2DCommon.leakyReluSlope) is applied by
+        // ConvBufExecution on every path and by ConvBufWinograd on its non-subgroup path.
+        // The Intel-subgroup executions have no PReLU variant and would drop the activation
+        // silently, so route such convs to ConvBufExecution instead.
+        const bool hasFusedPRelu = (nullptr != conv2D->common()->leakyReluSlope() &&
+                                    conv2D->common()->leakyReluSlope()->size() > 0);
+        const bool useIntelSubgroup =
+            static_cast<OpenCLBackend *>(backend)->getOpenCLRuntime()->isSupportedIntelSubgroup();
+
+        if (!(hasFusedPRelu && useIntelSubgroup) &&
+            ConvBufWinograd::valid(conv2D->common(), inputs[0], outputs[0], static_cast<OpenCLBackend *>(backend)->getOpenCLRuntime()->getGpuType() == INTEL)) {
 #ifdef MNN_SUPPORT_INTEL_SUBGROUP
-            if(static_cast<OpenCLBackend *>(backend)->getOpenCLRuntime()->isSupportedIntelSubgroup()){
+            if(useIntelSubgroup){
                 std::vector<int> inputShape = tensorShapeFormat(input);
                 std::vector<int> outputShape = tensorShapeFormat(output);
                 const int src_width = inputShape.at(2);
@@ -962,7 +987,7 @@ public:
             OPENCL_CREATOR_CHECK(new ConvBufWinograd(op, backend));
         }
 #ifdef MNN_SUPPORT_INTEL_SUBGROUP
-        if (static_cast<OpenCLBackend *>(backend)->getOpenCLRuntime()->isSupportedIntelSubgroup() && outputChannel >= 16) {
+        if (!hasFusedPRelu && useIntelSubgroup && outputChannel >= 16) {
             if (inputChannels >= 16) {
                 auto pads = ConvolutionCommon::convolutionPadFull(inputs[0], outputs[0], conv2D->common());
                 TensorUtils::setTensorPad(inputs[0], std::get<0>(pads), std::get<2>(pads), 0, 0);

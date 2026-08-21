@@ -322,6 +322,12 @@ bool Cli::initializeMNNConvertArgs(modelConfig &modelPath, int argc, char **argv
      "keep native group convolution. default: false",
      cxxopts::value<bool>()
      )
+    (
+     "fusePreluToConv",
+     "fuse PReLU / LeakyReLU into the preceding convolution. OpenCL ONLY: other backends "
+     "ignore the fused slope and silently drop the activation. default: false",
+     cxxopts::value<bool>()
+     )
      (
      "allowCustomOp",
      "allow custom op when convert. default: false",
@@ -551,6 +557,9 @@ bool Cli::initializeMNNConvertArgs(modelConfig &modelPath, int argc, char **argv
     }
     if (result.count("groupConvNative")) {
         modelPath.groupConvNative = true;
+    }
+    if (result.count("fusePreluToConv")) {
+        modelPath.fusePreluToConv = true;
     }
     if (result.count("allowCustomOp")) {
         modelPath.allowCustomOp = true;

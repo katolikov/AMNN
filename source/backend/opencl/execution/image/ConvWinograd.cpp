@@ -115,6 +115,29 @@ ConvWinograd::ConvWinograd(const MNN::Op *op, Backend* backend) : CommonExecutio
         queue.enqueueUnmapMemObject(*biasBuffer, biasC);
         copyBufferToImage(runTime, *biasBuffer, *mResource->mBias, coC4, 1, mOpenCLBackend->getPrecision());
 
+        // Optional fused per-channel PReLU slopes (Convolution2DCommon.leakyReluSlope, written by
+        // the converter pass gated on --fusePreluToConv). Mirrors the bias image exactly, so the
+        // dest transform can index it with the same out-channel-block coordinate.
+        auto slopeVec = mResource->mCommon->leakyReluSlope();
+        mResource->mHasPRelu = (slopeVec != nullptr && slopeVec->size() >= (size_t)co);
+        if (mResource->mHasPRelu) {
+            mResource->mSlope.reset(new cl::Image2D(runTime->context(), CL_MEM_READ_WRITE,
+                                                    cl::ImageFormat(CL_RGBA, imageChannelType),
+                                                    UP_DIV(co, 4), 1, 0, nullptr, nullptr));
+            std::shared_ptr<cl::Buffer> slopeBuffer(
+                new cl::Buffer(runTime->context(), CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR, buffer_size));
+            cl_int slopeErr;
+            auto slopeC = queue.enqueueMapBuffer(*slopeBuffer, CL_TRUE, CL_MAP_WRITE, 0, buffer_size, nullptr, nullptr, &slopeErr);
+            if(slopeC != nullptr && slopeErr == CL_SUCCESS){
+                ::memset(slopeC, 0, buffer_size);
+                ::memcpy(slopeC, slopeVec->data(), co * sizeof(float));
+            }else{
+                MNN_ERROR("Map error slopeC == nullptr \n");
+            }
+            queue.enqueueUnmapMemObject(*slopeBuffer, slopeC);
+            copyBufferToImage(runTime, *slopeBuffer, *mResource->mSlope, coC4, 1, mOpenCLBackend->getPrecision());
+        }
+
         std::shared_ptr<Tensor> sourceWeight(
             Tensor::create<float>(std::vector<int>{co, ci, ky, kx}, (void*)(filterDataPtr), Tensor::CAFFE));
 
@@ -220,6 +243,9 @@ ErrorCode ConvWinograd::onEncode(const std::vector<Tensor*>& inputs, const std::
             if (mResource->mCommon->relu6()) {
                 buildOptions.emplace("-DRELU6");
             }
+            if (mResource->mHasPRelu) {
+                buildOptions.emplace("-DPRELU");
+            }
             mUnits[i * 3 + 2].kernel =
                 runTime->buildKernel("winogradTransformDest" + formatStr,
                                      "winogradTransformDest", buildOptions, mOpenCLBackend->getPrecision());
@@ -258,6 +284,9 @@ ErrorCode ConvWinograd::onEncode(const std::vector<Tensor*>& inputs, const std::
         ret |= mUnits[b * 3 + 2].kernel->get().setArg(6, output->height());
         ret |= mUnits[b * 3 + 2].kernel->get().setArg(7, ocC4);
         ret |= mUnits[b * 3 + 2].kernel->get().setArg(8, b);
+        if (mResource->mHasPRelu) {
+            ret |= mUnits[b * 3 + 2].kernel->get().setArg(9, *mResource->mSlope);
+        }
         MNN_CHECK_CL_SUCCESS(ret, "setArg ConvWinogradExecution");
 
         /*Source Transform*/

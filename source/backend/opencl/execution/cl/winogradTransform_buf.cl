@@ -388,6 +388,9 @@ __kernel void winoTransSrcBuf2_3_1(GLOBAL_SIZE_DIM2
 __kernel void winoTransDstBuf2_3_1(GLOBAL_SIZE_DIM2
                                     __global const FLOAT* uInput,
                                     __global const FLOAT* uBias,
+#ifdef PRELU
+                                    __global const FLOAT* uSlope,
+#endif
                                     __global FLOAT* uOutput,
                                     __private const int unitWidth, //wUnit
                                     __private const int unitHeight, //hUnit
@@ -408,6 +411,9 @@ __kernel void winoTransDstBuf2_3_1(GLOBAL_SIZE_DIM2
     int oz         = pos.y % dstChannelC4;
     
     FLOAT4 bias    = vload4(0, uBias+oz*4);
+#ifdef PRELU
+    FLOAT4 slope   = vload4(0, uSlope+oz*4);
+#endif
     int batchIndex = pos.y / dstChannelC4;
 
     batchIndex = batchOffset;
@@ -461,6 +467,9 @@ __kernel void winoTransDstBuf2_3_1(GLOBAL_SIZE_DIM2
 #ifdef RELU6
                 res = clamp(res, (FLOAT4)(0), (FLOAT4)(6));
 #endif
+#ifdef PRELU
+                res = fmax(res, (FLOAT4)(0)) + slope * fmin(res, (FLOAT4)(0));
+#endif
                 vstore4(res, 0, uOutput+out_offset);
             }
         }
@@ -474,6 +483,9 @@ __kernel void winoTransDstBuf2_3_1(GLOBAL_SIZE_DIM2
 #endif
 #ifdef RELU6
                 res = clamp(res, (FLOAT4)(0), (FLOAT4)(6));
+#endif
+#ifdef PRELU
+                res = fmax(res, (FLOAT4)(0)) + slope * fmin(res, (FLOAT4)(0));
 #endif
                 vstore4(res, 0, uOutput+out_offset+4);
             }
@@ -489,6 +501,9 @@ __kernel void winoTransDstBuf2_3_1(GLOBAL_SIZE_DIM2
 #ifdef RELU6
                 res = clamp(res, (FLOAT4)(0), (FLOAT4)(6));
 #endif
+#ifdef PRELU
+                res = fmax(res, (FLOAT4)(0)) + slope * fmin(res, (FLOAT4)(0));
+#endif
                 vstore4(res, 0, uOutput+out_offset+4*dstWidth);
             }
         }
@@ -502,6 +517,9 @@ __kernel void winoTransDstBuf2_3_1(GLOBAL_SIZE_DIM2
 #endif
 #ifdef RELU6
                 res = clamp(res, (FLOAT4)(0), (FLOAT4)(6));
+#endif
+#ifdef PRELU
+                res = fmax(res, (FLOAT4)(0)) + slope * fmin(res, (FLOAT4)(0));
 #endif
                 vstore4(res, 0, uOutput+out_offset+4*dstWidth+4);
             }

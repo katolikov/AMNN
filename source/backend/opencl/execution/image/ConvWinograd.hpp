@@ -16,6 +16,8 @@ struct ConvWinoResource {
     const Convolution2DCommon* mCommon;
     std::shared_ptr<cl::Image2D> mWeight;
     std::shared_ptr<cl::Image2D> mBias;
+    std::shared_ptr<cl::Image2D> mSlope;
+    bool mHasPRelu = false;
 };
 
 class ConvWinograd : public CommonExecution {

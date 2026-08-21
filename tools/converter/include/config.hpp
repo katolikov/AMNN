@@ -59,6 +59,10 @@ public:
     bool transformerFuse = false;
     bool allowCustomOp = false;
     bool groupConvNative = false;
+    // Fuse PReLU / LeakyReLU into the preceding convolution (Convolution2DCommon.leakyReluSlope).
+    // Off by default: only the OpenCL backend reads that field, so a model built with this on
+    // loses the activation silently on CPU/Metal/Vulkan/CUDA.
+    bool fusePreluToConv = false;
     std::string customOpLibs = "";
     std::string authCode = "";
     std::string testDir = "";

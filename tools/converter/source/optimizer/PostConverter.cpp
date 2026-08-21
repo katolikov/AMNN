@@ -357,6 +357,12 @@ std::unique_ptr<MNN::NetT> optimizeNetImpl(std::unique_ptr<MNN::NetT>& originNet
         "MergeReluToBinaryOp",
 
     };
+    // Opt-in fusion of PReLU / LeakyReLU into convs (--fusePreluToConv). Off by default
+    // because only the OpenCL backend reads Convolution2DCommon.leakyReluSlope.
+    auto converterConfig = Global<modelConfig>::Get();
+    if (nullptr != converterConfig && converterConfig->fusePreluToConv) {
+        afterProgramConvert.emplace_back("MergePReluToConvolution");
+    }
     if (ctx->is_training) {
         std::vector<std::string>::iterator iter = afterProgramConvert.begin();
         while (iter != afterProgramConvert.end()) {
