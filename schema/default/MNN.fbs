@@ -208,6 +208,7 @@ enum OpType : int {
     If    = 601,
     LayerNorm = 603,
     GridSample = 604,
+    FusedMathS2D = 609,
 }
 
 table Plugin {
@@ -339,6 +340,22 @@ table LoopParam {
     initCommand:[RegionCommand];
 }
 
+// Fused per-pixel affine math + space-to-depth(block=2) for two single-plane
+// inputs A, B of shape [1,1,H,W] -> [1,13,H/2,W/2].
+//   P0 = alpha*A + beta*B + gamma      -> channels 0..3
+//   P1 = delta*B + epsilon             -> channels 4..7
+//   P2 = P0 - P1                       -> channels 8..11
+//   channel 12                         = kConst (uniform plane)
+// Within a plane the 2x2 block maps to channels in (dy,dx) order 00,01,10,11.
+table FusedMathS2DParam {
+    alpha:float = 1.0;
+    beta:float = 1.0;
+    gamma:float = 0.0;
+    delta:float = 1.0;
+    epsilon:float = 0.0;
+    kConst:float = 0.0;
+}
+
 union OpParameter {
     QuantizedAdd,
     ArgMax,
@@ -440,7 +457,8 @@ union OpParameter {
     AttentionParam,
     StftParam,
     LinearAttentionParam,
-    ShapeParam
+    ShapeParam,
+    FusedMathS2DParam
 }
 
 table Op {

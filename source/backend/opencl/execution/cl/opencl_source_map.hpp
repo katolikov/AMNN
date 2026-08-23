@@ -154,6 +154,9 @@ extern const char* reduction_buf;
 extern const char* strassen_binary_buf;
 #endif
 #ifndef MNN_OPENCL_BUFFER_CLOSED
+extern const char* fused_math_s2d_buf;
+#endif
+#ifndef MNN_OPENCL_BUFFER_CLOSED
 extern const char* matmul_params_buf;
 #endif
 extern const char* cast;
@@ -327,6 +330,9 @@ const std::map<std::string, const char*> OpenCLProgramMap =
   { "strassen_binary_buf", strassen_binary_buf },
 #endif
 #ifndef MNN_OPENCL_BUFFER_CLOSED
+  { "fused_math_s2d_buf", fused_math_s2d_buf },
+#endif
+#ifndef MNN_OPENCL_BUFFER_CLOSED
   { "matmul_params_buf", matmul_params_buf },
 #endif
   { "cast", cast },
@@ -411,6 +417,7 @@ const std::map<std::string, std::string> OpenCLProgramMd5Map =
   { "input_transe_buf", "c80482cd531add8582edc242bcbfa947" },
   { "reduction_buf", "c16506adcebf7760a1a3c96ce0d386ee" },
   { "strassen_binary_buf", "1ec57b4f87beb05457f6ef00de593d9d" },
+  { "fused_math_s2d_buf", "664c04393e3f0617c75d7d801e579213" },
   { "matmul_params_buf", "34fba2156345dcdb8fb07a4081a92fd1" },
   { "cast", "129055345fd1d576eb398635c81701ab" },
   { "buffer_convert_buf", "e633544642a1a9a61755c913cfe77017" },
