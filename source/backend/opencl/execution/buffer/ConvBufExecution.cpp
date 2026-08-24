@@ -111,6 +111,7 @@ ConvBufCommonExecution::ConvBufCommonExecution(const Op *op, Backend *backend, b
         const PRelu* preluParam = flatbuffers::GetRoot<PRelu>(op->main_as_Extra()->attr()->GetAs<Attribute>(1)->tensor()->uint8s()->data());
         slopeDataPtr = preluParam->slope()->data();
     } else if(op->type() == OpType_Convolution &&
+              !conv2dParams->common()->relu() && !conv2dParams->common()->relu6() &&
               conv2dParams->common()->leakyReluSlope() != nullptr &&
               conv2dParams->common()->leakyReluSlope()->size() >= (size_t)biasSize){
         // Fused per-channel PReLU carried directly on the conv (MergePReluToConvolution /
@@ -118,7 +119,9 @@ ConvBufCommonExecution::ConvBufCommonExecution(const Op *op, Backend *backend, b
         // internal ExtraConvolution2DPrelu op; covers every non-winograd buffer conv.
         // Restricted to OpType_Convolution because the other users of this base ctor
         // (deconv / depthwise) have no kernel that consumes the slope -- and the converter
-        // pass never emits the field on them either.
+        // pass never emits the field on them either. relu/relu6 exclude it too: they win the
+        // build-option chain below, so a slope alongside them would bind an argument the
+        // compiled kernel does not have.
         slopeDataPtr = conv2dParams->common()->leakyReluSlope()->data();
     }
     if(slopeDataPtr != nullptr){
@@ -950,13 +953,22 @@ public:
                         // Don't support IDST-int8 because of error
                         return nullptr;
                     }
-                    for (int i = 0; i < inputs.size(); ++i) {
-                        TensorUtils::setTensorSupportPack(inputs[i], false);
+                    // The low-memory executions never read leakyReluSlope. Letting a fused
+                    // conv through here would drop its activation while still running on
+                    // OpenCL, so the backend-type check in Pipeline cannot catch it. Fall
+                    // through to the full-precision conv instead.
+                    if (nullptr != conv2dParams->common()->leakyReluSlope() &&
+                        conv2dParams->common()->leakyReluSlope()->size() > 0) {
+                        // fall through
+                    } else {
+                        for (int i = 0; i < inputs.size(); ++i) {
+                            TensorUtils::setTensorSupportPack(inputs[i], false);
+                        }
+                        for (int i = 0; i < outputs.size(); ++i) {
+                            TensorUtils::setTensorSupportPack(outputs[i], false);
+                        }
+                        OPENCL_CREATOR_CHECK(new ConvBufLowMemoryExecution(inputs, outputs, op, backend));
                     }
-                    for (int i = 0; i < outputs.size(); ++i) {
-                        TensorUtils::setTensorSupportPack(outputs[i], false);
-                    }
-                    OPENCL_CREATOR_CHECK(new ConvBufLowMemoryExecution(inputs, outputs, op, backend));
                 }
             }
         }

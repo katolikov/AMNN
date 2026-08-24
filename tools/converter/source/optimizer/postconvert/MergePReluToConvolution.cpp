@@ -19,7 +19,9 @@
 //
 
 #include "../PostTreatUtils.hpp"
+#include "../Global.hpp"
 #include "MergeToConvolution.hpp"
+#include "config.hpp"
 
 using namespace MNN;
 
@@ -40,6 +42,13 @@ public:
         if (!isPRelu && !isLeakyRelu) {
             return false;
         }
+        // MergeToConvolution::onExecute mutates nothing itself: it calls us first and only
+        // then checks _isSingleInputOutput, dropping the merge if that fails. Since we write
+        // the slope into the conv, a dropped merge would leave BOTH the slope and the original
+        // activation op in the graph -- applied twice. Check it here, before touching anything.
+        if (!PostTreatUtils::_isSingleInputOutput(inplaceOp)) {
+            return false;
+        }
         auto conv = convolutionOp->main.AsConvolution2D();
         auto common = conv->common.get();
         // Dense conv only (group==1). Any kernel/stride/dilation/channel count is fine -- see
@@ -47,6 +56,21 @@ public:
         // (the low-memory path) do NOT read it, so skip those.
         if (common->group != 1) return false;
         if (conv->quanParameter != nullptr) return false;
+        // Weight quantisation is applied by writeFb AFTER this pass, so the check above cannot
+        // see it. A conv that ends up with BOTH a slope and a quanParameter routes to the OpenCL
+        // low-memory execution, which does not read the slope. Weight quantisation is the larger
+        // win of the two, so keep it and skip the fusion -- loudly, not silently.
+        auto converterConfig = Global<modelConfig>::Get();
+        if (nullptr != converterConfig && converterConfig->weightQuantBits > 0) {
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                MNN_PRINT("Warning: --fusePreluToConv is ignored because the weights are being "
+                          "quantized (--weightQuantBits). Quantized convs run through the OpenCL "
+                          "low-memory path, which does not apply a fused activation.\n");
+            }
+            return false;
+        }
         if (common->outputCount <= 0) return false;
         if (common->relu || common->relu6) return false;            // already has an activation
         if (!common->leakyReluSlope.empty()) return false;          // already fused

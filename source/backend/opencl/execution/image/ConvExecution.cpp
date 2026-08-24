@@ -78,8 +78,15 @@ ConvCommonExecution::ConvCommonExecution(const Op *op, Backend *backend, bool is
     // Fused per-channel PReLU written by the converter into Convolution2DCommon.leakyReluSlope
     // (pass gated on --fusePreluToConv). The kernels in conv_2d.cl already implement -DPRELU
     // with the slope as an image indexed by out_channel_block_idx; only this upload was missing.
+    // Restricted to OpType_Convolution because the other users of this base ctor (deconv /
+    // depthwise / low-memory) have no kernel that consumes the slope, and the converter pass
+    // never emits the field on them either, nor alongside relu/relu6 -- which win the
+    // build-option chain, so a slope with them would bind an unused kernel argument.
+    // Mirrors the buffer path.
     auto slopeVec = conv2dParams->common()->leakyReluSlope();
-    bool hasFusedSlope = (!isExtra && slopeVec != nullptr && slopeVec->size() >= (size_t)biasSize);
+    bool hasFusedSlope = (!isExtra && op->type() == OpType_Convolution &&
+                          !conv2dParams->common()->relu() && !conv2dParams->common()->relu6() &&
+                          slopeVec != nullptr && slopeVec->size() >= (size_t)biasSize);
     if(hasFusedSlope){
         cl::Buffer slopeBuffer(runtime->context(), CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR, buffer_size);
         cl_int slopeErr;
@@ -630,7 +637,16 @@ public:
                         // Don't support IDST-int8 because of error
                         return nullptr;
                     }
-                    OPENCL_CREATOR_CHECK(new ConvLowMemoryExecution(inputs, outputs, op, backend));
+                    // The low-memory executions never read leakyReluSlope. Letting a fused
+                    // conv through here would drop its activation while still running on
+                    // OpenCL, so the backend-type check in Pipeline cannot catch it. Fall
+                    // through to the full-precision conv instead.
+                    if (nullptr != conv2dParams->common()->leakyReluSlope() &&
+                        conv2dParams->common()->leakyReluSlope()->size() > 0) {
+                        // fall through
+                    } else {
+                        OPENCL_CREATOR_CHECK(new ConvLowMemoryExecution(inputs, outputs, op, backend));
+                    }
                 } else {
                     //MNN_ERROR("OpenCL Conv buf low memory init error. For Opencl Backend, only support low memory mode of int8 or int4 dequantization currently.\n");
                     return nullptr;

@@ -119,7 +119,8 @@ ConvWinograd::ConvWinograd(const MNN::Op *op, Backend* backend) : CommonExecutio
         // the converter pass gated on --fusePreluToConv). Mirrors the bias image exactly, so the
         // dest transform can index it with the same out-channel-block coordinate.
         auto slopeVec = mResource->mCommon->leakyReluSlope();
-        mResource->mHasPRelu = (slopeVec != nullptr && slopeVec->size() >= (size_t)co);
+        mResource->mHasPRelu = (!mResource->mCommon->relu() && !mResource->mCommon->relu6() &&
+                                slopeVec != nullptr && slopeVec->size() >= (size_t)co);
         if (mResource->mHasPRelu) {
             mResource->mSlope.reset(new cl::Image2D(runTime->context(), CL_MEM_READ_WRITE,
                                                     cl::ImageFormat(CL_RGBA, imageChannelType),

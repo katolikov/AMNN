@@ -534,6 +534,27 @@ void Pipeline::_pushTuningTask(std::vector<Schedule::OpCacheInfo>&& initInfos) {
     const_cast<Runtime*>(mRuntime)->setAsyncWork(std::move(future));
 }
 
+// A convolution carrying Convolution2DCommon.leakyReluSlope has had its PReLU / LeakyReLU folded
+// into the conv itself by MNNConvert --fusePreluToConv. ONLY the OpenCL backend reads that field:
+// on any other backend the conv runs and the activation is simply never applied, producing output
+// that is wrong but entirely plausible-looking, with no diagnostic anywhere. Refuse to build such
+// a pipeline instead -- including the case where OpenCL was requested but THIS op fell back to the
+// backup (CPU) backend, which is the easiest way to get silently wrong results.
+static bool _fusedActivationSupported(const Op* op, Backend* bn) {
+    if (nullptr == op || op->type() != OpType_Convolution || nullptr == bn) {
+        return true;
+    }
+    auto conv2d = op->main_as_Convolution2D();
+    if (nullptr == conv2d || nullptr == conv2d->common()) {
+        return true;
+    }
+    auto slope = conv2d->common()->leakyReluSlope();
+    if (nullptr == slope || 0 == slope->size()) {
+        return true;
+    }
+    return MNN_FORWARD_OPENCL == bn->type();
+}
+
 static ErrorCode _createExecutions(Schedule::PipelineInfo& mInfo, const std::string& externalFile, std::vector<std::shared_ptr<BufferStorage>>& extraStorage) {
     FileLoader loader(externalFile.c_str());
     auto& mBackend = mInfo.first.cache.first;
@@ -576,6 +597,17 @@ static ErrorCode _createExecutions(Schedule::PipelineInfo& mInfo, const std::str
             }
             if (nullptr != tmpStorage.get()) {
                 extraStorage.emplace_back(tmpStorage);
+            }
+            if (!_fusedActivationSupported(iter.op, iter.execution->backend())) {
+                MNN_ERROR("Pipeline: op \"%s\" is a convolution with a fused PReLU/LeakyReLU "
+                          "(Convolution2DCommon.leakyReluSlope), but it was assigned to backend "
+                          "type %d, which does not apply the fused slope and would silently drop "
+                          "the activation. Only MNN_FORWARD_OPENCL (%d) supports it. Re-convert "
+                          "the model without MNNConvert --fusePreluToConv, or run it on OpenCL.\n",
+                          nullptr != iter.op->name() ? iter.op->name()->c_str() : "(unnamed)",
+                          (int)iter.execution->backend()->type(), (int)MNN_FORWARD_OPENCL);
+                iter.execution = nullptr;
+                return NOT_SUPPORT;
             }
             // invalid means memory alloc failed
             if (!iter.execution->valid()) {

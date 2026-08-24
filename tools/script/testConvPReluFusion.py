@@ -156,7 +156,8 @@ def convert(convert_bin, onnx_path, mnn_path, fuse):
         raise SystemExit("MNNConvert failed")
 
 
-def run_on_device(mnn_path, in_shape, x, forward, gpu_mode, precision):
+def run_on_device(mnn_path, in_shape, x, forward, gpu_mode, precision,
+                  allow_refusal=False):
     base = os.path.basename(mnn_path)
     tdir = WORK / "tdir"
     tdir.mkdir(parents=True, exist_ok=True)
@@ -172,8 +173,12 @@ def run_on_device(mnn_path, in_shape, x, forward, gpu_mode, precision):
     out = adb(f"shell 'cd {DEV} && LD_LIBRARY_PATH={DEV} ./ModuleBasic.out {base} tdir 0 "
               f"{forward} 1 {gpu_mode} {precision} 2>&1'").stdout
     local = WORK / f"out_{forward}_{gpu_mode}_{base}.txt"
+    if local.exists():
+        local.unlink()
     adb(f"pull {DEV}/output/0_0.txt {local}")
     if not local.exists():
+        if allow_refusal:
+            return None, out
         print(out[-3000:])
         raise SystemExit("no output pulled from device")
     return np.loadtxt(local, dtype=np.float32), out
@@ -234,21 +239,64 @@ def numerics(mode, case, unfused, fused):
     return ok
 
 
+def low_memory_control(convert_bin):
+    """A conv that carries BOTH a slope and a quanParameter routes to the OpenCL low-memory
+    execution, which does not read leakyReluSlope -- and it still runs on OpenCL, so the
+    backend-type check in Pipeline cannot see it. Two things are asserted:
+      * the converter no longer emits that combination (--weightQuantBits wins, with a warning);
+      * a model that carries it anyway (third party, or built before the fix) still computes
+        correctly, because the low-memory creators now decline such convs.
+    The second half is the one that matters: it is the only guard for a model we did not build."""
+    name = "lowmem"
+    onnx_path = WORK / f"{name}.onnx"
+    make_onnx(onnx_path, 1, 64, 64, 16, 16, 3, 1, 1, 1, "prelu")
+    unfused, both = WORK / f"{name}_unf.mnn", WORK / f"{name}_both.mnn"
+    # reference: quantised, activation NOT fused
+    sh(f'"{convert_bin}" -f ONNX --modelFile "{onnx_path}" --MNNModel "{unfused}" '
+       f'--bizCode biz --weightQuantBits 8')
+    # what the converter does when asked for both
+    r = sh(f'"{convert_bin}" -f ONNX --modelFile "{onnx_path}" --MNNModel "{both}" '
+           f'--bizCode biz --weightQuantBits 8 --fusePreluToConv')
+    declined = inspect(convert_bin, both, None) and "is ignored because the weights" in r.stdout
+    print(f"[{'PASS' if declined else '**FAIL**'}] lowmem  converter declines slope+weightQuant "
+          f"and says so ({declined})")
+
+    # now the runtime half, on a model deliberately carrying both
+    forced = WORK / f"{name}_forced.mnn"
+    sh(f'"{convert_bin}" -f ONNX --modelFile "{onnx_path}" --MNNModel "{forced}" '
+       f'--bizCode biz --fusePreluToConv')
+    x = signed_input(1, 64, 16, 16)
+    ref, _ = run_on_device(unfused, [1, 64, 16, 16], x, FORWARD_CPU, GPU_MODE["buffer"],
+                           PRECISION_HIGH)
+    ok = declined
+    for mode in ("buffer", "image"):
+        got, _ = run_on_device(forced, [1, 64, 16, 16], x, FORWARD_OPENCL, GPU_MODE[mode],
+                               PRECISION_LOW + 4 * 2, allow_refusal=True)   # memory = Low
+        if got is None:
+            good, detail = False, "refused"
+        else:
+            cos, _ = cosine(ref, got)
+            good, detail = cos > 0.99, f"cos={cos:.6f}"
+        ok = ok and good
+        print(f"[{'PASS' if good else '**FAIL**'}] lowmem  {mode:6} memory=Low applies the fused "
+              f"activation ({detail})")
+    return ok
+
+
 def negative_control(case, unfused, fused):
-    """Prove the comparison has teeth: no CPU backend reads leakyReluSlope, so running the
-    FUSED model on CPU must land well BELOW the tolerance. If it does not, the slopes are too
-    close to 1 (or some backend started honouring them) and every PASS below is vacuous."""
+    """No CPU backend reads leakyReluSlope, so a fused model on CPU cannot be correct. Pipeline
+    must REFUSE to build it (source/core/Pipeline.cpp) rather than run it and quietly return
+    un-activated output. Asserting the refusal is also what stops this suite passing vacuously:
+    if CPU ever silently accepted a fused model, the OpenCL-vs-CPU comparisons above would be
+    comparing two wrong answers."""
     name, N, Cin, Cout, H, W, k, group, act, _ = case
     x = signed_input(N, Cin, H, W)
-    ref, _ = run_on_device(unfused, [N, Cin, H, W], x, FORWARD_CPU,
-                           GPU_MODE["buffer"], PRECISION_HIGH)
-    dropped, _ = run_on_device(fused, [N, Cin, H, W], x, FORWARD_CPU,
-                               GPU_MODE["buffer"], PRECISION_HIGH)
-    cos, _ = cosine(ref, dropped)
-    ok = cos < COS_TOL
-    print(f"[{'PASS' if ok else '**FAIL**'}] control {name:16} activation dropped on CPU "
-          f"reads cos={cos:.6f} (must be < {COS_TOL})")
-    return ok
+    out, log = run_on_device(fused, [N, Cin, H, W], x, FORWARD_CPU,
+                             GPU_MODE["buffer"], PRECISION_HIGH, allow_refusal=True)
+    refused = out is None and "does not apply the fused slope" in log
+    print(f"[{'PASS' if refused else '**FAIL**'}] control {name:16} fused model on CPU is "
+          f"refused={refused} (produced_output={out is not None})")
+    return refused
 
 
 CASES = [
@@ -262,6 +310,12 @@ CASES = [
     ("wino_leaky",     1,  64,   64, 16, 16, 3, 1, "prelu_scalar", True),
     ("direct_leaky",   1,  32,   32, 16, 16, 3, 1, "prelu_scalar", True),
     ("direct_c32",     1,  32,   32, 16, 16, 3, 1, "prelu",        True),   # below winograd gate
+    # ConvBufWinograd::valid takes 3x3 s1 when (ci,co >= 32 and in_w < co) or (ci,co >= 64), so
+    # in_w >= co with 32 channels lands on the general "ori" path instead. These three steer its
+    # autotuner towards different conv_2d_c*h*w* shapes (wide / tall / 8-channel-block).
+    ("direct_wide",    1,  32,   32,  8, 64, 3, 1, "prelu",        True),
+    ("direct_tall",    1,  32,   32, 64, 32, 3, 1, "prelu",        True),
+    ("direct_c8blk",   1,  32,   64, 16, 64, 3, 1, "prelu",        True),
     ("direct_k5",      1,  96,   96, 16, 16, 5, 1, "prelu",        True),   # general conv
     ("pointwise_1x1",  1,  96,   96, 16, 16, 1, 1, "prelu",        True),   # 1x1 path
     ("pointwise_gemm", 1, 256,  256, 16, 16, 1, 1, "prelu",        True),   # 1x1 -> gemm path
@@ -273,6 +327,31 @@ CASES = [
     ("wino_relu",      1,  64,   64, 16, 16, 3, 1, "relu",         "relu"),
     ("wino_relu6",     1,  64,   64, 16, 16, 3, 1, "relu6",        "relu6"),
 ]
+
+
+def codegen_fresh():
+    """The .cl sources are compiled into *_mnn_cl.cpp string literals, and opencl_source_map.hpp
+    records an md5 per kernel that MNN uses to decide whether a CACHED COMPILED BINARY is still
+    valid. Edit a .cl without regenerating and MNN will happily reuse a binary built from the old
+    source -- e.g. a dest transform compiled without -DPRELU, whose argument list is one shorter.
+    Re-run the generator into a temp copy and require it to reproduce what is committed."""
+    import shutil, tempfile, filecmp
+    src = REPO / "source/backend/opencl/execution/cl"
+    ok = True
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td) / "cl"
+        shutil.copytree(src, tmp)
+        r = sh(f'cd "{tmp}" && python3 opencl_codegen.py "{tmp}"')
+        if r.returncode != 0:
+            print(r.stdout[-1000:], r.stderr[-1000:])
+            return False
+        for gen in sorted(tmp.glob("*_mnn_cl.cpp")) + [tmp / "opencl_source_map.hpp"]:
+            if not filecmp.cmp(gen, src / gen.name, shallow=False):
+                print(f"[**FAIL**] codegen  {gen.name} is stale -- rerun opencl_codegen.py")
+                ok = False
+    if ok:
+        print("[PASS] codegen  *_mnn_cl.cpp and opencl_source_map.hpp match the .cl sources")
+    return ok
 
 
 def main():
@@ -289,7 +368,7 @@ def main():
     WORK.mkdir(parents=True, exist_ok=True)
     cases = [c for c in CASES if args.filter in c[0]]
 
-    results = []
+    results = [codegen_fresh()]
     built = []
     for case in cases:
         ok, unfused, fused = build(convert_bin, case)
@@ -306,6 +385,7 @@ def main():
             adb(f"push {lib} {DEV}/")
         # one control per fused activation kind (per-channel PReLU, scalar LeakyReLU): each
         # takes a different branch of the pass, so each needs its own proof of teeth
+        results.append(low_memory_control(convert_bin))
         for act in ("prelu", "prelu_scalar"):
             rep = next((b for b in built if b[0][-1] is True and b[0][8] == act), None)
             if rep:
