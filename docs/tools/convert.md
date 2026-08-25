@@ -87,11 +87,30 @@ Usage:
 
       --useOriginRNNImpl    LSTM和GRU算子是否使用原始算子实现，默认关闭。若开启，性能可能提升，但无法进行LSTM/GRU的量化
 
+      --fusePreluToConv     将 PReLU / LeakyReLU 融合进前一个卷积，默认关闭。**仅 OpenCL 后端支持**，
+                            详见下方说明3
 ```
 
 **说明1: 选项weightQuantBits，使用方式为 --weightQuantBits numBits，numBits可选2~8，此功能仅对conv/matmul/LSTM的float32权值进行量化，仅优化模型大小，加载模型后会解码为float32，量化位宽可选2~8，运行速度和float32模型一致。经内部测试8bit时精度基本无损，模型大小减小4倍。default: 0，即不进行权值量化。**
 
 **说明2：如果使用Interpreter-Session C++接口开发，因为NC4HW4便于与ImageProcess结合，可以考虑在转换模型时使用自动内存布局：`--keepInputFormat=0`**
+
+**说明3: 选项 fusePreluToConv，将紧跟卷积的 per-channel PReLU（或 LeakyReLU）的斜率存到卷积上
+（`Convolution2DCommon.leakyReluSlope`），由卷积 kernel 直接应用，省去一次对输出张量的完整读写。
+在 conv block 上实测 GPU kernel 时间下降约 4%~10%（收益随张量大小上升）。**
+
+**只有 OpenCL 后端会读取该字段。** 用其它后端（CPU / Metal / Vulkan / CUDA）运行融合后的模型时，
+激活会被完全丢弃；为避免这种「结果错误但看起来正常」的情况，运行时会直接拒绝创建 Session 并给出明确报错，
+而不是静默出错。因此该选项只适用于确定部署在 OpenCL 上的模型。
+
+**推荐搭配 OpenCL buffer 内存模式（`MNN_GPU_MEMORY_BUFFER`）使用。** buffer 与 image 两种模式都已实现并验证，
+但 image 模式下有两种情况会被 OpenCL 拒绝、回退到 CPU，进而触发上述拒绝、导致 Session 无法创建：
+1. 与 `--fp16` 同时使用，且 `BackendConfig::Memory_Low`；
+2. 卷积权重为动态输入（多输入卷积）。
+这两种情况在 buffer 模式下均可正常运行。
+
+另外，`--fusePreluToConv` 与 `--weightQuantBits` 不能同时生效：量化卷积会走 OpenCL 低内存路径，
+该路径不应用融合的激活。同时指定时会保留权值量化并跳过融合，转换时给出 Warning。
 
 ## 其他模型转换到MNN
 ### TensorFlow to MNN

@@ -78,15 +78,11 @@ ConvCommonExecution::ConvCommonExecution(const Op *op, Backend *backend, bool is
     // Fused per-channel PReLU written by the converter into Convolution2DCommon.leakyReluSlope
     // (pass gated on --fusePreluToConv). The kernels in conv_2d.cl already implement -DPRELU
     // with the slope as an image indexed by out_channel_block_idx; only this upload was missing.
-    // Restricted to OpType_Convolution because the other users of this base ctor (deconv /
-    // depthwise / low-memory) have no kernel that consumes the slope, and the converter pass
-    // never emits the field on them either, nor alongside relu/relu6 -- which win the
-    // build-option chain, so a slope with them would bind an unused kernel argument.
-    // Mirrors the buffer path.
+    // The FusedActivation_PRelu verdict is the single gate shared with the op creator and with
+    // Pipeline, so a conv approved by one is never ignored by another. Mirrors the buffer path.
     auto slopeVec = conv2dParams->common()->leakyReluSlope();
-    bool hasFusedSlope = (!isExtra && op->type() == OpType_Convolution &&
-                          !conv2dParams->common()->relu() && !conv2dParams->common()->relu6() &&
-                          slopeVec != nullptr && slopeVec->size() >= (size_t)biasSize);
+    bool hasFusedSlope = (!isExtra && ConvolutionCommon::FusedActivation_PRelu ==
+                          ConvolutionCommon::fusedActivation(conv2dParams->common()));
     if(hasFusedSlope){
         cl::Buffer slopeBuffer(runtime->context(), CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR, buffer_size);
         cl_int slopeErr;
@@ -94,7 +90,10 @@ ConvCommonExecution::ConvCommonExecution(const Op *op, Backend *backend, bool is
             slopeBuffer, true, CL_MAP_WRITE, 0, buffer_size, nullptr, nullptr, &slopeErr);
         if(slopePtrCL != nullptr && slopeErr == CL_SUCCESS){
             ::memset(slopePtrCL, 0, ALIGN_UP8(biasSize) * sizeof(float));
-            ::memcpy(slopePtrCL, slopeVec->data(), biasSize * sizeof(float));
+            // fusedActivation guarantees slopeVec covers outputCount; clamp to the staging
+            // buffer too, which is sized from bias()->size().
+            ::memcpy(slopePtrCL, slopeVec->data(),
+                     ALIMIN(conv2dParams->common()->outputCount(), biasSize) * sizeof(float));
         }else{
             MNN_ERROR("Map error slopePtrCL == nullptr \n");
         }
@@ -641,8 +640,8 @@ public:
                     // conv through here would drop its activation while still running on
                     // OpenCL, so the backend-type check in Pipeline cannot catch it. Fall
                     // through to the full-precision conv instead.
-                    if (nullptr != conv2dParams->common()->leakyReluSlope() &&
-                        conv2dParams->common()->leakyReluSlope()->size() > 0) {
+                    if (ConvolutionCommon::FusedActivation_None !=
+                        ConvolutionCommon::fusedActivation(conv2dParams->common())) {
                         // fall through
                     } else {
                         OPENCL_CREATOR_CHECK(new ConvLowMemoryExecution(inputs, outputs, op, backend));

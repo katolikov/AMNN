@@ -14,6 +14,25 @@
 namespace MNN {
 class MNN_PUBLIC ConvolutionCommon : public Execution {
 public:
+    // Classification of Convolution2DCommon.leakyReluSlope -- the per-channel PReLU/LeakyReLU
+    // folded into a conv by MNNConvert --fusePreluToConv. EVERY consumer (the Pipeline gate, the
+    // OpenCL op creators, and the executions that upload the slope) must agree on this. When the
+    // predicates disagree, a conv gets approved by one gate and ignored by another, and the
+    // activation is dropped with no diagnostic -- output that is wrong but plausible.
+    enum FusedActivation {
+        FusedActivation_None = 0,       // no slope; nothing to apply, any backend is fine
+        FusedActivation_PRelu,          // usable: one slope per output channel, no relu/relu6
+        // The two ways a slope can be present but unusable. Both must be refused rather than
+        // ignored, and they are kept apart so the diagnostic can name the actual problem
+        // instead of listing every rule the model might have broken.
+        FusedActivation_InvalidWithRelu,    // relu/relu6 on the same conv wins in every kernel
+        FusedActivation_InvalidSlopeCount,  // fewer slopes than the conv has output channels
+    };
+    static bool fusedActivationInvalid(FusedActivation act) {
+        return FusedActivation_InvalidWithRelu == act || FusedActivation_InvalidSlopeCount == act;
+    }
+    static FusedActivation fusedActivation(const Convolution2DCommon* common);
+
     struct Int8Common {
         AutoStorage<int8_t> weight;
         AutoStorage<float> alpha;

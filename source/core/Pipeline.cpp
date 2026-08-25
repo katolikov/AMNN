@@ -15,6 +15,7 @@
 #include "geometry/GeometryComputerUtils.hpp"
 #include "shape/SizeComputer.hpp"
 #include "core/OpCommonUtils.hpp"
+#include "core/ConvolutionCommon.hpp"
 
 // TODO: Find better way for debug
 //#define MNN_OP_SEPERATE
@@ -534,25 +535,59 @@ void Pipeline::_pushTuningTask(std::vector<Schedule::OpCacheInfo>&& initInfos) {
     const_cast<Runtime*>(mRuntime)->setAsyncWork(std::move(future));
 }
 
-// A convolution carrying Convolution2DCommon.leakyReluSlope has had its PReLU / LeakyReLU folded
-// into the conv itself by MNNConvert --fusePreluToConv. ONLY the OpenCL backend reads that field:
-// on any other backend the conv runs and the activation is simply never applied, producing output
-// that is wrong but entirely plausible-looking, with no diagnostic anywhere. Refuse to build such
-// a pipeline instead -- including the case where OpenCL was requested but THIS op fell back to the
-// backup (CPU) backend, which is the easiest way to get silently wrong results.
-static bool _fusedActivationSupported(const Op* op, Backend* bn) {
-    if (nullptr == op || op->type() != OpType_Convolution || nullptr == bn) {
-        return true;
+// Classify the fused activation an op carries. Shared with the OpenCL creators and executions
+// through ConvolutionCommon::fusedActivation so all of them agree on what "fused" means.
+static ConvolutionCommon::FusedActivation _opFusedActivation(const Op* op) {
+    if (nullptr == op || op->type() != OpType_Convolution) {
+        return ConvolutionCommon::FusedActivation_None;
     }
     auto conv2d = op->main_as_Convolution2D();
-    if (nullptr == conv2d || nullptr == conv2d->common()) {
-        return true;
+    if (nullptr == conv2d) {
+        return ConvolutionCommon::FusedActivation_None;
     }
-    auto slope = conv2d->common()->leakyReluSlope();
-    if (nullptr == slope || 0 == slope->size()) {
-        return true;
+    return ConvolutionCommon::fusedActivation(conv2d->common());
+}
+
+// A convolution carrying Convolution2DCommon.leakyReluSlope has had its PReLU/LeakyReLU folded
+// into the conv itself by MNNConvert --fusePreluToConv. ONLY the OpenCL backend reads that field:
+// anywhere else the conv runs and the activation is simply never applied, producing output that is
+// wrong but entirely plausible-looking, with no diagnostic. Refuse to build instead -- including
+// when OpenCL was requested but THIS op fell back to the backup (CPU) backend.
+static ErrorCode _checkFusedActivation(const Op* op, Backend* bn) {
+    auto act = _opFusedActivation(op);
+    if (ConvolutionCommon::FusedActivation_None == act || nullptr == bn) {
+        return NO_ERROR;
     }
-    return MNN_FORWARD_OPENCL == bn->type();
+    const char* name = (nullptr != op->name()) ? op->name()->c_str() : "(unnamed)";
+    if (ConvolutionCommon::FusedActivation_InvalidWithRelu == act) {
+        MNN_ERROR("Pipeline: op \"%s\" carries a fused Convolution2DCommon.leakyReluSlope AND has "
+                  "relu/relu6 set on the same convolution. relu/relu6 wins in every conv kernel, so "
+                  "the slope would never be applied -- the model asks for two activations and would "
+                  "silently get one. Refusing to build; drop one of them and re-convert.\n", name);
+        return NOT_SUPPORT;
+    }
+    if (ConvolutionCommon::FusedActivation_InvalidSlopeCount == act) {
+        auto common = op->main_as_Convolution2D()->common();
+        MNN_ERROR("Pipeline: op \"%s\" carries %d fused slopes but the convolution has %d output "
+                  "channels. The kernels index Convolution2DCommon.leakyReluSlope per output "
+                  "channel, so a short vector cannot be applied and the activation would be dropped "
+                  "silently. Refusing to build; re-convert the model.\n",
+                  name, (int)common->leakyReluSlope()->size(), common->outputCount());
+        return NOT_SUPPORT;
+    }
+    if (MNN_FORWARD_OPENCL != bn->type()) {
+        MNN_ERROR("Pipeline: op \"%s\" is a convolution with a fused PReLU/LeakyReLU "
+                  "(Convolution2DCommon.leakyReluSlope), but it was assigned to backend type %d, "
+                  "which does not apply the fused slope and would silently drop the activation. "
+                  "Only MNN_FORWARD_OPENCL (%d) supports it. If you ARE running OpenCL, this op "
+                  "was declined by the gpu and fell back to cpu -- known to happen in IMAGE "
+                  "memory mode with --fp16 under Memory_Low, or with a dynamic-weight conv; both "
+                  "work in BUFFER mode (MNN_GPU_MEMORY_BUFFER), which is the supported mode for "
+                  "fused models. Otherwise re-convert without MNNConvert --fusePreluToConv.\n",
+                  name, (int)bn->type(), (int)MNN_FORWARD_OPENCL);
+        return NOT_SUPPORT;
+    }
+    return NO_ERROR;
 }
 
 static ErrorCode _createExecutions(Schedule::PipelineInfo& mInfo, const std::string& externalFile, std::vector<std::shared_ptr<BufferStorage>>& extraStorage) {
@@ -598,16 +633,12 @@ static ErrorCode _createExecutions(Schedule::PipelineInfo& mInfo, const std::str
             if (nullptr != tmpStorage.get()) {
                 extraStorage.emplace_back(tmpStorage);
             }
-            if (!_fusedActivationSupported(iter.op, iter.execution->backend())) {
-                MNN_ERROR("Pipeline: op \"%s\" is a convolution with a fused PReLU/LeakyReLU "
-                          "(Convolution2DCommon.leakyReluSlope), but it was assigned to backend "
-                          "type %d, which does not apply the fused slope and would silently drop "
-                          "the activation. Only MNN_FORWARD_OPENCL (%d) supports it. Re-convert "
-                          "the model without MNNConvert --fusePreluToConv, or run it on OpenCL.\n",
-                          nullptr != iter.op->name() ? iter.op->name()->c_str() : "(unnamed)",
-                          (int)iter.execution->backend()->type(), (int)MNN_FORWARD_OPENCL);
-                iter.execution = nullptr;
-                return NOT_SUPPORT;
+            {
+                auto fusedCode = _checkFusedActivation(iter.op, iter.execution->backend());
+                if (NO_ERROR != fusedCode) {
+                    iter.execution = nullptr;
+                    return fusedCode;
+                }
             }
             // invalid means memory alloc failed
             if (!iter.execution->valid()) {
@@ -1108,7 +1139,31 @@ ErrorCode Pipeline::allocMemory(bool firstMalloc, bool forbidReplace) {
                 break;
             }
         }
-        if (currentInitCount > 0) {
+        // Session_Backend_Auto parks the WHOLE pipeline on CPU while tuning runs asynchronously
+        // on the gpu runtime. A conv carrying a fused activation cannot run on cpu at all (see
+        // _checkFusedActivation), so that relocation would make the session unbuildable until the
+        // tuning cache is warm. Skip the relocation entirely for such a model -- including the
+        // async tuning task, because the swap to cpu is also what keeps this pipeline off the gpu
+        // backend while that task runs on it. Auto mode then behaves exactly as it does once the
+        // cache is warm (currentInitCount == 0): build on gpu, tune inline, slower first run.
+        bool hasFusedActivation = false;
+        for (auto& info : mInfo.second) {
+            if (info.type == Schedule::CONSTANT) {
+                continue;
+            }
+            for (auto& iterP : info.executeBuffer.command) {
+                if (ConvolutionCommon::FusedActivation_None != _opFusedActivation(iterP->op)) {
+                    hasFusedActivation = true;
+                    break;
+                }
+            }
+            if (hasFusedActivation) {
+                break;
+            }
+        }
+        if (currentInitCount > 0 && hasFusedActivation) {
+            MNN_PRINT("Keep gpu: model has a conv with a fused activation, which cpu cannot apply\n");
+        } else if (currentInitCount > 0) {
             MNN_PRINT("Turn back to cpu\n");
             // Reset execution
             for (auto& info : mInfo.second) {

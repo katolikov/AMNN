@@ -110,18 +110,14 @@ ConvBufCommonExecution::ConvBufCommonExecution(const Op *op, Backend *backend, b
     if(isExtra){
         const PRelu* preluParam = flatbuffers::GetRoot<PRelu>(op->main_as_Extra()->attr()->GetAs<Attribute>(1)->tensor()->uint8s()->data());
         slopeDataPtr = preluParam->slope()->data();
-    } else if(op->type() == OpType_Convolution &&
-              !conv2dParams->common()->relu() && !conv2dParams->common()->relu6() &&
-              conv2dParams->common()->leakyReluSlope() != nullptr &&
-              conv2dParams->common()->leakyReluSlope()->size() >= (size_t)biasSize){
+    } else if(ConvolutionCommon::FusedActivation_PRelu ==
+              ConvolutionCommon::fusedActivation(conv2dParams->common())){
         // Fused per-channel PReLU carried directly on the conv (MergePReluToConvolution /
         // Convolution2DCommon.leakyReluSlope). Reuses the same mPrelu/mSlope path as the
         // internal ExtraConvolution2DPrelu op; covers every non-winograd buffer conv.
-        // Restricted to OpType_Convolution because the other users of this base ctor
-        // (deconv / depthwise) have no kernel that consumes the slope -- and the converter
-        // pass never emits the field on them either. relu/relu6 exclude it too: they win the
-        // build-option chain below, so a slope alongside them would bind an argument the
-        // compiled kernel does not have.
+        // The FusedActivation_PRelu verdict is the single gate shared with the op creator and
+        // with Pipeline: arming mPrelu on anything they would classify differently is what
+        // makes an activation vanish between the gate that approved it and the kernel.
         slopeDataPtr = conv2dParams->common()->leakyReluSlope()->data();
     }
     if(slopeDataPtr != nullptr){
@@ -957,8 +953,8 @@ public:
                     // conv through here would drop its activation while still running on
                     // OpenCL, so the backend-type check in Pipeline cannot catch it. Fall
                     // through to the full-precision conv instead.
-                    if (nullptr != conv2dParams->common()->leakyReluSlope() &&
-                        conv2dParams->common()->leakyReluSlope()->size() > 0) {
+                    if (ConvolutionCommon::FusedActivation_None !=
+                        ConvolutionCommon::fusedActivation(conv2dParams->common())) {
                         // fall through
                     } else {
                         for (int i = 0; i < inputs.size(); ++i) {
@@ -978,8 +974,8 @@ public:
         // ConvBufExecution on every path and by ConvBufWinograd on its non-subgroup path.
         // The Intel-subgroup executions have no PReLU variant and would drop the activation
         // silently, so route such convs to ConvBufExecution instead.
-        const bool hasFusedPRelu = (nullptr != conv2D->common()->leakyReluSlope() &&
-                                    conv2D->common()->leakyReluSlope()->size() > 0);
+        const bool hasFusedPRelu = (ConvolutionCommon::FusedActivation_None !=
+                                    ConvolutionCommon::fusedActivation(conv2D->common()));
         const bool useIntelSubgroup =
             static_cast<OpenCLBackend *>(backend)->getOpenCLRuntime()->isSupportedIntelSubgroup();
 

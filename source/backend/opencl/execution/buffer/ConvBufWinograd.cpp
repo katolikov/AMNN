@@ -206,8 +206,8 @@ ConvBufWinograd::ConvBufWinograd(const MNN::Op* op, Backend* backend) : CommonEx
 
         // Optional fused per-channel PReLU slopes (mirrors the bias buffer layout).
         auto slopeVec = mResource->mCommon->leakyReluSlope();
-        mResource->mHasPRelu = (!mResource->mCommon->relu() && !mResource->mCommon->relu6() &&
-                                slopeVec != nullptr && slopeVec->size() >= (size_t)mCo);
+        mResource->mHasPRelu = (ConvolutionCommon::FusedActivation_PRelu ==
+                                ConvolutionCommon::fusedActivation(mResource->mCommon));
         if (mResource->mHasPRelu) {
             mResource->mSlope.reset(Tensor::createDevice<float>({1, 1, 1, (int)ALIGN_UP4(mCo)}));
             mOpenCLBackend->onAcquireBuffer(mResource->mSlope.get(), Backend::STATIC);

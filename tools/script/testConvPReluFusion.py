@@ -157,7 +157,7 @@ def convert(convert_bin, onnx_path, mnn_path, fuse):
 
 
 def run_on_device(mnn_path, in_shape, x, forward, gpu_mode, precision,
-                  allow_refusal=False):
+                  allow_refusal=False, run_mask=0, cache=None):
     base = os.path.basename(mnn_path)
     tdir = WORK / "tdir"
     tdir.mkdir(parents=True, exist_ok=True)
@@ -170,8 +170,10 @@ def run_on_device(mnn_path, in_shape, x, forward, gpu_mode, precision,
     adb(f"push {tdir/'input.txt'} {DEV}/tdir/input.txt")
     adb(f"shell 'rm -rf {DEV}/output && mkdir -p {DEV}/output'")
     # ModuleBasic.out <model> <dir> <runMask> <forwardType> <loops> <numberThread> <precision>
-    out = adb(f"shell 'cd {DEV} && LD_LIBRARY_PATH={DEV} ./ModuleBasic.out {base} tdir 0 "
-              f"{forward} 1 {gpu_mode} {precision} 2>&1'").stdout
+    if cache:
+        adb(f"shell rm -f {DEV}/{cache}")
+    out = adb(f"shell 'cd {DEV} && LD_LIBRARY_PATH={DEV} ./ModuleBasic.out {base} tdir {run_mask} "
+              f"{forward} 1 {gpu_mode} {precision} {cache or ''} 2>&1'").stdout
     local = WORK / f"out_{forward}_{gpu_mode}_{base}.txt"
     if local.exists():
         local.unlink()
@@ -283,6 +285,86 @@ def low_memory_control(convert_bin):
     return ok
 
 
+def malformed_control(convert_bin):
+    """A fused slope can be present but unusable in two ways, and both must be REFUSED rather
+    than read as "no activation" and ignored. Before ConvolutionCommon::fusedActivation was the
+    single gate, a slope shorter than outputCount passed the Pipeline check, was routed as fused
+    by the creators, and then left mPrelu unarmed -- it built, ran on OpenCL and dropped the
+    activation (measured 0.857). Each case must also name ITSELF in the diagnostic: listing every
+    rule the model might have broken leaves the author guessing which one they hit."""
+    src = WORK / "wino_64_fus.mnn"
+    if not src.exists():
+        print("[**FAIL**] malform no wino_64_fus.mnn to derive from")
+        return False
+    dump = Path(convert_bin).with_name("MNNDump2Json")
+    sh(f'"{dump}" "{src}" "{WORK}/malformed.json"')
+    base = json.loads((WORK / "malformed.json").read_text())
+
+    # (a) slope vector shorter than outputCount   (b) slope alongside relu on the same conv
+    short, trimmed = json.loads(json.dumps(base)), 0
+    for op in short["oplists"]:
+        if op["type"] == "Convolution" and op["main"]["common"].get("leakyReluSlope"):
+            c = op["main"]["common"]
+            c["leakyReluSlope"] = c["leakyReluSlope"][: max(1, c["outputCount"] // 4)]
+            trimmed = len(c["leakyReluSlope"])
+    withrelu = json.loads(json.dumps(base))
+    for op in withrelu["oplists"]:
+        if op["type"] == "Convolution":
+            op["main"]["common"]["relu"] = True
+
+    cases = [("short slope", short, f"carries {trimmed} fused slopes but the convolution has"),
+             ("slope+relu",  withrelu, "AND has relu/relu6 set on the same convolution")]
+    x = signed_input(1, 64, 16, 16)
+    ok = True
+    for label, net, expect in cases:
+        tag = label.replace(" ", "_").replace("+", "_")
+        (WORK / f"{tag}.json").write_text(json.dumps(net))
+        bad = WORK / f"{tag}.mnn"
+        sh(f'"{convert_bin}" -f JSON --modelFile "{WORK}/{tag}.json" --MNNModel "{bad}" '
+           f'--bizCode biz')
+        if not bad.exists():
+            print(f"[**FAIL**] malform could not build the {label} fixture")
+            ok = False
+            continue
+        for mode in ("buffer", "image"):
+            out, log = run_on_device(bad, [1, 64, 16, 16], x, FORWARD_OPENCL, GPU_MODE[mode],
+                                     PRECISION_LOW, allow_refusal=True)
+            # refused AND the diagnostic identifies THIS case, not just "something is wrong"
+            good = out is None and expect in log
+            ok = ok and good
+            print(f"[{'PASS' if good else '**FAIL**'}] malform {mode:6} {label:11} refused with "
+                  f"its own message ({good})")
+    return ok
+
+
+def auto_mode_control(case, unfused, fused):
+    """Session_Backend_Auto (ModuleBasic runMask 16) parks the whole pipeline on CPU while tuning
+    runs, which a fused conv cannot survive -- the session used to fail outright on a cold cache
+    and only recover once tuning was cached. Assert it builds AND is numerically right on a cold
+    cache, and that an unfused model still takes the CPU relocation (no behaviour change there)."""
+    name, N, Cin, Cout, H, W, k, group, act, _ = case
+    x = signed_input(N, Cin, H, W)
+    ref, _ = run_on_device(unfused, [N, Cin, H, W], x, FORWARD_CPU, GPU_MODE["buffer"],
+                           PRECISION_HIGH)
+    got, log = run_on_device(fused, [N, Cin, H, W], x, FORWARD_OPENCL, GPU_MODE["buffer"],
+                             PRECISION_LOW, allow_refusal=True, run_mask=16, cache="autotest.cache")
+    if got is None:
+        print(f"[**FAIL**] auto    {name:16} session failed under Session_Backend_Auto")
+        return False
+    cos, _ = cosine(ref, got)
+    kept = "Keep gpu" in log
+    ok = cos > COS_TOL and kept
+    print(f"[{'PASS' if ok else '**FAIL**'}] auto    {name:16} cold-cache Session_Backend_Auto "
+          f"builds, cos={cos:.6f}, stayed on gpu={kept}")
+
+    _, ulog = run_on_device(unfused, [N, Cin, H, W], x, FORWARD_OPENCL, GPU_MODE["buffer"],
+                            PRECISION_LOW, allow_refusal=True, run_mask=16, cache="autoref.cache")
+    relocated = "Turn back to cpu" in ulog
+    print(f"[{'PASS' if relocated else '**FAIL**'}] auto    {name:16} unfused model still "
+          f"relocates to cpu ({relocated})")
+    return ok and relocated
+
+
 def negative_control(case, unfused, fused):
     """No CPU backend reads leakyReluSlope, so a fused model on CPU cannot be correct. Pipeline
     must REFUSE to build it (source/core/Pipeline.cpp) rather than run it and quietly return
@@ -386,6 +468,10 @@ def main():
         # one control per fused activation kind (per-channel PReLU, scalar LeakyReLU): each
         # takes a different branch of the pass, so each needs its own proof of teeth
         results.append(low_memory_control(convert_bin))
+        results.append(malformed_control(convert_bin))
+        rep = next((b for b in built if b[0][-1] is True), None)
+        if rep:
+            results.append(auto_mode_control(*rep))
         for act in ("prelu", "prelu_scalar"):
             rep = next((b for b in built if b[0][-1] is True and b[0][8] == act), None)
             if rep:

@@ -324,8 +324,9 @@ bool Cli::initializeMNNConvertArgs(modelConfig &modelPath, int argc, char **argv
      )
     (
      "fusePreluToConv",
-     "fuse PReLU / LeakyReLU into the preceding convolution. OpenCL ONLY: other backends "
-     "ignore the fused slope and silently drop the activation. default: false",
+     "fuse PReLU / LeakyReLU into the preceding convolution. OpenCL ONLY, buffer memory mode "
+     "recommended: other backends ignore the fused slope and drop the activation, so they refuse "
+     "to build instead. Cannot be combined with weightQuantBits. default: false",
      cxxopts::value<bool>()
      )
      (

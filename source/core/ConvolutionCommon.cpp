@@ -16,6 +16,27 @@
 
 namespace MNN {
 
+ConvolutionCommon::FusedActivation ConvolutionCommon::fusedActivation(const Convolution2DCommon* common) {
+    if (nullptr == common) {
+        return FusedActivation_None;
+    }
+    auto slope = common->leakyReluSlope();
+    if (nullptr == slope || 0 == slope->size()) {
+        return FusedActivation_None;
+    }
+    // relu/relu6 win the -DRELU/-DRELU6/-DPRELU build-option chain in every conv kernel, so a
+    // slope alongside them would never be applied.
+    if (common->relu() || common->relu6()) {
+        return FusedActivation_InvalidWithRelu;
+    }
+    // The kernels index the slope by output-channel block; anything shorter than outputCount
+    // cannot be applied, and the executions decline to arm it.
+    if (common->outputCount() <= 0 || slope->size() < (size_t)common->outputCount()) {
+        return FusedActivation_InvalidSlopeCount;
+    }
+    return FusedActivation_PRelu;
+}
+
 namespace IDSTDecoder {
 
 static inline void *MNNMemoryAllocAlignZeroAlign(size_t size) {
