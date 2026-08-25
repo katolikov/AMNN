@@ -326,7 +326,9 @@ bool Cli::initializeMNNConvertArgs(modelConfig &modelPath, int argc, char **argv
      "fusePreluToConv",
      "fuse PReLU / LeakyReLU into the preceding convolution. OpenCL ONLY, buffer memory mode "
      "recommended: other backends ignore the fused slope and drop the activation, so they refuse "
-     "to build instead. Cannot be combined with weightQuantBits. default: false",
+     "to build instead. Requires a runtime built with this feature -- an OLDER libMNN does not "
+     "read the field and has no gate, so it drops the activation SILENTLY, even on OpenCL. "
+     "Cannot be combined with weightQuantBits. default: false",
      cxxopts::value<bool>()
      )
      (

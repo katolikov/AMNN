@@ -117,7 +117,9 @@ ConvBufWinograd::ConvBufWinograd(const MNN::Op* op, Backend* backend) : CommonEx
             cl::Buffer &bias_buffer = *(cl::Buffer *)mResource->mBias->buffer().device;
             auto bias_ptr = queue.enqueueMapBuffer(bias_buffer, CL_TRUE, CL_MAP_WRITE, 0, buffer_size, nullptr, nullptr, &ret_code);
             if(bias_ptr == nullptr || ret_code) {
-                MNN_ERROR("clBuffer map error!\n");
+                MNN_ERROR("ConvBufWinograd: bias buffer map error!\n");
+                mValid = false;
+                return;
             }
             ::memset(bias_ptr, 0, buffer_size);
             if(mOpenCLBackend->getPrecision() != BackendConfig::Precision_High) {
@@ -191,7 +193,9 @@ ConvBufWinograd::ConvBufWinograd(const MNN::Op* op, Backend* backend) : CommonEx
             cl::Buffer &bias_buffer = *(cl::Buffer *)mResource->mBias->buffer().device;
             auto bias_ptr = queue.enqueueMapBuffer(bias_buffer, CL_TRUE, CL_MAP_WRITE, 0, buffer_size, nullptr, nullptr, &ret_code);
             if(bias_ptr == nullptr || ret_code) {
-                MNN_ERROR("clBuffer map error!\n");
+                MNN_ERROR("ConvBufWinograd: bias buffer map error!\n");
+                mValid = false;
+                return;
             }
             ::memset(bias_ptr, 0, buffer_size);
             if(mOpenCLBackend->getPrecision() != BackendConfig::Precision_High) {
@@ -215,7 +219,11 @@ ConvBufWinograd::ConvBufWinograd(const MNN::Op* op, Backend* backend) : CommonEx
                 cl::Buffer &slope_buffer = *(cl::Buffer *)mResource->mSlope->buffer().device;
                 auto slope_ptr = queue.enqueueMapBuffer(slope_buffer, CL_TRUE, CL_MAP_WRITE, 0, buffer_size, nullptr, nullptr, &ret_code);
                 if(slope_ptr == nullptr || ret_code) {
-                    MNN_ERROR("clBuffer map error!\n");
+                    // Must bail: writing through the null pointer crashes, and continuing would
+                    // leave the slope buffer uninitialised, which is a wrong activation.
+                    MNN_ERROR("ConvBufWinograd: slope buffer map error!\n");
+                    mValid = false;
+                    return;
                 }
                 ::memset(slope_ptr, 0, buffer_size);
                 if(mOpenCLBackend->getPrecision() != BackendConfig::Precision_High) {
@@ -257,11 +265,13 @@ ConvBufWinograd::ConvBufWinograd(const MNN::Op* op, Backend* backend) : CommonEx
             
             cl_int res;
             auto ptrCL = mOpenCLBackend->getOpenCLRuntime()->commandQueue().enqueueMapBuffer(weightBufferCL, true, CL_MAP_WRITE, 0, buffer_size, nullptr, nullptr, &res);
-            if(ptrCL != nullptr && res == CL_SUCCESS) {
-                ::memcpy(ptrCL, filterDataPtr, buffer_size);
-            }else{
+            if(ptrCL == nullptr || res != CL_SUCCESS) {
+                // Continuing would run convertWeightFormat over uninitialised memory.
                 MNN_ERROR("Map weightBufferCL error:%d, ptrCL == nullptr \n", res);
+                mValid = false;
+                return;
             }
+            ::memcpy(ptrCL, filterDataPtr, buffer_size);
             mOpenCLBackend->getOpenCLRuntime()->commandQueue().enqueueUnmapMemObject(weightBufferCL, ptrCL);
             
             convertWeightFormat(weightBufferCL, mResource->mAlignK, mResource->mAlignN);

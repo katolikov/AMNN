@@ -103,6 +103,10 @@ Usage:
 激活会被完全丢弃；为避免这种「结果错误但看起来正常」的情况，运行时会直接拒绝创建 Session 并给出明确报错，
 而不是静默出错。因此该选项只适用于确定部署在 OpenCL 上的模型。
 
+**同样重要：该模型要求运行时也包含此功能。** 旧版本的 libMNN（例如未打此补丁的 3.5.0）根本不读取
+`leakyReluSlope`，也没有上述保护性检查，因此**即使跑在 OpenCL 上也会静默丢弃激活**，不会有任何报错。
+发布融合模型时必须同时保证 App 内的 libMNN 已升级。
+
 **推荐搭配 OpenCL buffer 内存模式（`MNN_GPU_MEMORY_BUFFER`）使用。** buffer 与 image 两种模式都已实现并验证，
 但 image 模式下有两种情况会被 OpenCL 拒绝、回退到 CPU，进而触发上述拒绝、导致 Session 无法创建：
 1. 与 `--fp16` 同时使用，且 `BackendConfig::Memory_Low`；

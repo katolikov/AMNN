@@ -646,10 +646,15 @@ public:
                     } else {
                         OPENCL_CREATOR_CHECK(new ConvLowMemoryExecution(inputs, outputs, op, backend));
                     }
-                } else {
+                } else if (ConvolutionCommon::FusedActivation_None ==
+                           ConvolutionCommon::fusedActivation(conv2dParams->common())) {
                     //MNN_ERROR("OpenCL Conv buf low memory init error. For Opencl Backend, only support low memory mode of int8 or int4 dequantization currently.\n");
                     return nullptr;
                 }
+                // Declining a fused conv sends it to the cpu backup, where the slope is not
+                // applied, and the Pipeline gate then refuses the session. --fp16 stamps
+                // quanParameter type 3 after the fusion pass runs, so this is the common case.
+                // Fall through to the full-precision conv, which does apply the slope.
             }
         }
 #endif

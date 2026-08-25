@@ -468,7 +468,7 @@ __kernel void winoTransDstBuf2_3_1(GLOBAL_SIZE_DIM2
                 res = clamp(res, (FLOAT4)(0), (FLOAT4)(6));
 #endif
 #ifdef PRELU
-                res = fmax(res, (FLOAT4)(0)) + slope * fmin(res, (FLOAT4)(0));
+                res = select(res * slope, res, res >= 0);
 #endif
                 vstore4(res, 0, uOutput+out_offset);
             }
@@ -485,7 +485,7 @@ __kernel void winoTransDstBuf2_3_1(GLOBAL_SIZE_DIM2
                 res = clamp(res, (FLOAT4)(0), (FLOAT4)(6));
 #endif
 #ifdef PRELU
-                res = fmax(res, (FLOAT4)(0)) + slope * fmin(res, (FLOAT4)(0));
+                res = select(res * slope, res, res >= 0);
 #endif
                 vstore4(res, 0, uOutput+out_offset+4);
             }
@@ -502,7 +502,7 @@ __kernel void winoTransDstBuf2_3_1(GLOBAL_SIZE_DIM2
                 res = clamp(res, (FLOAT4)(0), (FLOAT4)(6));
 #endif
 #ifdef PRELU
-                res = fmax(res, (FLOAT4)(0)) + slope * fmin(res, (FLOAT4)(0));
+                res = select(res * slope, res, res >= 0);
 #endif
                 vstore4(res, 0, uOutput+out_offset+4*dstWidth);
             }
@@ -519,7 +519,7 @@ __kernel void winoTransDstBuf2_3_1(GLOBAL_SIZE_DIM2
                 res = clamp(res, (FLOAT4)(0), (FLOAT4)(6));
 #endif
 #ifdef PRELU
-                res = fmax(res, (FLOAT4)(0)) + slope * fmin(res, (FLOAT4)(0));
+                res = select(res * slope, res, res >= 0);
 #endif
                 vstore4(res, 0, uOutput+out_offset+4*dstWidth+4);
             }

@@ -579,11 +579,11 @@ static ErrorCode _checkFusedActivation(const Op* op, Backend* bn) {
         MNN_ERROR("Pipeline: op \"%s\" is a convolution with a fused PReLU/LeakyReLU "
                   "(Convolution2DCommon.leakyReluSlope), but it was assigned to backend type %d, "
                   "which does not apply the fused slope and would silently drop the activation. "
-                  "Only MNN_FORWARD_OPENCL (%d) supports it. If you ARE running OpenCL, this op "
-                  "was declined by the gpu and fell back to cpu -- known to happen in IMAGE "
-                  "memory mode with --fp16 under Memory_Low, or with a dynamic-weight conv; both "
-                  "work in BUFFER mode (MNN_GPU_MEMORY_BUFFER), which is the supported mode for "
-                  "fused models. Otherwise re-convert without MNNConvert --fusePreluToConv.\n",
+                  "Only MNN_FORWARD_OPENCL (%d) supports it. If you ARE running OpenCL, the gpu "
+                  "declined this op and it fell back to cpu -- either an allocation failure, or a "
+                  "conv shape no OpenCL conv execution accepts (group > 1, dynamic weights, "
+                  "IDST-int8 weights), which MNNConvert does not fuse but a hand-built model can "
+                  "carry. Otherwise re-convert without MNNConvert --fusePreluToConv.\n",
                   name, (int)bn->type(), (int)MNN_FORWARD_OPENCL);
         return NOT_SUPPORT;
     }
@@ -599,6 +599,22 @@ static ErrorCode _createExecutions(Schedule::PipelineInfo& mInfo, const std::str
             continue;
         }
         if (info.type == Schedule::CONSTANT) {
+            // Constant subtrees run on the cpu runtime inside geometry, before any execution
+            // exists, so the per-op gate below never sees them and the slope would be dropped.
+            auto constAct = _opFusedActivation(info.op);
+            if (ConvolutionCommon::fusedActivationInvalid(constAct)) {
+                // Let the shared check name the rule that was broken; it is not about constants.
+                return _checkFusedActivation(info.op, mBackupBackend.get());
+            }
+            if (ConvolutionCommon::FusedActivation_None != constAct) {
+                MNN_ERROR("Pipeline: op \"%s\" is a convolution with a fused PReLU/LeakyReLU "
+                          "(Convolution2DCommon.leakyReluSlope) inside a constant subgraph. "
+                          "Constant subgraphs are computed on the cpu runtime during geometry, "
+                          "which does not apply the fused slope. Refusing to build; re-convert "
+                          "without MNNConvert --fusePreluToConv.\n",
+                          (nullptr != info.op->name()) ? info.op->name()->c_str() : "(unnamed)");
+                return NOT_SUPPORT;
+            }
             continue;
         }
         auto& buffer = info.executeBuffer;

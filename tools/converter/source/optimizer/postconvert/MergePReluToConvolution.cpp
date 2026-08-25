@@ -56,6 +56,10 @@ public:
         // (the low-memory path) do NOT read it, so skip those.
         if (common->group != 1) return false;
         if (conv->quanParameter != nullptr) return false;
+        // Dynamic weights arrive as a second input, which the OpenCL image creator declines;
+        // the op then falls back to cpu and the runtime gate refuses the session. Fusing here
+        // would turn a working model into one that cannot load.
+        if (convolutionOp->inputIndexes.size() > 1) return false;
         // Weight quantisation is applied by writeFb AFTER this pass, so the check above cannot
         // see it. A conv that ends up with BOTH a slope and a quanParameter routes to the OpenCL
         // low-memory execution, which does not read the slope. Weight quantisation is the larger
@@ -81,6 +85,9 @@ public:
             return true;
         }
         auto prelu = inplaceOp->main.AsPRelu();
+        // slopeCount is metadata; the vector holds the values. Copying a short one would emit a
+        // model the runtime gate refuses at load time, so decline the fusion instead.
+        if (prelu->slope.size() < (size_t)prelu->slopeCount) return false;
         if (prelu->slopeCount == co) {
             common->leakyReluSlope = prelu->slope;                  // per-channel
         } else if (prelu->slopeCount == 1) {

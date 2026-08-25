@@ -216,8 +216,11 @@ COS_TOL = 0.999
 
 
 def cosine(a, b):
-    n = min(a.size, b.size)
-    a, b = a.reshape(-1)[:n], b.reshape(-1)[:n]
+    # Sizes must match: comparing a common prefix would turn a wrong output shape into a pass.
+    if a.size != b.size:
+        print(f"        size mismatch: reference {a.size} vs got {b.size}")
+        return float("nan"), a.reshape(-1)
+    a, b = a.reshape(-1), b.reshape(-1)
     return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-12)), a
 
 
@@ -265,12 +268,24 @@ def low_memory_control(convert_bin):
 
     # now the runtime half, on a model deliberately carrying both
     forced = WORK / f"{name}_forced.mnn"
+    # --fp16 stamps quanParameter type 3 after the fusion pass, the only supported way to build
+    # a conv carrying both a slope and a quanParameter. Without it there is no quanParameter and
+    # the model never reaches a low-memory creator, which made this half of the case vacuous.
     sh(f'"{convert_bin}" -f ONNX --modelFile "{onnx_path}" --MNNModel "{forced}" '
-       f'--bizCode biz --fusePreluToConv')
+       f'--bizCode biz --fusePreluToConv --fp16')
+    dump = Path(convert_bin).with_name("MNNDump2Json")
+    sh(f'"{dump}" "{forced}" "{WORK}/{name}_forced.json"')
+    fj = json.loads((WORK / f"{name}_forced.json").read_text())
+    carries_both = any(
+        op["type"] == "Convolution" and op["main"].get("quanParameter") is not None
+        and op["main"]["common"].get("leakyReluSlope")
+        for op in fj["oplists"])
+    print(f"[{'PASS' if carries_both else '**FAIL**'}] lowmem  fixture really carries slope+"
+          f"quanParameter ({carries_both}) -- guards this case against going vacuous")
     x = signed_input(1, 64, 16, 16)
     ref, _ = run_on_device(unfused, [1, 64, 16, 16], x, FORWARD_CPU, GPU_MODE["buffer"],
                            PRECISION_HIGH)
-    ok = declined
+    ok = declined and carries_both
     for mode in ("buffer", "image"):
         got, _ = run_on_device(forced, [1, 64, 16, 16], x, FORWARD_OPENCL, GPU_MODE[mode],
                                PRECISION_LOW + 4 * 2, allow_refusal=True)   # memory = Low

@@ -87,7 +87,7 @@ __kernel void winogradTransformDest(__read_only image2d_t uInput, // 0
                     res = clamp(res, (FLOAT4)(0), (FLOAT4)(6));
 #endif
 #ifdef PRELU
-                    res = fmax(res, (FLOAT4)(0)) + slope * fmin(res, (FLOAT4)(0));
+                    res = select(res * slope, res, res >= 0);
 #endif
                     WI_F(uOutput, (int2)(imageOx, imageOy), res);
                 }
@@ -106,7 +106,7 @@ __kernel void winogradTransformDest(__read_only image2d_t uInput, // 0
                     res = clamp(res, (FLOAT4)(0), (FLOAT4)(6));
 #endif
 #ifdef PRELU
-                    res = fmax(res, (FLOAT4)(0)) + slope * fmin(res, (FLOAT4)(0));
+                    res = select(res * slope, res, res >= 0);
 #endif
                     WI_F(uOutput, (int2)(imageOx, imageOy), res);
                 }
@@ -125,7 +125,7 @@ __kernel void winogradTransformDest(__read_only image2d_t uInput, // 0
                     res = clamp(res, (FLOAT4)(0), (FLOAT4)(6));
 #endif
 #ifdef PRELU
-                    res = fmax(res, (FLOAT4)(0)) + slope * fmin(res, (FLOAT4)(0));
+                    res = select(res * slope, res, res >= 0);
 #endif
                     WI_F(uOutput, (int2)(imageOx, imageOy), res);
                 }
@@ -144,7 +144,7 @@ __kernel void winogradTransformDest(__read_only image2d_t uInput, // 0
                     res = clamp(res, (FLOAT4)(0), (FLOAT4)(6));
 #endif
 #ifdef PRELU
-                    res = fmax(res, (FLOAT4)(0)) + slope * fmin(res, (FLOAT4)(0));
+                    res = select(res * slope, res, res >= 0);
 #endif
                     WI_F(uOutput, (int2)(imageOx, imageOy), res);
                 }
