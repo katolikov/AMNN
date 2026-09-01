@@ -10,6 +10,22 @@ The resulting directory/tarball needs NO MNN repo, NO MNNConvert, NO numpy on th
 import json, os, shutil, subprocess, sys, tarfile
 from pathlib import Path
 
+# Resolve the shape family before importing block_fixture: CORES/HEADS below are built at module
+# scope from block_fixture.scale(), so the family has to be settled by import time. Handled here
+# rather than in main() so `--shape-family` behaves like an ordinary flag while the environment
+# variable keeps working for callers that already set it.
+def _resolve_family(argv):
+    for i, a in enumerate(argv):
+        if a == "--shape-family" and i + 1 < len(argv):
+            return argv[i + 1]
+        if a.startswith("--shape-family="):
+            return a.split("=", 1)[1]
+    return os.environ.get("CONV_BENCH_SHAPES", "3")
+
+
+if "-h" not in sys.argv and "--help" not in sys.argv:
+    os.environ["CONV_BENCH_SHAPES"] = _resolve_family(sys.argv[1:])
+
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "conv_bench"))
 import numpy as np
@@ -157,6 +173,16 @@ def conv3x3(x, W, b):
 
 
 def main():
+    import argparse
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--shape-family", default=None,
+                    help="'full', or a divisor applied to the original spatial sizes: "
+                         "1.5 -> H/1.5, 3 -> H/3 (default 3). Also settable as CONV_BENCH_SHAPES. "
+                         "Refused unless every dimension divides exactly and stays even.")
+    ap.parse_args()          # resolved at import time; parsed here for --help and validation
+    print(f"== shape family: {block_fixture.SHAPE_FAMILY} "
+          f"(H,W / {block_fixture.SHAPE_DIVISOR:g}) ==")
     if OUT.exists(): shutil.rmtree(OUT)
     for sub in ("bin", "models", "ref"):
         (OUT / sub).mkdir(parents=True)

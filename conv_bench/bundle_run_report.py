@@ -97,6 +97,42 @@ def list_devices():
 
 
 # --------------------------------------------------------------- autotune cache
+def push_binaries(d, bin_dir, manifest=None):
+    """Push the bundle's binaries, and DROP the tuning cache if they changed.
+
+    The cache holds programs compiled by a specific libMNN_CL.so. Every script pushes the bundle's
+    binaries on each run, but nothing used to invalidate the cache, so rebuilding the library and
+    re-running silently reused programs built by the previous one -- the run succeeds, the numbers
+    look reasonable, and you are measuring a mix of two builds. Clearing it by hand worked only
+    while someone remembered to.
+
+    The fingerprint covers the binaries and the manifest, so a rebuilt library and a rebuilt set of
+    models both invalidate it. Returns True when the cache was dropped."""
+    import hashlib
+    h = hashlib.sha1()
+    for f in sorted(Path(bin_dir).iterdir()):
+        h.update(f.name.encode()); h.update(f.read_bytes())
+    if manifest and Path(manifest).exists():
+        h.update(Path(manifest).read_bytes())
+    fp = h.hexdigest()[:16]
+
+    d.shell(f"mkdir -p {DEV}/tdir; mkdir -p {TUNE}")
+    seen = d.shell(f"cat {DEV}/.binaries 2>/dev/null").strip()
+    dropped = False
+    if seen != fp:
+        n = d.shell(f"ls {TUNE}/*.bin 2>/dev/null | wc -l").strip()
+        d.shell(f"rm -f {TUNE}/*.bin")
+        dropped = True
+        if seen:
+            print(f"   binaries changed ({seen} -> {fp}); dropped {n} stale cache entries",
+                  flush=True)
+    for f in sorted(Path(bin_dir).iterdir()):
+        d.push(f, f"{DEV}/")
+    d.shell(f"chmod +x {DEV}/ModuleBasic.out")
+    d.shell(f"echo {fp} > {DEV}/.binaries")
+    return dropped
+
+
 def cache_name(model, shape, env, mode, ftype):
     """Content-addressed name for MNN's autotune cache: hash of everything that can change which
     kernel is selected.

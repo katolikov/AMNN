@@ -71,10 +71,7 @@ def main():
     a.serial = a.serial or default_serial()
 
     d = R.Dev(a.serial)
-    d.shell(f"mkdir -p {R.DEV}/tdir"); d.shell(f"mkdir -p {R.TUNE}")
-    for f in sorted((BUNDLE / "bin").iterdir()):
-        d.push(f, f"{R.DEV}/")
-    d.shell(f"chmod +x {R.DEV}/ModuleBasic.out")
+    R.push_binaries(d, BUNDLE / "bin", BUNDLE / "manifest.json")
 
     st = ResultStore(a.db)
     s0l, _ = R.sample_clock(d, configs()[0][0], configs()[0][1])

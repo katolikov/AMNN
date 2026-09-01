@@ -6,15 +6,19 @@ Measures this model's 13 distinct convs at a chosen fraction of their original s
 
 A family is a **divisor applied to `model_convs_updated.csv`**, the one conv list:
 
-    CONV_BENCH_SHAPES=full   python3 conv_bench/make_bundle.py   # original sizes
-    CONV_BENCH_SHAPES=1.5    python3 conv_bench/make_bundle.py   # H/1.5, W/1.5
-    CONV_BENCH_SHAPES=3      python3 conv_bench/make_bundle.py   # H/3, W/3   (default)
+    python3 conv_bench/make_bundle.py --shape-family full   # original sizes
+    python3 conv_bench/make_bundle.py --shape-family 1.5    # H/1.5, W/1.5
+    python3 conv_bench/make_bundle.py --shape-family 3      # H/3, W/3   (default)
+
+`CONV_BENCH_SHAPES` does the same thing for callers that already set it; the flag wins.
 
 It matters at **bundle-build time** -- the models are pre-converted, so once built the bundle IS
-that family, and the manifest records which. Setting the variable on the later scripts is harmless
-and makes the intent visible. Clear the tuning cache when switching, since the models change:
+that family, and the manifest records which.
 
-    adb shell 'rm -f /data/local/tmp/convprobe/tune/*.bin'
+You do not need to clear the tuning cache by hand. Every script fingerprints the binaries and the
+manifest before pushing, and drops the cache when either changed -- so a rebuilt libMNN_CL.so or a
+rebuilt bundle invalidates it automatically. Clearing it manually used to be a step you had to
+remember, and forgetting it meant silently measuring programs compiled by the previous library.
 
 A divisor is refused unless every spatial dimension divides exactly AND stays even. Exactness keeps
 the shapes the model's real shapes rather than rounded approximations; evenness keeps stride-2

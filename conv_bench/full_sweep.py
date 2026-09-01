@@ -113,10 +113,7 @@ def main():
 
     d = R.Dev(a.serial)
     tel = GpuTelemetry(a.serial)
-    d.shell(f"mkdir -p {R.DEV}/tdir"); d.shell(f"mkdir -p {R.TUNE}")
-    for f in sorted((BUNDLE / "bin").iterdir()):
-        d.push(f, f"{R.DEV}/")
-    d.shell(f"chmod +x {R.DEV}/ModuleBasic.out")
+    R.push_binaries(d, BUNDLE / "bin", BUNDLE / "manifest.json")
     for model, _ in PROBE_MODELS:
         d.push(BUNDLE / "models" / model, f"{R.DEV}/{model}")
 
