@@ -43,14 +43,32 @@ def configs():
     return list(PROBE_MODELS)
 
 
+
+def default_serial():
+    """The attached device, when there is exactly one.
+
+    These scripts used to default to the serial of the machine they were written on, so on any
+    other setup the first run targeted a device that does not exist. Auto-detect instead, and say
+    plainly what to pass when the answer is ambiguous."""
+    import subprocess
+    out = subprocess.run("adb devices", shell=True, text=True, capture_output=True).stdout
+    devs = [l.split()[0] for l in out.splitlines()[1:] if "\tdevice" in l]
+    if len(devs) == 1:
+        return devs[0]
+    if not devs:
+        raise SystemExit("no device attached (check `adb devices`)")
+    raise SystemExit(f"several devices attached; pass one as the first argument: {', '.join(devs)}")
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("serial", nargs="?", default="R3CY905E04M")
+    ap.add_argument("serial", nargs="?", default=None,
+                    help="adb serial; auto-detected when one device is attached")
     ap.add_argument("--repeats", type=int, default=5, help="how many times to re-run each batch")
     ap.add_argument("--reps", type=int, default=3, help="interleaved reps inside one batch")
     ap.add_argument("--cool", type=int, default=10, help="seconds between batches")
     ap.add_argument("--db", default=str(HERE / "results.db"))
     a = ap.parse_args()
+    a.serial = a.serial or default_serial()
 
     d = R.Dev(a.serial)
     d.shell(f"mkdir -p {R.DEV}/tdir"); d.shell(f"mkdir -p {R.TUNE}")
