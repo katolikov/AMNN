@@ -254,6 +254,31 @@ def test_is_deployed_semantics():
     assert not is_deployed("MNN_CONV_FORCE=x ", 68)
 
 
+def test_oversized_batch_raises():
+    """full_sweep put 215 launches in one batch and its verdicts contradicted three shorter runs.
+    A batch that cannot hold a stable thermal state must not be recordable as one."""
+    from bench_store import OversizedBatch
+    s = new_store()
+    try:
+        with s.batch(section="x", label="everything at once", reps=3, max_arms=5) as b:
+            b.baseline("a0")
+            for i in range(6):
+                b.record("c", f"a{i}", 30.0 + i)
+    except OversizedBatch as e:
+        assert "not comparable" in str(e)
+        return
+    raise AssertionError("a batch above the arm cap must raise")
+
+
+def test_batch_within_cap_is_fine():
+    s = new_store()
+    with s.batch(section="x", label="one model", reps=3, max_arms=5) as b:
+        b.baseline("a0")
+        for i in range(4):
+            b.record("c", f"a{i}", 30.0 + i)
+    assert len(s.rows(b.batch_id)) == 4
+
+
 if __name__ == "__main__":
     print("bench_store — replaying the investigation's real failures\n")
     for name, fn in sorted(globals().items()):

@@ -28,24 +28,19 @@ BUNDLE = HERE / "conv_probe_bundle"
 sys.path.insert(0, str(BUNDLE))
 sys.path.insert(0, str(HERE))
 import run_report as R                       # noqa: E402
+from probe_perconv import per_conv, label_of, PROBE_MODELS  # noqa: E402
 from bench_store import ResultStore          # noqa: E402
 
-SCRATCH = Path("/private/tmp/claude-501/-Users-sam-Documents-projects-MNN--claude-worktrees-"
-               "convolution-benchmark-reduced-shapes-00e84c/4d41964f-a31f-4e23-b852-189d900ce502/"
-               "scratchpad")
-
-
 def configs():
-    """The 13 convs of the reduced shape set: 5 stride-1 cores + 8 stride-2 singles."""
-    man = json.loads((BUNDLE / "manifest.json").read_text())
-    out = []
-    for c in man["cores"]:
-        out.append(dict(conv=c["label"], model=c["model"], shape=c["shape"], depth=c["depth"]))
-    s2 = SCRATCH / "s2_manifest.json"
-    if s2.exists():
-        for c in json.loads(s2.read_text()):
-            out.append(dict(conv=c["label"], model=c["model"], shape=c["shape"], depth=1))
-    return out
+    """The five probe models, which between them hold all 13 convs of the reduced shape set.
+
+    This used to read the stride-1 cores from the manifest plus a set of single-conv stride-2
+    models listed in a scratch directory. That path existed only on the machine the models were
+    generated on, and it was guarded by .exists(), so anywhere else this measured five cores and
+    silently reported nothing about the eight stride-2 convs. Using the probe models instead
+    covers all 13, needs nothing outside the bundle, and matches how the rest of the harness
+    attributes per-conv times."""
+    return list(PROBE_MODELS)
 
 
 def main():
@@ -64,33 +59,37 @@ def main():
     d.shell(f"chmod +x {R.DEV}/ModuleBasic.out")
 
     st = ResultStore(a.db)
-    s0l, _ = R.sample_clock(d, configs()[0]["model"], configs()[0]["shape"])
+    s0l, _ = R.sample_clock(d, configs()[0][0], configs()[0][1])
     s0 = statistics.median(s0l) if s0l else 0
     st.begin_run(device=a.serial, shape_family="reduced", harness="variance_probe",
                  clock_start=s0, notes=f"across-batch variance, {a.repeats} repeats")
 
     cfgs = configs()
-    print(f"=== across-batch variance: {len(cfgs)} convs x 2 modes x {a.repeats} batches "
-          f"({a.reps} reps each) ===")
+    print(f"=== across-batch variance: {len(cfgs)} probe models (13 convs) x 2 modes "
+          f"x {a.repeats} batches ({a.reps} reps each) ===")
     print(f"(clock at start: {s0} MHz)\n")
     print(f"{'conv':<22}{'mode':<8}{'median':>9}{'min':>8}{'max':>8}{'spread':>9}   verdict")
 
     t0 = time.time()
     per_batch: dict[tuple, list] = {}
     for rep in range(a.repeats):
-        for c in cfgs:
+        for model, shape in cfgs:
             R.cooldown(d, a.cool)
-            d.push(BUNDLE / "models" / c["model"], f"{R.DEV}/{c['model']}")
-            with st.batch(section="variance", label=f"{c['conv']} rep{rep}", reps=a.reps) as b:
+            d.push(BUNDLE / "models" / model, f"{R.DEV}/{model}")
+            acc: dict = {}
+            for mode, arm in ((68, "buffer"), (132, "image")):
+                for _ in range(a.reps):
+                    out, _ = R.run_model(d, model, shape, 120, mode=mode)
+                    for tag, us in per_conv(out).items():
+                        acc.setdefault((label_of(tag), arm), []).append(us)
+            with st.batch(section="variance", label=f"{model} rep{rep}", reps=a.reps) as b:
                 b.baseline("buffer")
-                for mode, arm in ((68, "buffer"), (132, "image")):
-                    samples = [R.conv_all_us(
-                        R.run_model(d, c["model"], c["shape"], 120, mode=mode)[0], c["depth"])
-                        for _ in range(a.reps)]
-                    row = b.record(c["conv"], arm, 0, env="", mode=mode, samples=samples)
-                    per_batch.setdefault((c["conv"], arm), []).append(row["us"])
+                for (conv, arm), samples in acc.items():
+                    row = b.record(conv, arm, 0, env="",
+                                   mode=68 if arm == "buffer" else 132, samples=samples)
+                    per_batch.setdefault((conv, arm), []).append(row["us"])
 
-    s1l, _ = R.sample_clock(d, cfgs[0]["model"], cfgs[0]["shape"])
+    s1l, _ = R.sample_clock(d, cfgs[0][0], cfgs[0][1])
     s1 = statistics.median(s1l) if s1l else 0
     valid = st.finish_run(clock_end=s1)
 

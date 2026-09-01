@@ -145,6 +145,10 @@ class MissingBaseline(Exception):
     """Raised when a batch is rendered or compared without declaring which arm is its baseline."""
 
 
+class OversizedBatch(Exception):
+    """Raised when a batch holds so many arms that drift within it invalidates the comparison."""
+
+
 class UncheckedKernel(Exception):
     """Raised when timings are reported for a (conv, arm, mode) with no passing correctness gate."""
 
@@ -279,11 +283,26 @@ class ResultStore:
         self._conn.commit()
         return bool(valid)
 
+    # A batch is only meaningful if every arm in it saw the same thermal state. full_sweep.py put
+    # 215 launches (~2h) into one "interleaved" batch; drift across that window was larger than the
+    # 10-20% effects being measured, and its verdicts contradicted three shorter runs that agreed
+    # with each other. Rotation across reps cannot fix a batch that long. This is the same
+    # cross-batch error the store prevents, occurring INSIDE a batch because it was sized wrong.
+    MAX_ARMS_PER_BATCH = 40
+
     @contextmanager
     def batch(self, section: str, label: str, reps: int = 1, interleaved: bool = True,
-              tolerate_invalid: bool = False):
+              tolerate_invalid: bool = False, max_arms: int | None = None):
         b = Batch(self, self.run_id, section, label, reps, interleaved, tolerate_invalid)
         yield b
+        cap = max_arms or self.MAX_ARMS_PER_BATCH
+        arms = {r["arm"] for r in b._rows}
+        if len(arms) > cap:
+            raise OversizedBatch(
+                f"batch {label!r} holds {len(arms)} arms (cap {cap}). A batch must be short enough "
+                f"that thermal drift within it is negligible, or its arms are not comparable and "
+                f"the interleaving is decorative. Split it -- one batch per probe model is the "
+                f"pattern that worked -- or pass max_arms= if you have certified the clock held.")
         b._flush()
 
     # ------------------------------------------------------------------ queries
