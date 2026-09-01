@@ -110,6 +110,29 @@ watchdog.
 Prints per conv: the deployed baseline, the best arm, the gain, that conv's measured noise floor,
 and USE IT / keep default. Raw rows land in `results.db`.
 
+## If you see no output
+
+`variance_probe` prints one line per model as it finishes. A cold configuration compiles shaders
+before its first line appears, so the first model can take minutes -- that silence is normal.
+
+Silence from EVERY script, including `preflight`, means output is going to logcat instead of
+stdout. Check the bundle's copy of the library, which is the one that runs:
+
+    strings conv_bench/conv_probe_bundle/bin/libMNN.so | grep -c MNNJNI     # 0 = logcat OFF
+
+or ask the device directly:
+
+    adb shell 'cd /data/local/tmp/convprobe && LD_LIBRARY_PATH=. ./ModuleBasic.out Block1.mnn tdir 0 3 4 68 2 t.bin 2>&1' | grep -c "kernel time"
+
+Zero, with the lines visible in `adb logcat -d -s MNNJNI`, is conclusive. Two things to know about
+the fix: `MNN_USE_LOGCAT` lives in libMNN.so, not libMNN_CL.so, so `make MNN_CL` alone will not
+change it; and the bundle carries COPIES, so a rebuild without `make_bundle.py` leaves the old
+library in place.
+
+    cd build_android_profile && cmake .. -DMNN_USE_LOGCAT=OFF
+    make -C build_android_profile MNN MNN_CL MNN_Express ModuleBasic.out -j10
+    python3 conv_bench/make_bundle.py
+
 ## What it does NOT do
 
 * **Wall-clock.** Everything above measures GPU kernel time. On this model kernel time is only

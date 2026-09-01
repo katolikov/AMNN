@@ -82,11 +82,19 @@ def main():
     cfgs = configs()
     print(f"=== across-batch variance: {len(cfgs)} probe models (13 convs) x 2 modes "
           f"x {a.repeats} batches ({a.reps} reps each) ===")
-    print(f"(clock at start: {s0} MHz)\n")
+    print(f"(clock at start: {s0} MHz)")
+    print(f"(first pass compiles shaders for each new configuration -- a cold model can take "
+          f"minutes before its first line appears)\n", flush=True)
     print(f"{'conv':<22}{'mode':<8}{'median':>9}{'min':>8}{'max':>8}{'spread':>9}   verdict")
 
     t0 = time.time()
     per_batch: dict[tuple, list] = {}
+    total_batches = a.repeats * len(cfgs)
+    done_batches = 0
+    # Progress, because this used to print the header and then nothing until every model was
+    # finished. On a cold cache that is half an hour of silence, which is indistinguishable from
+    # the harness being broken -- and the first thing anyone checks is whether output is going to
+    # logcat instead of stdout.
     for rep in range(a.repeats):
         for model, shape in cfgs:
             R.cooldown(d, a.cool)
@@ -103,6 +111,9 @@ def main():
                     row = b.record(conv, arm, 0, env="",
                                    mode=68 if arm == "buffer" else 132, samples=samples)
                     per_batch.setdefault((conv, arm), []).append(row["us"])
+            done_batches += 1
+            print(f"   [{done_batches}/{total_batches}] {model} rep{rep+1}/{a.repeats}  "
+                  f"{len(acc)//2} convs, {time.time()-t0:.0f}s elapsed", flush=True)
 
     s1l, _ = R.sample_clock(d, cfgs[0][0], cfgs[0][1])
     s1 = statistics.median(s1l) if s1l else 0
