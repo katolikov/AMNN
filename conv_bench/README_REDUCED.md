@@ -95,14 +95,19 @@ assumed 6%, which is wrong for at least two configurations here (one buffer core
 Across-batch spread is the right quantity — reps inside one batch are interleaved and agree with
 each other even when the batch as a whole is off, which is how a 54% error once passed every check.
 
-## 3. Full sweep  — ~1 h first run, ~7 min after
+## 3. Full sweep  — ~3.5 h first run, ~5 min after
 
     python3 conv_bench/full_sweep.py --reps 3
+
+Measured on the reference device: warm-up 191 min, then five batches totalling 271 s. Warm-up cost
+is NOT uniform across arms -- the plain kernels compile in seconds while NCHW, im2col and implicit
+GEMM take far longer, so the last third of the arm list dominates. Budget ~4 h to bring up a new
+device end to end, and ~5 min per sweep afterwards.
 
 43 arms per conv: 15 kernels × 2 memory modes, plus NCHW, im2col+GEMM, implicit GEMM, LDS ×2,
 split-K ×2, constant-weights, HARD, force/no-Winograd, and both mode defaults.
 
-Phase 1 warms the tuning cache for all 215 (arm, model) pairs (~55 min, once per device) —
+Phase 1 warms the tuning cache for all 215 (arm, model) pairs (**~3 h**, once per device) —
 compilation is not measurement, and doing it inside a batch heats the device enough to invalidate
 the batch. Phase 2 measures: one batch per probe model, 34–80 s each, each certified by a clock
 watchdog.
