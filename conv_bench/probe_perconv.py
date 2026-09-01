@@ -115,12 +115,23 @@ def label_of(tag: str) -> str:
     return f"{ci}->{co}@{hi}x{wi}"
 
 
-# The five block models that between them contain all 13 distinct convs of the reduced set.
+# The five block models that between them contain all 13 distinct convs of the shape set.
 # Block5's two convs duplicate shapes already covered by Block1/Block4, so it is not needed.
-PROBE_MODELS = [
-    ("Block3.mnn",  [1, 1, 192, 256]),    # 1->8@192x256, 8->8@96x128
-    ("Block4.mnn",  [1, 8, 96, 128]),     # 8->16@96x128, 16->16@48x64
-    ("Block1.mnn",  [1, 18, 96, 128]),    # 18->16@96x128, 16->32@48x64, 32->32@24x32
-    ("Block2.mnn",  [1, 34, 48, 64]),     # 34->32@48x64, 32->48@24x32, 48->48@12x16
-    ("Block96.mnn", [1, 64, 24, 32]),     # 64->64@24x32, 64->96@12x16, 96->96@6x8
-]
+#
+# The INPUT SHAPES are read from the bundle manifest rather than written here, because they differ
+# per shape family: Block3 takes [1,1,192,256] reduced and [1,1,576,768] full. Hardcoding the
+# reduced ones meant CONV_BENCH_SHAPES=full fed every probe model the wrong input size.
+_WANT = ["Block3", "Block4", "Block1", "Block2", "Block96"]
+
+
+def _probe_models():
+    import json
+    from pathlib import Path as _P
+    man = _P(__file__).resolve().parent / "conv_probe_bundle" / "manifest.json"
+    if not man.exists():
+        return []                       # bundle not built yet; callers surface the real error
+    blocks = {b["key"]: b for b in json.loads(man.read_text()).get("blocks", [])}
+    return [(blocks[k]["model"], blocks[k]["shape"]) for k in _WANT if k in blocks]
+
+
+PROBE_MODELS = _probe_models()

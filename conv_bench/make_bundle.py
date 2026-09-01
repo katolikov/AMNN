@@ -27,31 +27,39 @@ OUT = REPO / "conv_bench" / "conv_probe_bundle"
 # why the small-channel convs of Block3/Block4 were unmeasured until they were added here.
 # 8@288x384 and 16@144x192 are 63.7 MMAC/conv -- identical to 32@72x96, so they extend the existing
 # MAC-matched comparison rather than introducing a new workload class.
-# REDUCED SHAPES: every spatial dim of the original set divided by 3 (see
-# model_convs_reduced.csv). MACs drop exactly 9x, so 32@24x32 / 8@96x128 / 16@48x64 remain
-# MAC-matched at 7.08 MMAC and 48@12x16 / 96@6x8 at 3.98 MMAC -- the same comparison
-# structure as before, one regime down. 96@6x8 launches only 288 work-items at c4h1w4,
-# i.e. under one 64-wide wave per CU on 8 CUs: the fixed per-dispatch cost is now a
-# first-order term, which is why the strategy ranking has to be re-measured, not inherited.
-CORES = [(32, 24, 32), (48, 12, 16), (96, 6, 8), (8, 96, 128), (16, 48, 64)]
+# Cores and heads follow the SHAPE FAMILY, exactly as the block CSV does. They used to be pinned
+# to the reduced values, so CONV_BENCH_SHAPES=full produced a bundle whose BLOCKS were full-size
+# while its cores and heads were still 1/3 -- one bundle describing two different models, with
+# nothing in it saying so.
+#
+# "reduced" is every spatial dim of the original divided by 3. MACs drop exactly 9x, so
+# 32@24x32 / 8@96x128 / 16@48x64 stay MAC-matched at 7.08 MMAC and 48@12x16 / 96@6x8 at 3.98 MMAC:
+# the same comparison structure, one regime down. 96@6x8 launches only 288 work-items at c4h1w4,
+# under one 64-wide wave per CU on 8 CUs, which is why the strategy ranking had to be re-measured
+# rather than inherited from the full-size results.
+_CORES = {
+    "reduced": [(32, 24, 32), (48, 12, 16), (96, 6, 8), (8, 96, 128), (16, 48, 64)],
+    "full":    [(32, 72, 96), (48, 36, 48), (96, 18, 24), (8, 288, 384), (16, 144, 192)],
+}
 
 # Stride-2 "head" pairs: two 3x3 s2 convs that halve the spatial size twice. Each conv has a
-# different shape, so these are reported PER CONV (matched by the shape tag MNN puts in the
-# kernel name), not as one averaged number.
-HEADS = [
-    ("head18", [dict(cin=18, cout=16, H=96, W=128, stride=2, pad=1, prelu=1),
-                dict(cin=16, cout=32, H=48, W=64, stride=2, pad=1, prelu=1)]),
-    ("head34", [dict(cin=34, cout=32, H=48, W=64, stride=2, pad=1, prelu=1),
-                dict(cin=32, cout=48, H=24, W=32,  stride=2, pad=1, prelu=1)]),
-    ("head64", [dict(cin=64, cout=64, H=24, W=32,  stride=2, pad=1, prelu=1),
-                dict(cin=64, cout=96, H=12, W=16,  stride=2, pad=1, prelu=1)]),
-    # Block3/Block4 stride-2 convs. They chain exactly (192x256 -> 96x128 -> 48x64), so this is
-    # the model's own pyramid, not an invented pair. cin=1 is the interesting case: NC4HW4 pads it
-    # to 4 channels, a 4x input-read tax, where §H.39's heads only paid 6-11% (cin=18/34). The NCHW
-    # section iterates cores+heads, so adding this measures that regime for the first time.
-    ("head1",  [dict(cin=1,  cout=8,  H=192, W=256, stride=2, pad=1, prelu=1),
-                dict(cin=8,  cout=16, H=96, W=128, stride=2, pad=1, prelu=1)]),
-]
+# different shape, so these are reported PER CONV (matched by the shape tag MNN puts in the kernel
+# name), not as one averaged number. head1's cin=1 is the interesting case: NC4HW4 pads it to 4
+# channels, a 4x input-read tax, where the other heads only pay 6-11% (cin=18/34).
+def _heads(f):
+    S = (lambda h, w: (h, w)) if f == "full" else (lambda h, w: (h // 3, w // 3))
+    def pair(k, a, b):
+        (c0, o0, h0, w0), (c1, o1, h1, w1) = a, b
+        H0, W0 = S(h0, w0); H1, W1 = S(h1, w1)
+        return (k, [dict(cin=c0, cout=o0, H=H0, W=W0, stride=2, pad=1, prelu=1),
+                    dict(cin=c1, cout=o1, H=H1, W=W1, stride=2, pad=1, prelu=1)])
+    return [pair("head18", (18, 16, 288, 384), (16, 32, 144, 192)),
+            pair("head34", (34, 32, 144, 192), (32, 48, 72, 96)),
+            pair("head64", (64, 64, 72, 96),   (64, 96, 36, 48)),
+            pair("head1",  (1, 8, 576, 768),   (8, 16, 288, 384))]
+
+CORES = _CORES[block_fixture.SHAPE_FAMILY]
+HEADS = _heads(block_fixture.SHAPE_FAMILY)
 CC = (32, 24, 48)                            # correctness shape: %16/%4 (LDS) and %6/%6 (fused2) ok
 # Second correctness shape in the REDUCED regime. The first one (24x48) is nine times the
 # area of anything the suite now times, so a kernel that is only wrong on a short/narrow
