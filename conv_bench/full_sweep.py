@@ -55,13 +55,49 @@ def arms():
     """Every strategy in the investigation, as (name, mode, env).
 
     The env flags are the same ones the old sections used; what changes is that they are now
-    measured on one code path against one baseline instead of in 21 separate tables."""
+    measured on one code path against one baseline instead of in 21 separate tables.
+
+    MNN_CONV_HARD is a MODIFIER, not a strategy. It bakes the shape in as compile-time constants,
+    and only the kernels in HARD_CAPABLE read them -- so setting it alone applies it to whatever
+    kernel MNN happens to pick, which usually is not one of those. That is what this used to do:
+    the bare `buf HARD` arm measured within +/-5% of the untouched default on all 13 convs, i.e.
+    it measured nothing, and read as "hardcoding does not help" rather than "hardcoding was not
+    tested". It is now paired with each kernel that can actually respond to it.
+
+    The `_hc` kernels (shape-specialised copies of the stock ones) live in HARD_CAPABLE but not in
+    VARIANTS, so MNN_CONV_FORCE could never select them and they were absent from the sweep
+    entirely -- including c4h1w1_hc, which won the old section 5. They are swept here, and only
+    with HARD, because without it they are just their originals."""
     out = [("buffer default", 68, ""), ("image default", 132, "")]
+    # Forced kernels carry MNN_NO_WINOGRAD. On a conv where MNN deploys Winograd the direct-kernel
+    # selector is never reached, so MNN_CONV_FORCE is silently ignored and the arm measures the
+    # DEFAULT -- which is how successive sweeps named a different "best kernel" on each of the
+    # three Winograd cores (c4h1w4, c8h4w1, c4h4w2, c4h1w1): they were noise among no-ops. Measured
+    # spread across forced arms was 129% on a direct conv and 7-13% on the Winograd ones.
+    #
+    # Disabling Winograd is also what forcing a direct kernel MEANS in deployment, so comparing
+    # these against the untouched (Winograd) default is the real question: is this kernel worth
+    # giving up Winograd for? The old suite's section 4 used the same flag for the same reason.
+    # Forced kernels are BUFFER-ONLY. MNN_CONV_FORCE / MNN_CONV_SPEC / MNN_CONV_HARD are read in
+    # execution/buffer/ and nowhere in execution/image/, so an "img <kernel>" arm is image mode
+    # with an ignored flag -- 15 arms that all measured the same thing under 15 different names.
+    # That is why every run crowned a different image kernel (img c8h4w1, img c4h1w2, img c4h4w4,
+    # img c4h1w4): noise between identical measurements. Image mode gets one arm, plus the
+    # no-Winograd variant, since MNN_NO_WINOGRAD is the one flag that backend does read.
     for v in M.VARIANTS:
         spec = "MNN_CONV_SPEC=1 " if v in M.SPEC_ONLY else ""
         short = v.replace("conv_2d_", "")
-        out.append((f"buf {short}", 68, f"{spec}MNN_CONV_FORCE={v} "))
-        out.append((f"img {short}", 132, f"{spec}MNN_CONV_FORCE={v} "))
+        out.append((f"buf {short}", 68, f"MNN_NO_WINOGRAD=1 {spec}MNN_CONV_FORCE={v} "))
+    out.append(("image no-winograd", 132, "MNN_NO_WINOGRAD=1 "))
+
+    # Hardcoding, paired with every kernel that reads the constants. The _hc kernels are
+    # meaningless without HARD (they are their originals), so they appear only in this form.
+    for v in M.HARD_CAPABLE:
+        spec = "MNN_CONV_SPEC=1 " if v in M.SPEC_ONLY else ""
+        short = v.replace("conv_2d_", "")
+        out.append((f"buf {short}+HARD", 68,
+                    f"MNN_NO_WINOGRAD=1 MNN_CONV_HARD=1 {spec}MNN_CONV_FORCE={v} "))
+
     # algorithm-level strategies (old sections 7-9, 14-16, 19)
     out += [
         ("buf force-winograd", 68, "MNN_FORCE_WINOGRAD=1 "),
@@ -74,13 +110,16 @@ def arms():
         ("buf im2col+GEMM",    68, "MNN_CONV_IMGEMM=1 MNN_NO_WINOGRAD=1 "),
         ("buf implicit GEMM",  68, "MNN_CONV_IGEMM=1 MNN_NO_WINOGRAD=1 "),
         ("buf constant-w",     68, "MNN_CONV_CONSTW=1 "),
-        ("buf HARD",           68, "MNN_CONV_HARD=1 "),
     ]
     return out
 
 
 def kernel_of(name):
-    return None if name.endswith("default") or " " not in name else name.split(" ", 1)[1]
+    """'buf c4h4w2+HARD' -> 'c4h4w2'. The suffix must be stripped, or the stride-1-only exclusion
+    below fails to recognise these arms and lets a silently-ignored kernel into the ranking."""
+    if name.endswith("default") or " " not in name:
+        return None
+    return name.split(" ", 1)[1].removesuffix("+HARD")
 
 
 
