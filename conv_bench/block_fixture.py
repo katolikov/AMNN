@@ -19,21 +19,65 @@ import bench
 # c0_ceiling is imported lazily inside run_block(): make_bundle only needs
 # load_blocks()/build_onnx(), and a top-level import made that a hard dependency.
 
-# Which shape family the whole harness measures. "reduced" is the [1,C,H/3,W/3] set
-# (model_convs_reduced.csv); CONV_BENCH_SHAPES=full reverts to the original sizes. The
-# choice is PRINTED on load and recorded in the bundle manifest on purpose: a silently
-# swapped fixture is exactly the failure mode that has produced phantom results here before.
-SHAPE_FAMILY = os.environ.get("CONV_BENCH_SHAPES", "reduced").strip().lower()
-if SHAPE_FAMILY not in ("reduced", "full"):
-    raise SystemExit(f"CONV_BENCH_SHAPES must be 'reduced' or 'full', got {SHAPE_FAMILY!r}")
-CSV = REPO / "conv_bench" / ("model_convs_reduced.csv" if SHAPE_FAMILY == "reduced"
-                             else "model_convs_updated.csv")
+# The shape family is a DIVISOR applied to one source of truth, not a second CSV.
+#
+#     CONV_BENCH_SHAPES=full   # original sizes
+#     CONV_BENCH_SHAPES=1.5    # H/1.5, W/1.5
+#     CONV_BENCH_SHAPES=3      # H/3, W/3   (the default)
+#
+# Families used to be separate CSVs with the cores and heads hardcoded per family, and they drifted:
+# CONV_BENCH_SHAPES=full built a bundle whose blocks were full-size while its cores and heads were
+# still 1/3. Deriving every family from model_convs_updated.csv makes that impossible -- there is
+# one conv list, and a family is an arithmetic transform of it.
+#
+# A divisor is rejected unless every spatial dimension divides EXACTLY and stays EVEN. Exactness
+# keeps the shape a real conv rather than a rounded approximation of one; evenness keeps stride-2
+# halving exact, so the pyramid a block encodes still holds. Both are checked against every conv in
+# the CSV, and the offending shape is named.
+CSV = REPO / "conv_bench" / "model_convs_updated.csv"
+
+
+def _parse_family(raw):
+    """'full' | 'reduced' | a divisor -> (divisor, label)."""
+    r = (raw or "").strip().lower()
+    if r in ("full", "1", "1.0"):
+        return 1.0, "full"
+    if r == "reduced":                 # the original name for the /3 set; kept working
+        return 3.0, "div3"
+    try:
+        d = float(r)
+    except ValueError:
+        raise SystemExit(f"CONV_BENCH_SHAPES must be 'full' or a divisor (e.g. 1.5, 3); got {raw!r}")
+    if d <= 0:
+        raise SystemExit(f"CONV_BENCH_SHAPES divisor must be positive; got {raw!r}")
+    return d, "full" if d == 1.0 else f"div{r}"
+
+
+SHAPE_DIVISOR, SHAPE_FAMILY = _parse_family(os.environ.get("CONV_BENCH_SHAPES", "3"))
+
+
+def scale(v, what=""):
+    """Apply the family divisor to one spatial dimension, refusing anything inexact or odd."""
+    q = v / SHAPE_DIVISOR
+    if q != int(q):
+        raise SystemExit(f"CONV_BENCH_SHAPES={SHAPE_FAMILY}: {what or 'dimension'} {v} / "
+                         f"{SHAPE_DIVISOR:g} = {q} is not an integer. A family must divide every "
+                         f"conv exactly, or the shapes stop being the model's shapes.")
+    q = int(q)
+    if q % 2:
+        raise SystemExit(f"CONV_BENCH_SHAPES={SHAPE_FAMILY}: {what or 'dimension'} {v} / "
+                         f"{SHAPE_DIVISOR:g} = {q} is odd. Stride-2 halving would no longer be "
+                         f"exact, so the block pyramid would not survive the reduction.")
+    return q
+
+
 LOCAL = REPO / "conv_bench" / "work"
 
 
 def load_blocks():
     """Parse the CSV into {block_name: [conv spec dicts in order]}."""
-    print(f"[block_fixture] shape family = {SHAPE_FAMILY}  ({CSV.name})", flush=True)
+    print(f"[block_fixture] shape family = {SHAPE_FAMILY} "
+          f"(H,W / {SHAPE_DIVISOR:g} from {CSV.name})", flush=True)
     blocks, cur = {}, None
     with open(CSV) as f:
         for row in csv.reader(f):
@@ -43,9 +87,10 @@ def load_blocks():
             cin = row[2].strip()
             if not cin:
                 continue  # gap row (idx present, no data)
-            spec = dict(idx=idx, cin=int(cin), cout=int(row[3]), H=int(row[4]),
-                        W=int(row[5]), stride=int(row[6]), pad=int(row[7]),
-                        prelu=int(row[8]))
+            spec = dict(idx=idx, cin=int(cin), cout=int(row[3]),
+                        H=scale(int(row[4]), f"conv {idx} H"),
+                        W=scale(int(row[5]), f"conv {idx} W"),
+                        stride=int(row[6]), pad=int(row[7]), prelu=int(row[8]))
             if label.lower().startswith("block"):
                 cur = label; blocks[cur] = []
             if cur is None:

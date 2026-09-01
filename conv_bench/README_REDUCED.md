@@ -1,9 +1,34 @@
 # Reduced-shape conv benchmark — runbook
 
-Measures this model's 13 distinct convs at **[1,C,H/3,W/3]** (the reduced shape family, the
-default). `CONV_BENCH_SHAPES=full` switches back to the original sizes.
+Measures this model's 13 distinct convs at a chosen fraction of their original spatial size.
 
-## The 13 convs
+## Choosing the shape family
+
+A family is a **divisor applied to `model_convs_updated.csv`**, the one conv list:
+
+    CONV_BENCH_SHAPES=full   python3 conv_bench/make_bundle.py   # original sizes
+    CONV_BENCH_SHAPES=1.5    python3 conv_bench/make_bundle.py   # H/1.5, W/1.5
+    CONV_BENCH_SHAPES=3      python3 conv_bench/make_bundle.py   # H/3, W/3   (default)
+
+It matters at **bundle-build time** -- the models are pre-converted, so once built the bundle IS
+that family, and the manifest records which. Setting the variable on the later scripts is harmless
+and makes the intent visible. Clear the tuning cache when switching, since the models change:
+
+    adb shell 'rm -f /data/local/tmp/convprobe/tune/*.bin'
+
+A divisor is refused unless every spatial dimension divides exactly AND stays even. Exactness keeps
+the shapes the model's real shapes rather than rounded approximations; evenness keeps stride-2
+halving exact, so the pyramid each block encodes survives the reduction. `CONV_BENCH_SHAPES=5` is
+rejected naming the conv it fails on.
+
+Families are derived, never hand-maintained. They used to be separate CSVs with cores and heads
+hardcoded per family, and they drifted: `full` once built a bundle whose blocks were full-size while
+its cores and heads were still 1/3, with nothing in the bundle saying so.
+
+Work per conv: `full` 1x, `1.5` 4/9, `3` 1/9 -- so the /1.5 convs are 4x the /3 ones, and the sweep
+takes correspondingly longer than the ~7 min warm figure quoted below.
+
+## The 13 convs (shown at /3)
 
 | # | conv | original | reduced | stride |
 |---|---|---|---|---|
@@ -94,8 +119,9 @@ and USE IT / keep default. Raw rows land in `results.db`.
 
 ## Files
 
-Committed: the scripts, `model_convs_reduced.csv`, and 21 offline tests
-(`python3 conv_bench/test_bench_store.py`).
+Committed: the scripts, `model_convs_updated.csv` (the single conv list every family derives
+from), and the offline tests -- `test_bench_store.py` (21) and `test_shape_families.py` (8), which
+pins the /3 derivation to the 13 convs actually measured.
 Gitignored: `results.db`, `noise_floors.json`, `*_state.json` — device- and build-specific.
 Committing them would let a claim be gated on another device's noise, or a sweep resume onto
 results from a different libMNN_CL.so.
