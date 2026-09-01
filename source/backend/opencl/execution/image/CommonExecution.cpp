@@ -62,7 +62,9 @@ ErrorCode CommonExecution::onExecute(const std::vector<Tensor *> &inputs, const 
                                                     unit.localWorkSize,
                                                     nullptr,
                                                     &event);
-        runtime->pushEvent({EnumNameOpType(mOpType) + std::to_string(idx++), event});
+        runtime->pushEvent({unit.profileName.empty()
+                                ? EnumNameOpType(mOpType) + std::to_string(idx++)
+                                : unit.profileName, event});
     #else
         res = runtime->commandQueue().enqueueNDRangeKernel(unit.kernel->get(),
                                                     cl::NullRange,

@@ -1588,10 +1588,22 @@ ErrorCode ConvBufExecution::onExecute(const std::vector<Tensor *> &inputs, const
         }
     }
 #ifdef ENABLE_OPENCL_TIME_PROFILER
+    // The layout-conversion kernels around the conv (gemm2-0 in, gemm2-2 out) used to be pushed
+    // with a bare name carrying no shape. They belong to THIS conv and can be a large part of its
+    // cost -- MNN_CONV_NCHW and MNN_CONV_SPLITK both add them -- but a per-conv profile keyed on
+    // the shape tag could not see them, so those strategies appeared far faster than they are
+    // (NCHW measured -42% per-conv while being +48% on the whole model). Tag them like the conv.
+    const std::string convShape =
+        "-b" + std::to_string(inputs[0]->batch()) + "ci" + std::to_string(inputs[0]->channel()) +
+        "hi" + std::to_string(inputs[0]->height()) + "wi" + std::to_string(inputs[0]->width()) +
+        "co" + std::to_string(outputs[0]->channel()) + "ho" + std::to_string(outputs[0]->height()) +
+        "wo" + std::to_string(outputs[0]->width()) +
+        "kh" + std::to_string(mResource->mKernelHeight) +
+        "kw" + std::to_string(mResource->mKernelWidth);
     if (mPreKernel) {
         cl::Event event0;
         runKernel2D(mPreKernel, mPreGlobalWorkSize, mPreLocalWorkSize, mOpenCLBackend->getOpenCLRuntime(), &event0);
-        mOpenCLBackend->getOpenCLRuntime()->pushEvent({"ConvBuf2D-gemm2-0", event0});
+        mOpenCLBackend->getOpenCLRuntime()->pushEvent({("ConvBuf2D-gemm2-0" + convShape).c_str(), event0});
     }
 
     if(mResource->mConvGemmOptLevel == 1) {
@@ -1635,7 +1647,7 @@ ErrorCode ConvBufExecution::onExecute(const std::vector<Tensor *> &inputs, const
     if (mPostKernel) {
         cl::Event event2;
         runKernel2D(mPostKernel, mPostGlobalWorkSize, mPostLocalWorkSize, mOpenCLBackend->getOpenCLRuntime(), &event2);
-        mOpenCLBackend->getOpenCLRuntime()->pushEvent({"ConvBuf2D-gemm2-2", event2});
+        mOpenCLBackend->getOpenCLRuntime()->pushEvent({("ConvBuf2D-gemm2-2" + convShape).c_str(), event2});
     }
 #else
     if(mOpenCLBackend->isUseRecordQueue()){

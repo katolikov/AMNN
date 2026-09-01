@@ -13,6 +13,8 @@
 #include "core/TensorUtils.hpp"
 #include "backend/opencl/core/OpenCLBackend.hpp"
 #include "backend/opencl/core/OpenCLRunningUtils.hpp"
+#include <string>
+
 namespace MNN {
 namespace OpenCL {
 
@@ -63,6 +65,12 @@ struct Unit {
     std::shared_ptr<KernelWrap> kernel;
     cl::NDRange globalWorkSize;
     cl::NDRange localWorkSize;
+    // Optional profiling label. Empty means "<OpType><index>", which is what every image-backend
+    // op used to emit -- and because the index restarts on each execution, every conv in a graph
+    // reported as "Convolution0" with no shape. The buffer backend has always tagged its events
+    // with the shape (ConvBuf2D-ori-b1ci32hi24wi32co48...), so a multi-conv model can be timed per
+    // conv there but not here. Setting this makes the two backends comparable.
+    std::string profileName;
 };
 
 class CommonExecution : public Execution {

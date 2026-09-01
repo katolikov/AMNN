@@ -819,7 +819,20 @@ ErrorCode ConvBufWinograd::onExecute(const std::vector<Tensor *> &inputs, const 
         std::string n = std::to_string(gemmHeight);
         std::string k = std::to_string(icC4);
         std::string total = std::to_string(1.0 / 1000000 * alpha*alpha * gemmWidth * gemmHeight * icC4);
-        name += "-b" + b + "m" + m + "n" + n + "k" + k + "-total:" + total + "*10^6";
+        // The GEMM dims (b/m/n/k) do not identify the CONV: two different convs can share them,
+        // and none of ci/hi/wi/co appears. That made a multi-conv model unattributable on the
+        // Winograd path -- the direct path has always carried the full shape. Append it in the
+        // same format so one parser handles direct and Winograd, buffer and image alike.
+        name += "-b" + b + "m" + m + "n" + n + "k" + k;
+        name += "-shape-b" + std::to_string(inputs[0]->batch()) +
+                "ci" + std::to_string(inputs[0]->channel()) +
+                "hi" + std::to_string(inputs[0]->height()) +
+                "wi" + std::to_string(inputs[0]->width()) +
+                "co" + std::to_string(outputs[0]->channel()) +
+                "ho" + std::to_string(outputs[0]->height()) +
+                "wo" + std::to_string(outputs[0]->width()) +
+                "kh" + std::to_string(mKernelY) + "kw" + std::to_string(mKernelX);
+        name += "-total:" + total + "*10^6";
         runtime->pushEvent({name.c_str(), event});
         idx++;
     #else

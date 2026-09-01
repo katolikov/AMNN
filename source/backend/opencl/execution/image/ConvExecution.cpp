@@ -18,6 +18,20 @@
 namespace MNN {
 namespace OpenCL {
 
+#ifdef ENABLE_OPENCL_TIME_PROFILER
+// Shape tag for the profiler, in the SAME format the buffer backend emits
+// ("ConvBuf2D-ori-b1ci32hi24wi32co48ho12wo16kh3kw3"), so one parser handles both backends and a
+// multi-conv model can be timed per conv in image mode too.
+static std::string convShapeTag(const std::string& prefix, const Tensor* in, const Tensor* out,
+                                int kh, int kw) {
+    return prefix + "-b" + std::to_string(in->batch()) + "ci" + std::to_string(in->channel()) +
+           "hi" + std::to_string(in->height()) + "wi" + std::to_string(in->width()) +
+           "co" + std::to_string(out->channel()) + "ho" + std::to_string(out->height()) +
+           "wo" + std::to_string(out->width()) + "kh" + std::to_string(kh) +
+           "kw" + std::to_string(kw);
+}
+#endif  // ENABLE_OPENCL_TIME_PROFILER
+
 ConvCommonExecution::ConvCommonExecution(const Convolution2D *conv2dParams, Backend *backend) {
     mResource.reset(new ConvResource);
     mOpenCLBackend           = (OpenCLBackend *)backend;
@@ -605,6 +619,13 @@ ErrorCode ConvExecution::onEncode(const std::vector<Tensor *> &inputs, const std
 
     unit.globalWorkSize = {mGlobalWorkSize[0], mGlobalWorkSize[1]};
     unit.localWorkSize = {mLocalWorkSize[0], mLocalWorkSize[1]};
+    // NB: mResource->mKernelHeight/mKernelWidth are never assigned on the image path (they read
+    // 0); the live values are on mConv2dCommonParams, as used earlier in this same function.
+#ifdef ENABLE_OPENCL_TIME_PROFILER
+    unit.profileName = convShapeTag("Conv2D-ori", inputs[0], outputs[0],
+                                    mResource->mConv2dCommonParams->kernelY(),
+                                    mResource->mConv2dCommonParams->kernelX());
+#endif
 #ifdef LOG_VERBOSE
     MNN_PRINT("end ConvExecution onResize !\n");
 #endif

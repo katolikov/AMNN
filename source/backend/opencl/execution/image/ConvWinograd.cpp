@@ -13,6 +13,20 @@
 #define INTERP 1
 namespace MNN {
 namespace OpenCL {
+
+#ifdef ENABLE_OPENCL_TIME_PROFILER
+// Shape tag for the profiler, in the SAME format the buffer backend emits
+// ("ConvBuf2D-ori-b1ci32hi24wi32co48ho12wo16kh3kw3"), so one parser handles both backends and a
+// multi-conv model can be timed per conv in image mode too.
+static std::string convShapeTag(const std::string& prefix, const Tensor* in, const Tensor* out,
+                                int kh, int kw) {
+    return prefix + "-b" + std::to_string(in->batch()) + "ci" + std::to_string(in->channel()) +
+           "hi" + std::to_string(in->height()) + "wi" + std::to_string(in->width()) +
+           "co" + std::to_string(out->channel()) + "ho" + std::to_string(out->height()) +
+           "wo" + std::to_string(out->width()) + "kh" + std::to_string(kh) +
+           "kw" + std::to_string(kw);
+}
+#endif  // ENABLE_OPENCL_TIME_PROFILER
 bool ConvWinograd::valid(const Convolution2DCommon* common, const Tensor* input, const Tensor* output, int maxWidth, int maxHeight, int limit) {
     if (common->strideX() != 1 || common->strideY() != 1) {
         return false;
@@ -365,6 +379,17 @@ ErrorCode ConvWinograd::onEncode(const std::vector<Tensor*>& inputs, const std::
             mUnits[b * 3 + 2].globalWorkSize = {mGWS_D[b][0], mGWS_D[b][1]};
             mUnits[b * 3 + 2].localWorkSize = {mLWS_D[b][0], mLWS_D[b][1]};
         }
+        // Label all three dispatches with the SAME conv's shape, distinguished by role. Summing
+        // them gives that conv's true cost -- MNN's own `conv time` counter omits the two
+        // transforms, which is what once turned a +15% regression into an apparent -45% win.
+#ifdef ENABLE_OPENCL_TIME_PROFILER
+        {
+            const std::string tag = convShapeTag("Conv2D-wino", input, output, mKernelY, mKernelX);
+            mUnits[b * 3 + 0].profileName = tag + "-src";
+            mUnits[b * 3 + 1].profileName = tag + "-gemm";
+            mUnits[b * 3 + 2].profileName = tag + "-dst";
+        }
+#endif
     }
     
     return NO_ERROR;
