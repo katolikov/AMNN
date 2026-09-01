@@ -13,7 +13,16 @@ table per conv, and comparisons are the store's job, not prose.
 
     python3 conv_bench/full_sweep.py <serial> [--reps 3]
 
-Resumable: state is written after every rep. An interruption costs the rep in flight, not the run.
+ONE BATCH PER PROBE MODEL. The first version of this measured all 43 arms across all 5 models as a
+single "interleaved" batch: 215 launches taking ~2h, over which the GPU fell 980 -> 899 MHz. Arm 1
+was timed on a cool device and arm 43 on a hot one, so its ranking mixed thermal state with
+strategy -- and its verdicts contradicted three shorter runs that agreed with each other. Rotating
+arm order across reps cannot fix that; only a shorter batch can. Each model is now its own batch
+(~43 arms x reps launches, a few minutes warm), and ResultStore refuses a batch that runs long.
+
+Every conv lives in exactly one probe model, so no conv is split across batches.
+
+Resumable: state is written after every model. An interruption costs the model in flight.
 """
 from __future__ import annotations
 
@@ -80,6 +89,8 @@ def main():
     ap.add_argument("--reps", type=int, default=3)
     ap.add_argument("--settle-c", type=float, default=42.0)
     ap.add_argument("--db", default=str(HERE / "results.db"))
+    ap.add_argument("--no-warmup", action="store_true",
+                    help="skip cache warm-up (only safe when every arm has been run before)")
     a = ap.parse_args()
 
     d = R.Dev(a.serial)
@@ -99,80 +110,112 @@ def main():
     print(f"nominal {tel.nominal/1000:.0f} MHz, GPU {tel.temperature_c()} C\n", flush=True)
 
     state = HERE / "full_sweep_state.json"
-    samples: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
+    samples_all: dict[str, dict[str, list[float]]] = {}
     clocks: list[dict] = []
+    batch_ids: list = []
     done = 0
     if state.exists():
         blob = json.loads(state.read_text())
         if blob.get("arms") == [n for n, _, _ in A]:
-            done = blob["done_reps"]; clocks = blob.get("clocks", [])
-            for c, per in blob["samples"].items():
-                for arm, v in per.items():
-                    samples[c][arm] = v
-            print(f"  resuming after {done} rep(s)\n", flush=True)
+            done = blob.get("done_models", 0); clocks = blob.get("clocks", [])
+            samples_all = blob.get("samples", {})
+            print(f"  resuming after {done} model(s)\n", flush=True)
 
     def save(n):
-        state.write_text(json.dumps(dict(arms=[x[0] for x in A], done_reps=n, clocks=clocks,
-                                         samples={c: dict(v) for c, v in samples.items()}), indent=0))
+        state.write_text(json.dumps(dict(arms=[x[0] for x in A], done_models=n, clocks=clocks,
+                                         samples=samples_all), indent=0))
+
+    BS.load_noise_floors(HERE / "noise_floors.json")
+    st = ResultStore(a.db)
+    st.begin_run(device=a.serial, shape_family="reduced", harness="full_sweep",
+                 notes=f"{len(A)} arms, {a.reps} reps, one batch per probe model")
+
+    # ---- warm the tuning cache BEFORE measuring anything ----------------------------------
+    # Compilation is not measurement. A cold (arm, model) pair costs 12-50s of shader build, so a
+    # 43-arm batch on a cold cache takes ~13 min, heats the device, drops the clock below tolerance
+    # and is then correctly rejected -- meaning the first run on a device could never complete.
+    # Touching every pair once first moves that cost outside the measurement window: the batches
+    # afterwards run warm (~22s each) and hold their clock. Costs nothing on an already-warm cache.
+    if not a.no_warmup:
+        need = [(m, sh, n, mo, e) for m, sh in PROBE_MODELS for n, mo, e in A]
+        print(f"  warming {len(need)} (arm, model) pairs -- one-time shader compilation, "
+              f"not measured", flush=True)
+        wt0 = time.time()
+        for i, (m, sh, n, mo, e) in enumerate(need, 1):
+            R.run_model(d, m, sh, 2, env=e, mode=mo)      # 2 loops: build the cache, time nothing
+            if i % 43 == 0:
+                print(f"    {i}/{len(need)} ({time.time()-wt0:.0f}s)", flush=True)
+        print(f"  warm-up done in {(time.time()-wt0)/60:.0f} min\n", flush=True)
 
     t0 = time.time(); launches = 0
-    for rep in range(done, a.reps):
-        s = tel.settle(target_c=a.settle_c, max_wait=90)
-        order = A[rep % len(A):] + A[:rep % len(A)]     # rotate so drift favours nobody
+    for mi, (model, shape) in enumerate(PROBE_MODELS):
+        if mi < done:
+            continue
+        s_ = tel.settle(target_c=a.settle_c, max_wait=90)
+        acc: dict = {}
+        tm0 = time.time()          # measurement window start, for the batch duration guard
         with Watchdog(tel) as w:
-            for name, mode, env in order:
-                for model, shape in PROBE_MODELS:
+            for rep in range(a.reps):
+                order = A[rep % len(A):] + A[:rep % len(A)]   # rotate: drift favours nobody
+                for name, mode, env in order:
                     out, _ = R.run_model(d, model, shape, 120, env=env, mode=mode)
                     launches += 1
                     k = kernel_of(name)
                     for tag, us in per_conv(out).items():
                         if k and f"conv_2d_{k}" in s1only and is_stride2(tag):
                             continue
-                        samples[label_of(tag)][name].append(us)
-        clocks.append(w.result)
-        save(rep + 1)
-        print(f"  rep {rep+1}/{a.reps}: {launches} launches, {time.time()-t0:.0f}s, "
-              f"settle {s.get('waited',0):.0f}s @{s.get('temp')}C, "
+                        acc.setdefault((label_of(tag), name), []).append(us)
+        clocks.append(dict(model=model, **w.result))
+        # One batch for this model. If it ran long the store raises rather than recording a
+        # comparison whose arms saw different clocks.
+        # The Watchdog measured what the clock actually did across this batch; hand that to the
+        # store so a long-but-stable batch is accepted and a short-but-throttled one is not.
+        with st.batch(section="full", label=f"{model} ({len(A)} arms)", reps=a.reps,
+                      started=tm0, clock_valid=w.result.get("valid")) as b:
+            b.baseline("buffer default")
+            for (conv, arm), samples in acc.items():
+                b.record(conv, arm, 0, samples=samples,
+                         mode=dict((n, m) for n, m, _ in A)[arm],
+                         env=dict((n, e) for n, _, e in A)[arm])
+            batch_ids.append((model, b.batch_id))
+        for (conv, arm), samples in acc.items():
+            samples_all.setdefault(conv, {})[arm] = samples
+        save(mi + 1)
+        print(f"  {model:<14} {launches} launches, {time.time()-t0:.0f}s, "
+              f"settle {s_.get('waited',0):.0f}s @{s_.get('temp')}C, "
               f"clock {w.result.get('mean_mhz')} MHz "
-              f"({'valid' if w.result.get('valid') else 'THROTTLED'}), "
-              f"GPU {w.result.get('temp_end')}C", flush=True)
+              f"({'valid' if w.result.get('valid') else 'THROTTLED'})", flush=True)
 
-    # ------------------------------------------------------------------ record + report
-    BS.load_noise_floors(HERE / "noise_floors.json")
-    st = ResultStore(a.db)
-    st.begin_run(device=a.serial, shape_family="reduced", harness="full_sweep",
-                 clock_start=min((c.get("mean_mhz") or 0) * 1000 for c in clocks) if clocks else None,
-                 notes=f"{len(A)} arms, {a.reps} reps")
+    # ------------------------------------------------------------------ report
+    st.finish_run()
     valid_run = all(c.get("valid") for c in clocks)
-    with st.batch(section="full", label=f"full sweep ({len(A)} arms)", reps=a.reps) as b:
-        b.baseline("buffer default")
-        for conv in sorted(samples):
-            for arm, vals in samples[conv].items():
-                if vals:
-                    b.record(conv, arm, 0, mode=dict((n, m) for n, m, _ in A)[arm],
-                             env=dict((n, e) for n, _, e in A)[arm], samples=vals)
-        bid = b.batch_id
-    st.finish_run(clock_end=(min((c.get("mean_mhz") or 0) for c in clocks) * 1000) if clocks else None)
-
-    print(f"\n{'conv':<18}{'deployed':>9}{'best arm':<20}{'best':>8}{'gain':>7}{'floor':>7}  verdict")
-    print("-" * 78)
-    wins = 0
-    for conv in sorted(samples):
-        rows = {r["arm"]: r["us"] for r in st.rows(bid, conv) if r["valid"]}
-        if "buffer default" not in rows:
-            continue
-        base = rows["buffer default"]
-        best = min(rows, key=lambda x: rows[x])
-        gain = 100 * (rows[best] - base) / base
-        fl = max(BS.noise_floor(conv, "buffer"), BS.noise_floor(conv, "image"))
-        sig = abs(gain) >= fl
-        wins += sig
-        print(f"{conv:<18}{base:>9.1f}{best:<20}{rows[best]:>8.1f}{gain:>6.0f}%{fl:>6.0f}%  "
-              f"{'USE IT' if sig else 'keep default'}")
-    print(f"\n{wins}/{len(samples)} convs have a win clearing their measured noise floor")
-    print(f"run clock validity: {'VALID' if valid_run else 'SOME REPS THROTTLED'}  "
-          f"({', '.join(str(c.get('mean_mhz')) for c in clocks)} MHz per rep)")
-    print(f"{launches} launches in {time.time()-t0:.0f}s -> batch {bid}")
+    print(f"\n{'conv':<18}{'deployed':>9}  {'best arm':<22}{'best':>8}{'gain':>7}{'floor':>7}  verdict")
+    print("-" * 82)
+    wins = 0; total = 0
+    for model, bid in batch_ids:
+        rows: dict = {}
+        for r in st.rows(bid):
+            if r["valid"]:
+                rows.setdefault(r["conv"], {})[r["arm"]] = r["us"]
+        for conv in sorted(rows):
+            r = rows[conv]
+            if "buffer default" not in r:
+                continue
+            total += 1
+            base = r["buffer default"]; best = min(r, key=lambda x: r[x])
+            gain = 100 * (r[best] - base) / base
+            fl = max(BS.noise_floor(conv, "buffer"), BS.noise_floor(conv, "image"))
+            sig = abs(gain) >= fl; wins += sig
+            print(f"{conv:<18}{base:>9.1f}  {best:<22}{r[best]:>8.1f}{gain:>6.0f}%{fl:>6.0f}%  "
+                  f"{'USE IT' if sig else 'keep default'}")
+    print(f"\n{wins}/{total} convs have a win clearing their measured noise floor")
+    print("clock per batch: " + ", ".join(
+        f"{c['model'].replace('.mnn','')} {c.get('mean_mhz')}MHz"
+        f"{'' if c.get('valid') else ' THROTTLED'}" for c in clocks))
+    if not valid_run:
+        print("  ^ a throttled batch keeps its internal comparisons (arms interleaved inside it) "
+              "but its absolute microseconds are inflated.")
+    print(f"{launches} launches in {time.time()-t0:.0f}s")
 
 
 if __name__ == "__main__":

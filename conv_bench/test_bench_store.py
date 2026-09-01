@@ -254,18 +254,77 @@ def test_is_deployed_semantics():
     assert not is_deployed("MNN_CONV_FORCE=x ", 68)
 
 
-def test_oversized_batch_raises():
-    """full_sweep put 215 launches in one batch and its verdicts contradicted three shorter runs.
-    A batch that cannot hold a stable thermal state must not be recordable as one."""
+def test_batch_running_too_long_raises():
+    """full_sweep's batch took ~2h, over which the clock fell 980 -> 899 MHz, and its verdicts
+    contradicted three shorter runs. Duration is what decides comparability, so it is what is
+    checked -- the same arm count can take a minute warm or an hour cold."""
+    import time as _t
     from bench_store import OversizedBatch
     s = new_store()
     try:
-        with s.batch(section="x", label="everything at once", reps=3, max_arms=5) as b:
+        with s.batch(section="x", label="two-hour batch", reps=3, max_seconds=0.05) as b:
+            b.baseline("a0")
+            b.record("c", "a0", 30.0)
+            b.record("c", "a1", 31.0)
+            _t.sleep(0.06)
+    except OversizedBatch as e:
+        assert "did not see the same clock" in str(e)
+        return
+    raise AssertionError("a batch that ran past its time limit must raise")
+
+
+def test_duration_guard_uses_measurement_start_not_record_time():
+    """A caller that measures first and records afterwards would otherwise show ~0s elapsed and
+    never trip the guard -- which is exactly how the two-hour batch was recorded as valid."""
+    import time as _t
+    from bench_store import OversizedBatch
+    s = new_store()
+    measured_at = _t.time() - 7200          # measurement began two hours ago
+    try:
+        with s.batch(section="x", label="recorded after the fact", reps=3,
+                     started=measured_at, max_seconds=600) as b:
+            b.baseline("a0"); b.record("c", "a0", 30.0); b.record("c", "a1", 31.0)
+    except OversizedBatch as e:
+        assert "120 min" in str(e), str(e)
+        return
+    raise AssertionError("a batch whose MEASUREMENT ran two hours must raise")
+
+
+def test_measured_clock_validity_supersedes_the_duration_proxy():
+    """Duration is a proxy for 'did every arm see the same clock'. When a Watchdog has measured
+    that directly, the evidence wins: a 13-minute batch at a held clock is comparable, and
+    rejecting it would throw away good data (the cold-cache case)."""
+    import time as _t
+    s = new_store()
+    with s.batch(section="x", label="long but stable", reps=3,
+                 started=_t.time() - 1800, max_seconds=600, clock_valid=True) as b:
+        b.baseline("a0"); b.record("c", "a0", 30.0); b.record("c", "a1", 31.0)
+    assert len(s.rows(b.batch_id)) == 2
+
+
+def test_throttled_batch_still_fails_on_duration():
+    import time as _t
+    from bench_store import OversizedBatch
+    s = new_store()
+    try:
+        with s.batch(section="x", label="long and throttled", reps=3,
+                     started=_t.time() - 1800, max_seconds=600, clock_valid=False) as b:
+            b.baseline("a0"); b.record("c", "a0", 30.0)
+    except OversizedBatch:
+        return
+    raise AssertionError("a long batch whose clock did NOT hold must still raise")
+
+
+def test_oversized_arm_count_raises():
+    from bench_store import OversizedBatch
+    s = new_store()
+    try:
+        with s.batch(section="x", label="too many arms", reps=3, max_arms=5) as b:
             b.baseline("a0")
             for i in range(6):
                 b.record("c", f"a{i}", 30.0 + i)
     except OversizedBatch as e:
-        assert "not comparable" in str(e)
+        assert "split it per probe model" in str(e)
         return
     raise AssertionError("a batch above the arm cap must raise")
 

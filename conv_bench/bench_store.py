@@ -166,13 +166,18 @@ class Batch:
     """One interleaved measurement. Arms inside it are mutually comparable; nothing else is."""
 
     def __init__(self, store: "ResultStore", run_id: str, section: str, label: str,
-                 reps: int, interleaved: bool, tolerate_invalid: bool):
+                 reps: int, interleaved: bool, tolerate_invalid: bool,
+                 started: float | None = None):
         self.store, self.run_id = store, run_id
         self.batch_id = uuid.uuid4().hex[:12]
         self.section, self.label, self.reps = section, label, reps
         self.interleaved, self.tolerate_invalid = interleaved, tolerate_invalid
         self._baseline_arm: str | None = None
         self._rows: list[dict] = []
+        # When MEASUREMENT began, not when recording did. A caller that measures first and
+        # records afterwards must pass started=, or the duration guard sees ~0s and never fires --
+        # which is precisely the batch it exists to catch.
+        self.started = started if started is not None else time.time()
 
     # ------------------------------------------------------------------ recording
     def baseline(self, arm: str) -> None:
@@ -283,26 +288,42 @@ class ResultStore:
         self._conn.commit()
         return bool(valid)
 
-    # A batch is only meaningful if every arm in it saw the same thermal state. full_sweep.py put
-    # 215 launches (~2h) into one "interleaved" batch; drift across that window was larger than the
-    # 10-20% effects being measured, and its verdicts contradicted three shorter runs that agreed
-    # with each other. Rotation across reps cannot fix a batch that long. This is the same
-    # cross-batch error the store prevents, occurring INSIDE a batch because it was sized wrong.
-    MAX_ARMS_PER_BATCH = 40
+    # A batch is only meaningful if every arm in it saw the same thermal state. What decides that
+    # is how LONG the batch ran, not how many arms it held: full_sweep.py put 215 launches into one
+    # batch that took ~2h, over which the GPU fell 980 -> 899 MHz, and its verdicts contradicted
+    # three shorter runs that agreed with each other. Rotation across reps cannot rescue a batch
+    # that long. Duration is measured, not estimated from the arm count, because the same arm count
+    # can take one minute warm and an hour cold.
+    MAX_BATCH_SECONDS = 600
+    MAX_ARMS_PER_BATCH = 64          # backstop; duration is the real constraint
 
     @contextmanager
     def batch(self, section: str, label: str, reps: int = 1, interleaved: bool = True,
-              tolerate_invalid: bool = False, max_arms: int | None = None):
-        b = Batch(self, self.run_id, section, label, reps, interleaved, tolerate_invalid)
+              tolerate_invalid: bool = False, max_arms: int | None = None,
+              max_seconds: float | None = None, started: float | None = None,
+              clock_valid: bool | None = None):
+        b = Batch(self, self.run_id, section, label, reps, interleaved, tolerate_invalid, started)
         yield b
         cap = max_arms or self.MAX_ARMS_PER_BATCH
         arms = {r["arm"] for r in b._rows}
+        elapsed = time.time() - b.started
+        limit = max_seconds or self.MAX_BATCH_SECONDS
+        # Duration is only a PROXY for "did every arm see the same clock". When a Watchdog has
+        # measured that directly -- mean frequency within tolerance for the whole batch -- the
+        # proxy is superseded by the evidence, and a long batch is fine. A 13-minute batch at a
+        # held clock is comparable; a 2-minute batch that throttled is not.
+        if clock_valid is True:
+            limit = float("inf")
+        if elapsed > limit:
+            raise OversizedBatch(
+                f"batch {label!r} ran {elapsed/60:.0f} min (limit {limit/60:.0f}). Arms measured "
+                f"that far apart did not see the same clock, so comparing them compares thermal "
+                f"states as much as strategies -- the interleaving is then decorative. Split it: "
+                f"one batch per probe model is the pattern that worked. If a Watchdog measured "
+                f"the clock holding for the whole batch, pass clock_valid=True and this is waived.")
         if len(arms) > cap:
             raise OversizedBatch(
-                f"batch {label!r} holds {len(arms)} arms (cap {cap}). A batch must be short enough "
-                f"that thermal drift within it is negligible, or its arms are not comparable and "
-                f"the interleaving is decorative. Split it -- one batch per probe model is the "
-                f"pattern that worked -- or pass max_arms= if you have certified the clock held.")
+                f"batch {label!r} holds {len(arms)} arms (cap {cap}); split it per probe model.")
         b._flush()
 
     # ------------------------------------------------------------------ queries
