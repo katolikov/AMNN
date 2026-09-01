@@ -31,3 +31,15 @@ run_all_build.log
 # preflight.py before any timing) -- version-controlling it would mean masking cells based on a
 # stale device's findings.
 preflight_result.json
+
+# Measurement OUTPUT from the new harness. All of it is device- and build-specific: results.db
+# holds the raw per-batch measurements, noise_floors.json the across-batch spread measured on one
+# device, and the *_state.json files are resume points for an interrupted sweep. Committing them
+# would let a claim be gated on some other device's noise, or a sweep resume onto results from a
+# different libMNN_CL.so -- both silent, both exactly the class of error this harness exists to
+# prevent. Regenerate with variance_probe.py / full_sweep.py.
+results.db
+noise_floors.json
+full_sweep_state.json
+two_stage_state.json
+two_stage_validation.json

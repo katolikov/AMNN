@@ -18,6 +18,7 @@ from onnx import numpy_helper
 from gen_conv import make_conv
 from mk_chain import make_chain
 from bench import convert, LIBS, MODULE
+import block_fixture
 from block_fixture import load_blocks, build_onnx
 
 OUT = REPO / "conv_bench" / "conv_probe_bundle"
@@ -26,26 +27,38 @@ OUT = REPO / "conv_bench" / "conv_probe_bundle"
 # why the small-channel convs of Block3/Block4 were unmeasured until they were added here.
 # 8@288x384 and 16@144x192 are 63.7 MMAC/conv -- identical to 32@72x96, so they extend the existing
 # MAC-matched comparison rather than introducing a new workload class.
-CORES = [(32, 72, 96), (48, 36, 48), (96, 18, 24), (8, 288, 384), (16, 144, 192)]
+# REDUCED SHAPES: every spatial dim of the original set divided by 3 (see
+# model_convs_reduced.csv). MACs drop exactly 9x, so 32@24x32 / 8@96x128 / 16@48x64 remain
+# MAC-matched at 7.08 MMAC and 48@12x16 / 96@6x8 at 3.98 MMAC -- the same comparison
+# structure as before, one regime down. 96@6x8 launches only 288 work-items at c4h1w4,
+# i.e. under one 64-wide wave per CU on 8 CUs: the fixed per-dispatch cost is now a
+# first-order term, which is why the strategy ranking has to be re-measured, not inherited.
+CORES = [(32, 24, 32), (48, 12, 16), (96, 6, 8), (8, 96, 128), (16, 48, 64)]
 
 # Stride-2 "head" pairs: two 3x3 s2 convs that halve the spatial size twice. Each conv has a
 # different shape, so these are reported PER CONV (matched by the shape tag MNN puts in the
 # kernel name), not as one averaged number.
 HEADS = [
-    ("head18", [dict(cin=18, cout=16, H=288, W=384, stride=2, pad=1, prelu=1),
-                dict(cin=16, cout=32, H=144, W=192, stride=2, pad=1, prelu=1)]),
-    ("head34", [dict(cin=34, cout=32, H=144, W=192, stride=2, pad=1, prelu=1),
-                dict(cin=32, cout=48, H=72,  W=96,  stride=2, pad=1, prelu=1)]),
-    ("head64", [dict(cin=64, cout=64, H=72,  W=96,  stride=2, pad=1, prelu=1),
-                dict(cin=64, cout=96, H=36,  W=48,  stride=2, pad=1, prelu=1)]),
-    # Block3/Block4 stride-2 convs. They chain exactly (576x768 -> 288x384 -> 144x192), so this is
+    ("head18", [dict(cin=18, cout=16, H=96, W=128, stride=2, pad=1, prelu=1),
+                dict(cin=16, cout=32, H=48, W=64, stride=2, pad=1, prelu=1)]),
+    ("head34", [dict(cin=34, cout=32, H=48, W=64, stride=2, pad=1, prelu=1),
+                dict(cin=32, cout=48, H=24, W=32,  stride=2, pad=1, prelu=1)]),
+    ("head64", [dict(cin=64, cout=64, H=24, W=32,  stride=2, pad=1, prelu=1),
+                dict(cin=64, cout=96, H=12, W=16,  stride=2, pad=1, prelu=1)]),
+    # Block3/Block4 stride-2 convs. They chain exactly (192x256 -> 96x128 -> 48x64), so this is
     # the model's own pyramid, not an invented pair. cin=1 is the interesting case: NC4HW4 pads it
     # to 4 channels, a 4x input-read tax, where §H.39's heads only paid 6-11% (cin=18/34). The NCHW
     # section iterates cores+heads, so adding this measures that regime for the first time.
-    ("head1",  [dict(cin=1,  cout=8,  H=576, W=768, stride=2, pad=1, prelu=1),
-                dict(cin=8,  cout=16, H=288, W=384, stride=2, pad=1, prelu=1)]),
+    ("head1",  [dict(cin=1,  cout=8,  H=192, W=256, stride=2, pad=1, prelu=1),
+                dict(cin=8,  cout=16, H=96, W=128, stride=2, pad=1, prelu=1)]),
 ]
 CC = (32, 24, 48)                            # correctness shape: %16/%4 (LDS) and %6/%6 (fused2) ok
+# Second correctness shape in the REDUCED regime. The first one (24x48) is nine times the
+# area of anything the suite now times, so a kernel that is only wrong on a short/narrow
+# output -- a partial last w-block, a halo bound that only bites when out_w < the tile --
+# would pass it and still corrupt every timed shape. 12x24: %4 w-blocks, %6/%6 for fused2,
+# and out_h=12 is small enough to exercise the h-remainder paths.
+CC2 = (48, 12, 24)
 VARIANTS = ["conv_2d_c4h1w1", "conv_2d_c4h1w2", "conv_2d_c4h4w1", "conv_2d_c4h1w4",
             "conv_2d_c8h2w1", "conv_2d_c8h4w1", "conv_2d_c8h1w4", "conv_2d_c8h8w1",
             "conv_2d_c8h4w1_pa", "conv_2d_c8h1w1", "conv_2d_c4h8w1",
@@ -69,7 +82,13 @@ SPEC_ONLY += HARD_CAPABLE   # every one of them needs MNN_CONV_SPEC to enter the
 # 24x18 (core96), so MNN_CONV_LDS was accepted and then silently rejected there -- the arm
 # re-measured the default and LDS was unmeasurable at that shape (preflight §B2). 24x2 and 8x6
 # both divide 24x18 exactly.
-LDS_TILES = ["16x4", "48x4", "16x12", "8x4", "24x4", "16x2", "24x2", "8x6"]
+# At the reduced shapes the old tile list stops dividing: core96's output is 6x8, so only
+# "8x6" of the original eight qualifies (TILE_W must divide out_w=8, TILE_H divide out_h=6),
+# and core48's is 12x16. A tile that does not divide is ACCEPTED and then silently rejected
+# inside the kernel selector, so the arm re-measures the default and LDS reads as "no effect"
+# at exactly the shapes where it would matter most (preflight B2). Small tiles added below.
+LDS_TILES = ["16x4", "48x4", "16x12", "8x4", "24x4", "16x2", "24x2", "8x6",
+             "8x2", "8x3", "4x2", "4x3", "4x6", "16x6", "16x3"]
 # LDS staging modes (env MNN_CONV_LDS=<mode>). "1" = the original 1-output/thread kernel;
 # "w2" = c4h1w2 blocking + LDS, which isolates LDS at constant register blocking (FINDINGS §H.30).
 # w2 needs out_w % (2*TILE_W) == 0, so its tile must be chosen per shape.
@@ -160,7 +179,11 @@ def main():
            "splitk_factors": SPLITK_FACTORS,
            "impl_switching_envs": IMPL_SWITCHING_ENVS,
            "igemm_modes": IGEMM_MODES,
-           "cores": [], "heads": [], "blocks": [], "correctness": {}}
+           # Which shape family this bundle was BUILT from. The report prints it at the top:
+           # the bundle carries pre-converted .mnn files, so a bundle built for one family and
+           # read as the other is undetectable from the numbers alone.
+           "shape_family": block_fixture.SHAPE_FAMILY,
+           "cores": [], "heads": [], "blocks": [], "correctness": {}, "correctness2": {}}
 
     # ---------- core models ----------
     print("== models ==")
@@ -247,6 +270,22 @@ def main():
     man["correctness"] = {"model": "cc.mnn", "shape": [1, C, H, W]}
     print(f"   correctness cc {C}@{H}x{W} + conv^2 reference")
 
+    # Second correctness model, in the reduced regime. Same construction, smaller output, so a
+    # kernel that only breaks on a short/narrow output plane cannot pass unnoticed.
+    C2, H2, W2 = CC2
+    cc2 = tmp / "cc2.onnx"; make_conv(str(cc2), 1, C2, C2, H2, W2, 3, 3, 1, 1, 1, 1, "none")
+    convert(str(cc2), str(OUT / "models" / "cc2.mnn"))
+    m2 = onnx.load(str(cc2)); i2 = {t.name: numpy_helper.to_array(t) for t in m2.graph.initializer}
+    Wt2 = [v for v in i2.values() if v.ndim == 4][0]
+    bt2 = [v for v in i2.values() if v.ndim == 1][0]
+    x2 = np.random.default_rng(1717).standard_normal([1, C2, H2, W2]).astype(np.float32)
+    np.savetxt(OUT / "ref" / "cc2_input.txt", x2.reshape(-1), fmt="%.6f")
+    np.savetxt(OUT / "ref" / "fused2_ref2.txt",
+               conv3x3(conv3x3(x2[0], Wt2, bt2), Wt2, bt2).reshape(-1), fmt="%.6f")
+    man["correctness2"] = {"model": "cc2.mnn", "shape": [1, C2, H2, W2],
+                           "input": "cc2_input.txt", "fused2_ref": "fused2_ref2.txt"}
+    print(f"   correctness cc2 {C2}@{H2}x{W2} + conv^2 reference")
+
     (OUT / "manifest.json").write_text(json.dumps(man, indent=2))
     # run_report is required; the clock-pinning driver is optional (a repo that pins clocks with
     # its own tooling simply does not carry it).
@@ -255,7 +294,13 @@ def main():
                                ("bundle_clocks.py", "clocks.py", False),
                                # the integrity gate must travel WITH the bundle: run_suite.py runs
                                # it before any timing, and without it no cell can be validated
-                               ("preflight.py", "preflight.py", False)):
+                               ("preflight.py", "preflight.py", False),
+                               # the result store travels with the bundle: it is what records
+                               # each number's baseline env and refuses cross-batch comparison,
+                               # so a bundle without it can still produce the class of confident,
+                               # wrong table this store exists to prevent.
+                               ("bench_store.py", "bench_store.py", False),
+                               ("test_bench_store.py", "test_bench_store.py", False)):
         s = REPO / "conv_bench" / src
         if not s.exists():
             if required:

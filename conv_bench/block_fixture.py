@@ -8,7 +8,7 @@ not a homogeneous approximation. Reuses bench.py (convert/push/run) + c0_ceiling
 
 Usage:  python3 block_fixture.py [Block1|Block2|all]
 """
-import csv, json, re, sys
+import csv, json, os, re, sys
 from pathlib import Path
 import numpy as np, onnx
 from onnx import helper, TensorProto, numpy_helper
@@ -19,12 +19,21 @@ import bench
 # c0_ceiling is imported lazily inside run_block(): make_bundle only needs
 # load_blocks()/build_onnx(), and a top-level import made that a hard dependency.
 
-CSV = REPO / "conv_bench" / "model_convs_updated.csv"
+# Which shape family the whole harness measures. "reduced" is the [1,C,H/3,W/3] set
+# (model_convs_reduced.csv); CONV_BENCH_SHAPES=full reverts to the original sizes. The
+# choice is PRINTED on load and recorded in the bundle manifest on purpose: a silently
+# swapped fixture is exactly the failure mode that has produced phantom results here before.
+SHAPE_FAMILY = os.environ.get("CONV_BENCH_SHAPES", "reduced").strip().lower()
+if SHAPE_FAMILY not in ("reduced", "full"):
+    raise SystemExit(f"CONV_BENCH_SHAPES must be 'reduced' or 'full', got {SHAPE_FAMILY!r}")
+CSV = REPO / "conv_bench" / ("model_convs_reduced.csv" if SHAPE_FAMILY == "reduced"
+                             else "model_convs_updated.csv")
 LOCAL = REPO / "conv_bench" / "work"
 
 
 def load_blocks():
     """Parse the CSV into {block_name: [conv spec dicts in order]}."""
+    print(f"[block_fixture] shape family = {SHAPE_FAMILY}  ({CSV.name})", flush=True)
     blocks, cur = {}, None
     with open(CSV) as f:
         for row in csv.reader(f):

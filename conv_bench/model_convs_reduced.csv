@@ -1,0 +1,52 @@
+# REDUCED-SHAPE conv list -- every conv of model_convs_updated.csv with its INPUT spatial
+# size divided by 3: [1,C,H,W] -> [1,C,H/3,W/3]. Channels, kernel (3x3), stride, pad and
+# PReLU are unchanged; only H and W move. Every original dim divides by 3 exactly and the
+# quotient stays even, so stride-2 halving is still exact and no rounding is involved:
+#     576x768 -> 192x256    288x384 -> 96x128    144x192 -> 48x64
+#      72x96  ->  24x32      36x48  -> 12x16      18x24  ->  6x8
+# MACs therefore drop exactly 9x per conv, which pushes the small cores (core48 @12x16,
+# core96 @6x8) down towards the fixed per-dispatch cost -- see FINDINGS on why the strategy
+# ranking measured at the original sizes should not be assumed to carry over.
+#
+# Same columns as model_convs_updated.csv:
+#   idx,label,cin,cout,H,W,stride,pad,has_prelu,input_from,notes
+# where H,W are the conv's INPUT spatial size and the output is derived from stride.
+idx,label,cin,cout,H,W,stride,pad,has_prelu,input_from,notes
+1,Block1,18,16,96,128,2,1,1,Submodel inputs,"[1,18,96,128] -> [1,16,48,64]"
+2,,16,32,48,64,2,1,1,,"[1,16,48,64] -> [1,32,24,32]"
+3,,32,32,24,32,1,1,1,,core32 x6
+4,,32,32,24,32,1,1,1,,
+5,,32,32,24,32,1,1,1,,
+6,,32,32,24,32,1,1,1,,
+7,,32,32,24,32,1,1,1,,
+8,,32,32,24,32,1,1,1,,
+9,,,,,,,,,,
+10,Block2,34,32,48,64,2,1,1,Submodel inputs,"[1,34,48,64] -> [1,32,24,32]"
+11,,32,48,24,32,2,1,1,,"[1,32,24,32] -> [1,48,12,16]"
+12,,48,48,12,16,1,1,1,,core48 x6
+13,,48,48,12,16,1,1,1,,
+14,,48,48,12,16,1,1,1,,
+15,,48,48,12,16,1,1,1,,
+16,,48,48,12,16,1,1,1,,
+17,,48,48,12,16,1,1,1,,
+18,,,,,,,,,,
+# Blocks 3-5: the stride-2 downsample pyramid, bare (no PReLU). They chain:
+# 3 out -> 4 in -> 5 in. 3x3 / pad=1 throughout.
+31,Block3,1,8,192,256,2,1,0,input,"[1,1,192,256] -> [1,8,96,128]"
+32,,8,8,96,128,1,1,0,31,core8 x1
+33,Block4,8,16,96,128,2,1,0,32,"[1,8,96,128] -> [1,16,48,64]"
+34,,16,16,48,64,1,1,0,33,core16 x1
+35,Block5,16,32,48,64,2,1,0,34,"[1,16,48,64] -> [1,32,24,32]"
+36,,32,32,24,32,1,1,0,35,core32 x1
+# Block96: the 96-channel level -- same head+core composition as Block1/Block2.
+# Chain: 64->64@24x32 s2 -> 64->96@12x16 s2 -> 6x 96->96@6x8 s1.
+# 96->96@6x8 is the extreme of this set: 288 work-items at c4h1w4, i.e. under one
+# 64-wide wave per compute unit on an 8-CU GPU.
+37,Block96,64,64,24,32,2,1,1,Submodel inputs,"[1,64,24,32] -> [1,64,12,16]"
+38,,64,96,12,16,2,1,1,,"[1,64,12,16] -> [1,96,6,8]"
+39,,96,96,6,8,1,1,1,,core96 x6
+40,,96,96,6,8,1,1,1,,
+41,,96,96,6,8,1,1,1,,
+42,,96,96,6,8,1,1,1,,
+43,,96,96,6,8,1,1,1,,
+44,,96,96,6,8,1,1,1,,

@@ -15,12 +15,14 @@ taken at, because the clock materially affects which strategy wins.
 Everything needed (models, android binaries) ships in this bundle -- no MNN repo, no MNNConvert,
 no numpy required.
 """
-import argparse, json, math, os, re, subprocess, statistics, sys, datetime
+import argparse, hashlib, json, math, os, re, subprocess, statistics, sys, datetime
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 BIN, MODELS, REFD = HERE / "bin", HERE / "models", HERE / "ref"
 DEV = "/data/local/tmp/convprobe"
+# Persistent, content-addressed autotune caches. See cache_name() for why this exists.
+TUNE = DEV + "/tune"
 R = []
 
 # Set by main()'s sec() marker; consulted by say(), run_model(), cooldown(), sample_clock() and D.
@@ -94,9 +96,32 @@ def list_devices():
     return [l.split()[0] for l in out.splitlines()[1:] if "\tdevice" in l]
 
 
+# --------------------------------------------------------------- autotune cache
+def cache_name(model, shape, env, mode, ftype):
+    """Content-addressed name for MNN's autotune cache: hash of everything that can change which
+    kernel is selected.
+
+    Measured cost of one harness call: 3.5s with a cold cache, 0.6s with a warm one -- 85% of every
+    measurement was cache-cold startup, and the GPU work itself is ~0.2s. The harness used to pass a
+    unique filename per arm AND PER REPEAT (cache=f"...{i}.bin"), so every one of the ~1400 launches
+    in a sweep paid the cold price and left the cache behind unused (918 MB of write-once files).
+
+    That per-repeat uniqueness was guarding a real bug: sharing ONE cache across DIFFERENT forced
+    kernels makes some runs emit no output, and a correct kernel then reports as a correctness
+    failure. But the guard was too broad. The cache only has to be unique per CONFIGURATION -- and
+    `env` is in the key here, so two different MNN_CONV_FORCE values still get different files. The
+    repeat index is not a configuration, so it is not in the key, and repeats 2..N run warm.
+
+    `loops` is deliberately NOT in the key: it does not affect kernel selection, so a 2-loop
+    correctness run warms the cache for the 120-loop timing run of the same configuration.
+    Env tokens are sorted so "A=1 B=2" and "B=2 A=1" share one cache."""
+    key = json.dumps([model, list(shape), " ".join(sorted(env.split())), mode, ftype])
+    return f"tune/{hashlib.sha1(key.encode()).hexdigest()[:16]}.bin"
+
+
 # --------------------------------------------------------------- device run helpers
 def run_model(d, model, shape, loops, env="", cache="p.bin", pull=False, timeout=600,
-              mode=68, ftype=3):
+              mode=68, ftype=3, isolate_cache=False):
     """Push model+input.json, run ModuleBasic, return (stdout, output_floats_or_None)."""
     if _SKIP["on"]:
         return "", None          # section not selected: no device work at all
@@ -105,6 +130,11 @@ def run_model(d, model, shape, loops, env="", cache="p.bin", pull=False, timeout
                                "outputs": ["output"], "shapeMutable": False}))
     d.push(inj, f"{DEV}/tdir/input.json")
     d.push(MODELS / model, f"{DEV}/{model}")
+    # Callers historically passed a unique per-repeat filename; that is what made every launch
+    # cold. Their name is now ignored unless isolate_cache=True, and the cache is addressed by
+    # configuration instead. Pass isolate_cache=True only when a test needs a guaranteed-cold run.
+    if not isolate_cache:
+        cache = cache_name(model, shape, env, mode, ftype)
     if pull:
         d.shell(f"rm -rf {DEV}/output"); d.shell(f"mkdir -p {DEV}/output")
     out = d.shell(f"cd {DEV} && {env} LD_LIBRARY_PATH=. ./ModuleBasic.out {model} tdir 0 {ftype} "
@@ -358,6 +388,12 @@ def main(argv=None):
     # clock rather than assuming it holds.
     cool_s = a.cooldown if a.cooldown is not None else (5 if a.quick else 30)
     man = json.loads((HERE / "manifest.json").read_text())
+    # The bundle carries pre-converted .mnn files, so which shape family it was built from is
+    # NOT recoverable from the numbers. Print it, and fail loudly on a bundle predating the field.
+    SHAPE_FAMILY = man.get("shape_family")
+    if not SHAPE_FAMILY:
+        print("!! manifest has no 'shape_family' -- rebuild the bundle with make_bundle.py")
+        SHAPE_FAMILY = "unknown"
     # ---- section selection ------------------------------------------------------------------
     # The report is one long linear function, so instead of re-indenting 20 blocks (and risking a
     # silent behaviour change in a 5h run) an unselected section is neutralised at the EDGES: say()
@@ -427,6 +463,9 @@ def main(argv=None):
     # ---- stage
     print(f"staging to {serial} ...")
     d.shell(f"mkdir -p {DEV}/tdir")
+    # Persistent across runs on purpose: a warm cache is the difference between a 3.5s and
+    # a 0.6s launch, and it stays valid as long as the .so and the models do not change.
+    d.shell(f"mkdir -p {TUNE}")
     for f in sorted(BIN.iterdir()):
         d.push(f, f"{DEV}/")
     d.shell("svc power stayon usb")
@@ -434,6 +473,14 @@ def main(argv=None):
     say("# Conv strategy report")
     say(f"\n_device `{serial}` — {d.prop('ro.product.model')} / soc `{d.prop('ro.soc.model')}` — "
         f"generated {datetime.datetime.now():%Y-%m-%d %H:%M}{' (quick)' if a.quick else ''}_\n")
+    D["shape_family"] = SHAPE_FAMILY
+    say(f"> **Shape family: `{SHAPE_FAMILY}`** — "
+        + ("every conv's input spatial size is the original model's divided by 3 "
+           "(`[1,C,H,W]` -> `[1,C,H/3,W/3]`); channels, kernel, stride and pad are unchanged, "
+           "so MACs are exactly 1/9 of the original set. Results here must NOT be assumed to "
+           "carry over from the full-size runs and vice versa.\n"
+           if SHAPE_FAMILY == "reduced" else
+           f"shapes as recorded in the manifest.\n"))
     say("> Goal: find the **best conv configuration on this device**. All timings are per-conv GPU\n"
         "> kernel time (median of repeats) under sustained load, OpenCL buffer mode, fp16.\n")
 
@@ -847,26 +894,49 @@ def main(argv=None):
     # ---- 10. correctness
     sec(13)
     say("## 13. Correctness (custom kernels vs MNN default output)\n")
-    cc = man["correctness"]
-    d.push(REFD / "cc_input.txt", f"{DEV}/tdir/input.txt")
-    _, base_out = run_model(d, cc["model"], cc["shape"], 1, cache="k0.bin", pull=True)
-    say("| kernel | cosine | verdict |")
-    say("|---|---|---|")
+    # Two fixtures. The large one is the historical shape; the small one has an output plane
+    # the same size as what the suite now times, so a kernel whose halo/remainder handling only
+    # breaks on a short or narrow output cannot pass on the large fixture and then silently
+    # corrupt every timed shape. A kernel is trusted only if it passes BOTH.
+    fixtures = [("cc", man["correctness"], "cc_input.txt", "fused2_ref.txt")]
+    cc2 = man.get("correctness2") or {}
+    if cc2.get("model"):
+        fixtures.append(("cc2", cc2, cc2.get("input", "cc2_input.txt"),
+                         cc2.get("fused2_ref", "fused2_ref2.txt")))
     gates = [("LDS", "MNN_CONV_LDS=1")] + [
         (v.replace("conv_2d_", ""), f"MNN_CONV_SPEC=1 MNN_CONV_FORCE={v}") for v in sorted(spec_only)]
-    # NB: one cache file PER GATE. Reusing ONE autotune cache file across different forced kernels
-    # makes some runs emit no output at all (empty pull -> cosine nan -> a correct kernel is
-    # reported as FAIL). Always give each forced kernel its own cache file.
-    for gi, (label, env) in enumerate(gates):
-        _, v = run_model(d, cc["model"], cc["shape"], 1, env=env, cache=f"k1_{gi}.bin", pull=True)
-        c = cosine(base_out, v)
-        D.setdefault("correctness", {})[label] = c
-        say(f"| {label} | {c:.6f} | {'PASS' if c > 0.99 else 'FAIL — do not trust its timing'} |")
-    ref2 = [float(x) for x in (REFD / "fused2_ref.txt").read_text().split()]
-    _, v = run_model(d, cc["model"], cc["shape"], 1, env="MNN_CONV_FUSED2=1", cache="k2.bin", pull=True)
-    c = cosine(ref2, v)
-    say(f"| fused2 (vs conv² reference) | {c:.6f} | {'PASS' if c > 0.99 else 'FAIL'} |")
-    d.shell(f"rm -f {DEV}/tdir/input.txt")
+    say("| kernel | " + " | ".join(f"cosine ({n} {c['shape'][1]}@{c['shape'][2]}x{c['shape'][3]})"
+                                   for n, c, _, _ in fixtures) + " | verdict |")
+    say("|---|" + "---|" * (len(fixtures) + 1))
+    cosines, fused2 = {}, {}
+    for fname, cc, inp, ref in fixtures:
+        d.push(REFD / inp, f"{DEV}/tdir/input.txt")
+        _, base_out = run_model(d, cc["model"], cc["shape"], 1, cache=f"k0_{fname}.bin", pull=True)
+        # NB: one cache file PER GATE. Reusing ONE autotune cache file across different forced
+        # kernels makes some runs emit no output at all (empty pull -> cosine nan -> a correct
+        # kernel is reported as FAIL). Always give each forced kernel its own cache file.
+        for gi, (label, env) in enumerate(gates):
+            _, v = run_model(d, cc["model"], cc["shape"], 1, env=env,
+                             cache=f"k1_{fname}_{gi}.bin", pull=True)
+            cosines.setdefault(label, {})[fname] = cosine(base_out, v)
+        refv = [float(x) for x in (REFD / ref).read_text().split()]
+        _, v = run_model(d, cc["model"], cc["shape"], 1, env="MNN_CONV_FUSED2=1",
+                         cache=f"k2_{fname}.bin", pull=True)
+        fused2[fname] = cosine(refv, v)
+        d.shell(f"rm -f {DEV}/tdir/input.txt")
+    for label, _e in gates:
+        vals = cosines.get(label, {})
+        # The stored scalar is the WORST fixture: everything downstream reads D["correctness"]
+        # as one number per kernel and gates timings on > 0.99, so storing the best would let a
+        # kernel that fails only the small fixture keep its timings.
+        worst = min(vals.values()) if vals else float("nan")
+        D.setdefault("correctness", {})[label] = worst
+        say(f"| {label} | " + " | ".join(f"{vals.get(n, float('nan')):.6f}" for n, _, _, _ in fixtures)
+            + f" | {'PASS' if worst > 0.99 else 'FAIL — do not trust its timing'} |")
+    fw = min(fused2.values()) if fused2 else float("nan")
+    say(f"| fused2 (vs conv² reference) | "
+        + " | ".join(f"{fused2.get(n, float('nan')):.6f}" for n, _, _, _ in fixtures)
+        + f" | {'PASS' if fw > 0.99 else 'FAIL'} |")
     say("")
 
     # ---- Session-B strategies (all env-gated, all default OFF)
