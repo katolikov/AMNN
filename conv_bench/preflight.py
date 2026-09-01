@@ -330,9 +330,14 @@ def _check_C(c, out, results):
         fail("C", f"{c['key']}: no kernel lines parsed"); return
     win, cur, bad = [], [], []
     for ln in out.splitlines():
-        m = KT.search(ln)
-        if m: cur.append(int(m.group(1)))
-        elif "total kernel time" in ln and cur:
+        # Not elif, and finditer not search. Device output is not a guaranteed format: a WARN can
+        # splice into a line without a newline, so ONE line can carry both a kernel time and the
+        # window total. With `elif`, such a line matched KT and never closed the window -- its
+        # kernels rolled into the next one and the sums drifted, which is what reported Block3 as
+        # 4.1% off when an independent parse of the same output sums to 0.0%.
+        for m in KT.finditer(ln):
+            cur.append(int(m.group(1)))
+        if "total kernel time" in ln and cur:
             # Defensive: a line can contain the phrase yet not match (device output is not a
             # guaranteed format, and warnings splice into lines without a newline). A parser must
             # report an unparseable line, never crash on it.
@@ -343,13 +348,28 @@ def _check_C(c, out, results):
                 win.append((sum(cur), int(mt.group(1))))
             cur = []
     if win:
-        s_, t_ = win[-1]
+        # Aggregate over EVERY window, not just the last one. Each kernel time is reported as a
+        # whole microsecond, so a single inference carries up to ~1us of truncation per dispatch --
+        # on a 30-dispatch block that is several percent, and it tripped this check on Block2 at
+        # div1.5 (688 vs 717, 4.0%) while the same model summed to 0.5% over six inferences. A
+        # dropped or double-counted dispatch is a systematic error and survives aggregation;
+        # rounding averages out, so this now separates the two.
+        s_ = sum(x for x, _ in win)
+        t_ = sum(y for _, y in win)
         d = abs(s_ - t_) / max(t_, 1) * 100
         if d < 2:
-            ok(f"C1 {c['key']:16} per-kernel sum {s_} ~= total {t_} ({d:.1f}%)")
+            ok(f"C1 {c['key']:16} per-kernel sum {s_} ~= total {t_} ({d:.1f}%, "
+               f"{len(win)} window(s))")
         else:
-            fail("C1", f"{c['key']:16} per-kernel sum {s_} != total {t_} ({d:.1f}%) "
-                       f"-> parser dropping/double-counting dispatches")
+            # Name the offending windows. "sum != total by 4%" is not actionable: the same model
+            # reproduced by hand summed to 0.0% at every loop count, with and without the leftover
+            # output/ dir, under this exact env -- so the disagreement is about WHICH windows, and
+            # the check has to say which rather than leaving it to be guessed at.
+            bad_w = [(i, a, b) for i, (a, b) in enumerate(win) if a != b]
+            detail = "; ".join(f"w{i}: {a} vs {b}" for i, a, b in bad_w[:5])
+            fail("C1", f"{c['key']:16} per-kernel sum {s_} != total {t_} ({d:.1f}%, "
+                       f"{len(win)} window(s), {len(bad_w)} mismatching) -> "
+                       f"parser dropping/double-counting dispatches [{detail}]")
     # per INFERENCE. Summing across every profiling window made this vacuous ("47 >= 6").
     if bad:
         fail("C1", f"{c['key']:16} {len(bad)} unparseable 'total kernel time' line(s): {bad[0]!r}")

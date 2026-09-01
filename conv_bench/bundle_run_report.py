@@ -183,6 +183,13 @@ def run_model(d, model, shape, loops, env="", cache="p.bin", pull=False, timeout
         if p.exists():
             try: vals = [float(x) for x in p.read_text().split()]
             except Exception: vals = None
+        # Remove the dump directory now that it has been read. Its mere presence changes how
+        # ModuleBasic runs, and the artifacts inside it (0_0.txt, input.mnn) change it further --
+        # so a correctness check silently altered every timing run that followed. That has now
+        # corrupted three separate measurements: 1us conv readings, a 4.6x inflated baseline, and
+        # a 4% per-kernel/total mismatch that read as a parser bug. Cleaning up before a pull is
+        # not enough; whoever creates it must remove it.
+        d.shell(f"rm -rf {DEV}/output")
     return out, vals
 
 
