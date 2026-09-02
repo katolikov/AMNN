@@ -95,6 +95,23 @@ def test_spliced_line_still_closes_its_window():
     assert (f, w) == (0, 0), f"spliced totals must still close their window ({f} fails, {w} warns)"
 
 
+def test_one_mangled_total_line_warns():
+    """The other face of the same splicing: the total line arrives without its "= N us"."""
+    # the mangled total must FOLLOW pending kernels, or the check never reaches that branch
+    out = _out([([10, 90], 100)] * 8) + ("kernel time = 10    us ConvBuf2D-ori-x\n"
+                                         "total kernel time\n")
+    f, w = _run(out)
+    assert f == 0, "a single mangled total line must not block the run"
+    assert w == 1, "it must still be reported"
+
+
+def test_mostly_mangled_totals_fail():
+    out = _out([([10, 90], 100)] * 2) + ("kernel time = 10    us ConvBuf2D-ori-x\n"
+                                         "total kernel time\n") * 6
+    f, _ = _run(out)
+    assert f >= 1, "if most totals are unreadable the output is not usable"
+
+
 if __name__ == "__main__":
     print("preflight C1 -- systematic drop vs mangled output\n")
     for n, f in sorted(globals().items()):
