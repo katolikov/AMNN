@@ -113,7 +113,22 @@ the batch. Phase 2 measures: one batch per probe model, 34–80 s each, each cer
 watchdog.
 
 Prints per conv: the deployed baseline, the best arm, the gain, that conv's measured noise floor,
-and USE IT / keep default. Raw rows land in `results.db`.
+and USE IT / keep default.
+
+## Reading back every measurement
+
+The sweep prints one winner per conv; every arm it measured is in `conv_bench/results.db`.
+
+    python3 conv_bench/show_results.py                  # latest run, every conv, every arm
+    python3 conv_bench/show_results.py --conv 96->96    # one conv
+    python3 conv_bench/show_results.py --csv > runs.csv # for a spreadsheet
+    python3 conv_bench/show_results.py --runs           # list runs, then --run <id>
+
+Percentages are against that batch's declared baseline, and each is checked against the
+configuration's own measured noise floor -- anything smaller is marked `(noise)` rather than
+reported as a result. The CSV carries the full provenance of each row: the env that produced it,
+which arm was the baseline, whether that baseline was the deployed configuration, and the batch it
+belongs to (only rows sharing a batch are comparable).
 
 ## If you see no output
 
