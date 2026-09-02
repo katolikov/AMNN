@@ -145,6 +145,12 @@ def main():
                     help="adb serial; auto-detected when one device is attached")
     ap.add_argument("--reps", type=int, default=3)
     ap.add_argument("--settle-c", type=float, default=42.0)
+    ap.add_argument("--arm-chunk", type=int, default=38,
+                    help="max non-baseline arms per batch; the baseline is added to each. Lower it "
+                         "for heavy models whose full arm set cannot hold a stable clock.")
+    ap.add_argument("--models", default=None,
+                    help="comma-separated probe models to measure (default: all). Lets a batch "
+                         "the store rejected be redone without repeating the ones that passed.")
     ap.add_argument("--db", default=str(HERE / "results.db"))
     ap.add_argument("--no-warmup", action="store_true",
                     help="skip cache warm-up (only safe when every arm has been run before)")
@@ -168,6 +174,7 @@ def main():
     samples_all: dict[str, dict[str, list[float]]] = {}
     clocks: list[dict] = []
     batch_ids: list = []
+    rejected: list = []
     done = 0
     if state.exists():
         blob = json.loads(state.read_text())
@@ -203,40 +210,74 @@ def main():
         print(f"  warm-up done in {(time.time()-wt0)/60:.0f} min\n", flush=True)
 
     t0 = time.time(); launches = 0
+    want = {m.strip() for m in a.models.split(",")} if a.models else None
     for mi, (model, shape) in enumerate(PROBE_MODELS):
         if mi < done:
             continue
-        s_ = tel.settle(target_c=a.settle_c, max_wait=90)
-        acc: dict = {}
-        tm0 = time.time()          # measurement window start, for the batch duration guard
-        with Watchdog(tel) as w:
-            for rep in range(a.reps):
-                order = A[rep % len(A):] + A[:rep % len(A)]   # rotate: drift favours nobody
-                for name, mode, env in order:
-                    out, _ = R.run_model(d, model, shape, 120, env=env, mode=mode)
-                    launches += 1
-                    k = kernel_of(name)
-                    for tag, us in per_conv(out).items():
-                        if k and f"conv_2d_{k}" in s1only and is_stride2(tag):
-                            continue
-                        acc.setdefault((label_of(tag), name), []).append(us)
-        clocks.append(dict(model=model, **w.result))
-        # One batch for this model. If it ran long the store raises rather than recording a
-        # comparison whose arms saw different clocks.
-        # The Watchdog measured what the clock actually did across this batch; hand that to the
-        # store so a long-but-stable batch is accepted and a short-but-throttled one is not.
-        with st.batch(section="full", label=f"{model} ({len(A)} arms)", reps=a.reps,
-                      started=tm0, clock_valid=w.result.get("valid")) as b:
-            b.baseline("buffer default")
+        if want and model not in want and model.replace(".mnn", "") not in want:
+            continue
+        # Split the arms into chunks that each carry the baseline. A batch is only meaningful if
+        # its arms saw the same clock, and the heaviest model cannot fit 39 arms into that window:
+        # Block96 (20 conv dispatches/launch) took 13-18 min and fell to 645 MHz, so the store
+        # rejected it twice -- correctly, and the convs were simply absent from the results.
+        # Chunking keeps every comparison inside a short batch. Gains are against the baseline
+        # measured IN THAT CHUNK, so they remain comparable across chunks as ratios even though the
+        # raw microseconds are not; the store still refuses to difference arms across batches.
+        chunks = []
+        rest = [x for x in A if x[0] != "buffer default"]
+        base_arm = next(x for x in A if x[0] == "buffer default")
+        n = max(1, a.arm_chunk)
+        for i in range(0, len(rest), n):
+            chunks.append([base_arm] + rest[i:i + n])
+        if len(chunks) > 1:
+            print(f"   {model}: {len(A)} arms split into {len(chunks)} chunks of <= {n + 1} "
+                  f"(baseline repeated in each)", flush=True)
+
+        for ci, chunk in enumerate(chunks):
+            s_ = tel.settle(target_c=a.settle_c, max_wait=90)
+            acc: dict = {}
+            tm0 = time.time()          # measurement window start, for the batch duration guard
+            with Watchdog(tel) as w:
+                for rep in range(a.reps):
+                    order = chunk[rep % len(chunk):] + chunk[:rep % len(chunk)]
+                    for name, mode, env in order:
+                        out, _ = R.run_model(d, model, shape, 120, env=env, mode=mode)
+                        launches += 1
+                        k = kernel_of(name)
+                        for tag, us in per_conv(out).items():
+                            if k and f"conv_2d_{k}" in s1only and is_stride2(tag):
+                                continue
+                            acc.setdefault((label_of(tag), name), []).append(us)
+            clocks.append(dict(model=model if len(chunks) == 1 else f"{model}#{ci+1}",
+                               **w.result))
+            # One batch for this model. If it ran long the store raises rather than recording a
+            # comparison whose arms saw different clocks.
+            # The Watchdog measured what the clock actually did across this batch; hand that to the
+            # store so a long-but-stable batch is accepted and a short-but-throttled one is not.
+            # A rejected batch must not take the run down with it: the other models are unaffected and
+            # already measured, and losing them because the heaviest one drifted turns a partial result
+            # into no result. Block96 (20 conv dispatches, the most arms-per-second of any model) hit
+            # exactly this -- 13 min against a 10 min limit, with the clock falling -- and the
+            # exception discarded four good batches along with it.
+            try:
+                label = f"{model} ({len(chunk)} arms" + (f", chunk {ci+1}/{len(chunks)})"
+                                                         if len(chunks) > 1 else ")")
+                with st.batch(section="full", label=label, reps=a.reps,
+                              started=tm0, clock_valid=w.result.get("valid")) as b:
+                    b.baseline("buffer default")
+                    for (conv, arm), samples in acc.items():
+                        b.record(conv, arm, 0, samples=samples,
+                                 mode=dict((n, m) for n, m, _ in A)[arm],
+                                 env=dict((n, e) for n, _, e in A)[arm])
+                    batch_ids.append((model, b.batch_id))
+            except BS.OversizedBatch as e:
+                rejected.append((model, str(e).split(".")[0]))
+                print(f"   !! {model} NOT RECORDED: {str(e).split('.')[0]}", flush=True)
             for (conv, arm), samples in acc.items():
-                b.record(conv, arm, 0, samples=samples,
-                         mode=dict((n, m) for n, m, _ in A)[arm],
-                         env=dict((n, e) for n, _, e in A)[arm])
-            batch_ids.append((model, b.batch_id))
-        for (conv, arm), samples in acc.items():
-            samples_all.setdefault(conv, {})[arm] = samples
+                samples_all.setdefault(conv, {})[arm] = samples
         save(mi + 1)
-        print(f"  {model:<14} {launches} launches, {time.time()-t0:.0f}s, "
+        print(f"  {model + ('' if len(chunks)==1 else f'#{ci+1}'):<16} "
+              f"{launches} launches, {time.time()-t0:.0f}s, "
               f"settle {s_.get('waited',0):.0f}s @{s_.get('temp')}C, "
               f"clock {w.result.get('mean_mhz')} MHz "
               f"({'valid' if w.result.get('valid') else 'THROTTLED'})", flush=True)
@@ -254,6 +295,11 @@ def main():
     if not all(c.get("valid") for c in clocks):
         print("  ^ a throttled batch keeps its internal comparisons (arms interleaved inside it) "
               "but its absolute microseconds are inflated.")
+    if rejected:
+        print("\nNOT RECORDED (their convs are absent from the tables above):")
+        for model, why in rejected:
+            print(f"  {model}: {why}")
+        print("  Re-measure just these with --models " + ",".join(m for m, _ in rejected))
     print(f"{launches} launches in {time.time()-t0:.0f}s")
 
 
