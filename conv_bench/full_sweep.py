@@ -44,6 +44,7 @@ from clock_guard import GpuTelemetry, Watchdog              # noqa: E402
 import bench_store as BS                                    # noqa: E402
 from bench_store import ResultStore                         # noqa: E402
 from recommend import render as render_recommendations      # noqa: E402
+import block_fixture
 import make_bundle as M                                     # noqa: E402
 
 
@@ -189,7 +190,7 @@ def main():
 
     BS.load_noise_floors(HERE / "noise_floors.json")
     st = ResultStore(a.db)
-    st.begin_run(device=a.serial, shape_family="reduced", harness="full_sweep",
+    st.begin_run(device=a.serial, shape_family=block_fixture.SHAPE_FAMILY, harness="full_sweep",
                  notes=f"{len(A)} arms, {a.reps} reps, one batch per probe model")
 
     # ---- warm the tuning cache BEFORE measuring anything ----------------------------------

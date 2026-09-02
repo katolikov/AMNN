@@ -29,6 +29,7 @@ sys.path.insert(0, str(BUNDLE))
 sys.path.insert(0, str(HERE))
 import run_report as R                       # noqa: E402
 from probe_perconv import per_conv, label_of, PROBE_MODELS  # noqa: E402
+import block_fixture
 from bench_store import ResultStore          # noqa: E402
 
 def configs():
@@ -76,7 +77,7 @@ def main():
     st = ResultStore(a.db)
     s0l, _ = R.sample_clock(d, configs()[0][0], configs()[0][1])
     s0 = statistics.median(s0l) if s0l else 0
-    st.begin_run(device=a.serial, shape_family="reduced", harness="variance_probe",
+    st.begin_run(device=a.serial, shape_family=block_fixture.SHAPE_FAMILY, harness="variance_probe",
                  clock_start=s0, notes=f"across-batch variance, {a.repeats} repeats")
 
     cfgs = configs()

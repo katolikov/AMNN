@@ -30,10 +30,18 @@ import bench_store as BS
 BUFFER, IMAGE = 68, 132
 
 
-def _rows_by_conv(st, run_id):
+def _rows_by_conv(st, run_ids):
+    """Rows for one or several runs.
+
+    A conv measured across two runs (a model re-measured on its own after its first batch was
+    rejected) still has all of ITS arms inside one batch, which is what comparability requires --
+    so merging runs is safe here, while differencing arms across batches remains refused."""
+    if isinstance(run_ids, str):
+        run_ids = [run_ids]
     out = {}
-    for b in st._conn.execute("SELECT batch_id, baseline_arm FROM batches WHERE run_id=?"
-                              " ORDER BY created", (run_id,)):
+    q = ("SELECT batch_id, baseline_arm FROM batches WHERE run_id IN (%s) ORDER BY created"
+         % ",".join("?" * len(run_ids)))
+    for b in st._conn.execute(q, tuple(run_ids)):
         for r in st.rows(b["batch_id"]):
             if r["valid"]:
                 out.setdefault(r["conv"], []).append(r)
@@ -69,10 +77,10 @@ def _table(title, convs, pick, baseline_arm, note=""):
     return "\n".join(lines)
 
 
-def render(st, run_id, floors_path=None):
+def render(st, run_ids, floors_path=None):
     if floors_path:
         BS.load_noise_floors(floors_path)
-    convs = _rows_by_conv(st, run_id)
+    convs = _rows_by_conv(st, run_ids)
     if not convs:
         return "(no results for this run)"
     out = []
@@ -103,7 +111,10 @@ def main():
     HERE = Path(__file__).resolve().parent
     ap = argparse.ArgumentParser(description="three recommendation tables from a results.db")
     ap.add_argument("--db", default=str(HERE / "results.db"))
-    ap.add_argument("--run", default=None, help="run id (default: most recent full_sweep)")
+    ap.add_argument("--run", default=None,
+                    help="run id, or several comma-separated to merge (default: most recent "
+                         "full_sweep). Merging is how a model re-measured on its own rejoins the "
+                         "run whose batch was rejected.")
     ap.add_argument("--runs", action="store_true", help="list runs and exit")
     ap.add_argument("--floors", default=str(HERE / "noise_floors.json"))
     a = ap.parse_args()
@@ -124,12 +135,17 @@ def main():
         return
 
     if a.run:
-        run = next((r for r in runs if r["run_id"] == a.run), None)
-        if run is None:
-            raise SystemExit(f"no run {a.run!r}; try --runs")
+        ids = [x.strip() for x in a.run.split(",")]
+        known = {r["run_id"] for r in runs}
+        missing = [i for i in ids if i not in known]
+        if missing:
+            raise SystemExit(f"no run(s) {missing}; try --runs")
+        run = next(r for r in runs if r["run_id"] == ids[0])
+        run_ids = ids
     else:
         # default to the most recent sweep: a variance_probe run has no arms to recommend between
         run = next((r for r in runs if r["harness"] == "full_sweep"), runs[0])
+        run_ids = [run["run_id"]]
 
     n = BS.load_noise_floors(a.floors)
     print(f"run {run['run_id']}  device {run['device']}  family {run['shape_family']}  "
@@ -139,7 +155,9 @@ def main():
                           f"{BS.NOISE_FLOOR_PCT:.0f}% for every conv; run variance_probe.py"))
     if run["clock_valid"] == 0:
         print("clock: THROTTLED during this run -- comparisons hold, absolute times are inflated")
-    print(render(st, run["run_id"], a.floors))
+    if len(run_ids) > 1:
+        print(f"merging {len(run_ids)} runs: {', '.join(run_ids)}")
+    print(render(st, run_ids, a.floors))
 
 
 if __name__ == "__main__":
