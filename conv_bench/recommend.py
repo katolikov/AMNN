@@ -13,9 +13,18 @@ decision:
 
 Every percentage is measured against the baseline named in the table and checked against that
 configuration's own measured noise floor; anything smaller is reported as noise, not a win.
+Runnable directly against a results.db:
+
+    python3 conv_bench/recommend.py                     # latest run
+    python3 conv_bench/recommend.py --runs              # list runs, then --run <id>
+    python3 conv_bench/recommend.py --run <id> --db ... # a specific run / database
 """
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import bench_store as BS
 
 BUFFER, IMAGE = 68, 132
@@ -84,3 +93,54 @@ def render(st, run_id, floors_path=None):
         "buffer and an image winner in this table cannot both be used unless the convs live in\n"
         "different submodels -- confirm at whole-model wall-clock before shipping."))
     return "\n".join(out)
+
+
+def main():
+    import argparse
+    import datetime
+    from bench_store import ResultStore
+
+    HERE = Path(__file__).resolve().parent
+    ap = argparse.ArgumentParser(description="three recommendation tables from a results.db")
+    ap.add_argument("--db", default=str(HERE / "results.db"))
+    ap.add_argument("--run", default=None, help="run id (default: most recent full_sweep)")
+    ap.add_argument("--runs", action="store_true", help="list runs and exit")
+    ap.add_argument("--floors", default=str(HERE / "noise_floors.json"))
+    a = ap.parse_args()
+
+    if not Path(a.db).exists():
+        raise SystemExit(f"no results database at {a.db} -- run full_sweep.py first")
+    st = ResultStore(a.db)
+    runs = list(st._conn.execute(
+        "SELECT run_id, started, device, shape_family, harness, clock_valid, notes"
+        " FROM runs ORDER BY started DESC"))
+    if not runs:
+        raise SystemExit(f"{a.db} has no runs")
+    if a.runs:
+        for r in runs:
+            when = datetime.datetime.fromtimestamp(r["started"]).strftime("%Y-%m-%d %H:%M")
+            print(f"{r['run_id']}  {when}  {r['device']}  {r['shape_family'] or '?':<8} "
+                  f"{r['harness'] or '?':<14} {r['notes'] or ''}")
+        return
+
+    if a.run:
+        run = next((r for r in runs if r["run_id"] == a.run), None)
+        if run is None:
+            raise SystemExit(f"no run {a.run!r}; try --runs")
+    else:
+        # default to the most recent sweep: a variance_probe run has no arms to recommend between
+        run = next((r for r in runs if r["harness"] == "full_sweep"), runs[0])
+
+    n = BS.load_noise_floors(a.floors)
+    print(f"run {run['run_id']}  device {run['device']}  family {run['shape_family']}  "
+          f"harness {run['harness']}")
+    print(f"noise floors: {n} configurations loaded"
+          + ("" if n else f" -- {a.floors} missing, falling back to a flat "
+                          f"{BS.NOISE_FLOOR_PCT:.0f}% for every conv; run variance_probe.py"))
+    if run["clock_valid"] == 0:
+        print("clock: THROTTLED during this run -- comparisons hold, absolute times are inflated")
+    print(render(st, run["run_id"], a.floors))
+
+
+if __name__ == "__main__":
+    main()
