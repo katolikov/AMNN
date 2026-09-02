@@ -81,7 +81,11 @@ def run(model, shape, env="", mode=BUF, ftype=3, loops=2, cache=None, pull=False
         # locally and the device dir never existed -> every pull returned nothing -> cosine=nan,
         # which reported as "WRONG OUTPUT" on 11 correct cases.
         adb(f"shell 'rm -rf {DEV}/output && mkdir -p {DEV}/output'")
-    cache = cache or f"pf_{model.replace('.mnn','')}_{mode}.bin"   # shared across checks
+    # The family is part of the cache identity: core_32.mnn is a different conv in every family
+    # while keeping the same filename, so a name without it would hand div3's tuning to a full-size
+    # model after a switch. Shared across checks WITHIN a family, which is the point -- process
+    # launches are the unit of cost here.
+    cache = cache or f"pf_{model.replace('.mnn','')}_{mode}_{block_fixture.SHAPE_FAMILY}.bin"
     out = adb(f"shell 'cd {DEV} && {env}LD_LIBRARY_PATH=. ./ModuleBasic.out {model} tdir 0 "
               f"{ftype} {loops} {mode} 2 {cache} 2>&1'")
     vals = None
