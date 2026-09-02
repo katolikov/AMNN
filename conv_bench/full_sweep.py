@@ -140,6 +140,16 @@ def default_serial():
         raise SystemExit("no device attached (check `adb devices`)")
     raise SystemExit(f"several devices attached; pass one as the first argument: {', '.join(devs)}")
 
+def _bundle_family():
+    """The family recorded in the bundle. These scripts take their SHAPES from the manifest, so the
+    bundle is what they actually measured -- reading the label from anywhere else (an environment
+    variable set for a different family, say) would mislabel the run in the results database."""
+    man = BUNDLE / "manifest.json"
+    if man.exists():
+        return json.loads(man.read_text()).get("shape_family") or "?"
+    return "?"
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("serial", nargs="?", default=None,
@@ -190,7 +200,7 @@ def main():
 
     BS.load_noise_floors(HERE / "noise_floors.json")
     st = ResultStore(a.db)
-    st.begin_run(device=a.serial, shape_family=block_fixture.SHAPE_FAMILY, harness="full_sweep",
+    st.begin_run(device=a.serial, shape_family=_bundle_family(), harness="full_sweep",
                  notes=f"{len(A)} arms, {a.reps} reps, one batch per probe model")
 
     # ---- warm the tuning cache BEFORE measuring anything ----------------------------------

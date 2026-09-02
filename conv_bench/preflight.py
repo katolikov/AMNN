@@ -16,6 +16,31 @@ from collections import defaultdict
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "conv_bench"))
+
+# Adopt the family the BUNDLE was built for, before block_fixture is imported (it settles the
+# family at import time). The bundle is the authority: its models are pre-converted at those sizes,
+# so anything else is a guess about what is on the device. This removes the need to set
+# CONV_BENCH_SHAPES at all -- passing --shape-family or exporting the variable still overrides,
+# and the mismatch guard below still runs, but the default now cannot be wrong.
+def _family_from_bundle_or_argv(argv):
+    for i, x in enumerate(argv):
+        if x == "--shape-family" and i + 1 < len(argv):
+            return x and argv[i + 1]
+        if x.startswith("--shape-family="):
+            return x.split("=", 1)[1]
+    if os.environ.get("CONV_BENCH_SHAPES"):
+        return os.environ["CONV_BENCH_SHAPES"]
+    man = REPO / "conv_bench" / "conv_probe_bundle" / "manifest.json"
+    if man.exists():
+        fam = json.loads(man.read_text()).get("shape_family")
+        if fam:
+            return fam.replace("div", "") if fam != "full" else "full"
+    return None
+
+
+_fam = _family_from_bundle_or_argv(sys.argv[1:])
+if _fam:
+    os.environ["CONV_BENCH_SHAPES"] = _fam
 import make_bundle as M
 import block_fixture
 from block_fixture import load_blocks
