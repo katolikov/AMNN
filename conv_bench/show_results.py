@@ -29,6 +29,8 @@ def main():
     ap.add_argument("--conv", default=None, help="only convs whose label contains this")
     ap.add_argument("--csv", action="store_true", help="machine-readable, all rows")
     ap.add_argument("--floors", default=str(HERE / "noise_floors.json"))
+    ap.add_argument("--recommend", action="store_true",
+                    help="the three recommendation tables (buffer / image / overall)")
     a = ap.parse_args()
 
     st = ResultStore(a.db)
@@ -48,6 +50,10 @@ def main():
         return
 
     run = next((r for r in runs if r["run_id"] == a.run), runs[0])
+    if a.recommend:
+        from recommend import render
+        print(render(st, run["run_id"], a.floors))
+        return
     batches = list(st._conn.execute(
         "SELECT batch_id, label, reps, baseline_arm FROM batches WHERE run_id=? ORDER BY created",
         (run["run_id"],)))

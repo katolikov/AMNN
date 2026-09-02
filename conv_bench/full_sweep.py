@@ -43,6 +43,7 @@ from probe_perconv import per_conv, label_of, PROBE_MODELS  # noqa: E402
 from clock_guard import GpuTelemetry, Watchdog              # noqa: E402
 import bench_store as BS                                    # noqa: E402
 from bench_store import ResultStore                         # noqa: E402
+from recommend import render as render_recommendations      # noqa: E402
 import make_bundle as M                                     # noqa: E402
 
 
@@ -243,30 +244,14 @@ def main():
     # ------------------------------------------------------------------ report
     st.finish_run()
     valid_run = all(c.get("valid") for c in clocks)
-    print(f"\n{'conv':<18}{'deployed':>9}  {'best arm':<22}{'best':>8}{'gain':>7}{'floor':>7}  verdict")
-    print("-" * 82)
-    wins = 0; total = 0
-    for model, bid in batch_ids:
-        rows: dict = {}
-        for r in st.rows(bid):
-            if r["valid"]:
-                rows.setdefault(r["conv"], {})[r["arm"]] = r["us"]
-        for conv in sorted(rows):
-            r = rows[conv]
-            if "buffer default" not in r:
-                continue
-            total += 1
-            base = r["buffer default"]; best = min(r, key=lambda x: r[x])
-            gain = 100 * (r[best] - base) / base
-            fl = max(BS.noise_floor(conv, "buffer"), BS.noise_floor(conv, "image"))
-            sig = abs(gain) >= fl; wins += sig
-            print(f"{conv:<18}{base:>9.1f}  {best:<22}{r[best]:>8.1f}{gain:>6.0f}%{fl:>6.0f}%  "
-                  f"{'USE IT' if sig else 'keep default'}")
-    print(f"\n{wins}/{total} convs have a win clearing their measured noise floor")
+    # Three tables, not one: gpuMode is per Interpreter, so a single "best per conv" list mixes
+    # buffer and image winners that cannot coexist in one model.
+    print(render_recommendations(st, st.run_id, HERE / "noise_floors.json"))
+    print()
     print("clock per batch: " + ", ".join(
         f"{c['model'].replace('.mnn','')} {c.get('mean_mhz')}MHz"
         f"{'' if c.get('valid') else ' THROTTLED'}" for c in clocks))
-    if not valid_run:
+    if not all(c.get("valid") for c in clocks):
         print("  ^ a throttled batch keeps its internal comparisons (arms interleaved inside it) "
               "but its absolute microseconds are inflated.")
     print(f"{launches} launches in {time.time()-t0:.0f}s")

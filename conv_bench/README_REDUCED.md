@@ -112,8 +112,15 @@ compilation is not measurement, and doing it inside a batch heats the device eno
 the batch. Phase 2 measures: one batch per probe model, 34–80 s each, each certified by a clock
 watchdog.
 
-Prints per conv: the deployed baseline, the best arm, the gain, that conv's measured noise floor,
-and USE IT / keep default.
+Prints THREE recommendation tables, because gpuMode is set per Interpreter and a single
+"best per conv" list mixes buffer and image winners that cannot coexist in one model:
+
+    1. BUFFER  -- best kernel per conv if the model runs in buffer mode
+    2. IMAGE   -- best per conv if it runs in image mode
+    3. OVERALL -- best arm either way, against the deployed baseline (buffer, no flags)
+
+Table 3 sizes the prize; tables 1 and 2 are what you can actually deploy. Re-render any past run
+with `python3 conv_bench/show_results.py --recommend`.
 
 ## Reading back every measurement
 
