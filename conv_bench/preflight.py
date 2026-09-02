@@ -357,19 +357,27 @@ def _check_C(c, out, results):
         s_ = sum(x for x, _ in win)
         t_ = sum(y for _, y in win)
         d = abs(s_ - t_) / max(t_, 1) * 100
-        if d < 2:
+        bad_w = [(i, a, b) for i, (a, b) in enumerate(win) if a != b]
+        detail = "; ".join(f"w{i}: {a} vs {b}" for i, a, b in bad_w[:5])
+        # Systematic dropping vs a corrupted line. A dispatch the parser cannot see is invisible in
+        # EVERY window -- that is the failure this check exists to catch. A minority of bad windows
+        # means the device output stream was mangled for those inferences: the driver splices
+        # blobcache WARNs into stdout mid-line, observed as
+        #   "kernel time = 71    us ConvBuf2D-ori-b1ci8hi288wWARN: CLPlatformVk.cpp:435 ..."
+        # which can swallow a whole line. That costs one inference out of many and is averaged out
+        # by the medians every metric here uses, so it is a warning, not a reason to refuse the run.
+        systematic = len(bad_w) >= max(2, len(win) // 2)
+        if not bad_w:
             ok(f"C1 {c['key']:16} per-kernel sum {s_} ~= total {t_} ({d:.1f}%, "
                f"{len(win)} window(s))")
-        else:
-            # Name the offending windows. "sum != total by 4%" is not actionable: the same model
-            # reproduced by hand summed to 0.0% at every loop count, with and without the leftover
-            # output/ dir, under this exact env -- so the disagreement is about WHICH windows, and
-            # the check has to say which rather than leaving it to be guessed at.
-            bad_w = [(i, a, b) for i, (a, b) in enumerate(win) if a != b]
-            detail = "; ".join(f"w{i}: {a} vs {b}" for i, a, b in bad_w[:5])
+        elif systematic:
             fail("C1", f"{c['key']:16} per-kernel sum {s_} != total {t_} ({d:.1f}%, "
-                       f"{len(win)} window(s), {len(bad_w)} mismatching) -> "
-                       f"parser dropping/double-counting dispatches [{detail}]")
+                       f"{len(bad_w)}/{len(win)} windows mismatch) -> parser dropping/"
+                       f"double-counting dispatches [{detail}]")
+        else:
+            warn("C1", f"{c['key']:16} {len(bad_w)}/{len(win)} window(s) mismatch ({d:.1f}% overall) "
+                 f"-- device output mangled for those inferences, not a systematic drop; medians "
+                 f"absorb it [{detail}]")
     # per INFERENCE. Summing across every profiling window made this vacuous ("47 >= 6").
     if bad:
         fail("C1", f"{c['key']:16} {len(bad)} unparseable 'total kernel time' line(s): {bad[0]!r}")
