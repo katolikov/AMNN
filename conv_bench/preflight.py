@@ -17,6 +17,7 @@ from collections import defaultdict
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "conv_bench"))
 import make_bundle as M
+import block_fixture
 from block_fixture import load_blocks
 
 MODELS = REPO / "conv_bench" / "conv_probe_bundle" / "models"
@@ -158,6 +159,33 @@ def img_gate(ci, co, ow, oh, stride, k=3):
     return (co*oh*ow)/(ci*k) <= 5
 
 # ---- case list ---------------------------------------------------------------
+def assert_family_matches_bundle():
+    """The bundle IS a shape family; the case list is recomputed from CONV_BENCH_SHAPES. If they
+    disagree, every model on the device is a different size from the conv the harness thinks it is
+    launching, and the results are nonsense that still look like measurements.
+
+    That is not hypothetical: a bundle built with `--shape-family full` and a preflight run without
+    the variable produced `core32@24x32 ... direct_convs=2/6` and `Block5 ... direct_convs=4/2` --
+    four direct convs in a two-conv model, which is impossible and was the only visible clue.
+
+    make_bundle takes --shape-family; every other script reads CONV_BENCH_SHAPES, so the mismatch
+    is easy to create and was previously silent."""
+    man = MODELS.parent / "manifest.json"
+    if not man.exists():
+        return
+    built = json.loads(man.read_text()).get("shape_family")
+    here = block_fixture.SHAPE_FAMILY
+    if built and built != here:
+        raise SystemExit(
+            f"\nSHAPE FAMILY MISMATCH\n"
+            f"  the bundle was built for : {built}\n"
+            f"  this run is configured as: {here}\n\n"
+            f"  Every model on the device would be a different size from the conv this run thinks\n"
+            f"  it is launching. Either re-run with CONV_BENCH_SHAPES={built}, or rebuild the\n"
+            f"  bundle with: python3 conv_bench/make_bundle.py "
+            f"--shape-family {here.replace('div', '') or 'full'}\n")
+
+
 def cases():
     cs=[]
     for C,H,W in M.CORES:
@@ -418,6 +446,7 @@ def main():
     adb(f"shell mkdir -p {DEV}/tdir")
     for L in LIBS+[MODULE]: adb(f"push {L} {DEV}/")
     adb(f"shell chmod +x {DEV}/ModuleBasic.out")
+    assert_family_matches_bundle()
     CS = cases(); results={}
     print(f"cases: {sum(1 for c in CS if c['kind']=='core')} cores, "
           f"{sum(1 for c in CS if c['kind']=='head')} heads, "

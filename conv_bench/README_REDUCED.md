@@ -12,6 +12,15 @@ A family is a **divisor applied to `model_convs_updated.csv`**, the one conv lis
 
 `CONV_BENCH_SHAPES` does the same thing for callers that already set it; the flag wins.
 
+**Set it consistently.** `make_bundle.py` takes `--shape-family`, every other script reads
+`CONV_BENCH_SHAPES`, so it is easy to build one family and then run another. preflight refuses that
+outright -- it recomputes its case list per run, so a mismatch would launch models of one size while
+believing they are another, and the results look like measurements. It presents as impossible
+numbers (`Block5 ... direct_convs=4/2`: four direct convs in a two-conv model) rather than an error,
+which is why it is now checked. Exporting the variable for the whole session is the simplest way:
+
+    export CONV_BENCH_SHAPES=full
+
 It matters at **bundle-build time** -- the models are pre-converted, so once built the bundle IS
 that family, and the manifest records which.
 
