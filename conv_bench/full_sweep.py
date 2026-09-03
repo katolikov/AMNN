@@ -159,6 +159,9 @@ def main():
     ap.add_argument("--arm-chunk", type=int, default=38,
                     help="max non-baseline arms per batch; the baseline is added to each. Lower it "
                          "for heavy models whose full arm set cannot hold a stable clock.")
+    ap.add_argument("--resume", action="store_true",
+                    help="continue an interrupted run from full_sweep_state.json. Without it any "
+                         "saved state is discarded and every model is measured.")
     ap.add_argument("--models", default=None,
                     help="comma-separated probe models to measure (default: all). Lets a batch "
                          "the store rejected be redone without repeating the ones that passed.")
@@ -181,18 +184,36 @@ def main():
     print(f"clock: {'PINNED at ' + pin['governor'] if pin['pinned'] else 'governor ' + pin['governor'] + ' (not pinned; batches certified after the fact)'}")
     print(f"nominal {tel.nominal/1000:.0f} MHz, GPU {tel.temperature_c()} C\n", flush=True)
 
+    # Resuming is OPT-IN. The state file survives a completed run, so picking it up automatically
+    # made the next run skip every model it had already done -- silently, and only AFTER paying the
+    # full warm-up, so it presented as "0 launches in 0s / no results for this run" at the end of a
+    # multi-hour wait. Resume is for continuing an INTERRUPTED run and has to be asked for.
     state = HERE / "full_sweep_state.json"
     samples_all: dict[str, dict[str, list[float]]] = {}
     clocks: list[dict] = []
     batch_ids: list = []
     rejected: list = []
     done = 0
-    if state.exists():
+    if state.exists() and not a.resume:
+        stale = json.loads(state.read_text()).get("done_models", 0)
+        state.unlink()
+        if stale:
+            print(f"  (discarded a previous run's state: {stale} model(s) recorded. Pass --resume "
+                  f"to continue an interrupted run instead.)\n", flush=True)
+    elif state.exists():
         blob = json.loads(state.read_text())
-        if blob.get("arms") == [n for n, _, _ in A]:
-            done = blob.get("done_models", 0); clocks = blob.get("clocks", [])
-            samples_all = blob.get("samples", {})
-            print(f"  resuming after {done} model(s)\n", flush=True)
+        if blob.get("arms") != [n for n, _, _ in A]:
+            raise SystemExit(
+                "--resume: the saved state was written with a different arm set, so its models "
+                "and this run's are not the same measurement. Re-run without --resume.")
+        done = blob.get("done_models", 0); clocks = blob.get("clocks", [])
+        samples_all = blob.get("samples", {})
+        if done >= len(PROBE_MODELS):
+            raise SystemExit(
+                f"--resume: that run already finished all {done} models -- there is nothing to "
+                f"continue. Drop --resume to measure again, or read the results with "
+                f"`python3 conv_bench/recommend.py`.")
+        print(f"  resuming after {done} model(s)\n", flush=True)
 
     def save(n):
         state.write_text(json.dumps(dict(arms=[x[0] for x in A], done_models=n, clocks=clocks,
@@ -306,6 +327,8 @@ def main():
     if not all(c.get("valid") for c in clocks):
         print("  ^ a throttled batch keeps its internal comparisons (arms interleaved inside it) "
               "but its absolute microseconds are inflated.")
+    if state.exists() and not rejected:
+        state.unlink()          # the run finished; nothing to resume
     if rejected:
         print("\nNOT RECORDED (their convs are absent from the tables above):")
         for model, why in rejected:
